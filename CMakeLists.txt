@@ -1,17 +1,13 @@
 # ====================================================================
 # STARDIS-CPU 工程级 CMakeLists.txt (Workspace Level)
 # ====================================================================
-# 项目: STARDIS CPU版本（多库/多版本 Monte Carlo 辐射传输求解器）
+# 项目: STARDIS CUDA版本（多库/多版本 Monte Carlo 辐射传输求解器）
 # 模板: CMake v1.1.0 (数组+循环模式)
-# 版本: 1.2.0
-# 创建日期: 2026-01-20
-# 更新日期: 2026-01-21 15:43 - 添加 htpp 和 star-cmap 模块
+# 版本: 1.0.0
+# 创建日期: 2026-02-10
 # ====================================================================
 # 变更说明：
-# - 添加 star-cmap (颜色映射库) 到 Layer 4
-# - 添加 htpp (热传输后处理器可执行文件) 到 Layer 7
-# - 现在生成两个可执行文件：stardis 和 htpp
-# - 共13个模块（11个核心 + 2个工具）
+# 暂无
 # ====================================================================
 
 cmake_minimum_required(VERSION 3.25)
@@ -19,9 +15,9 @@ cmake_minimum_required(VERSION 3.25)
 # ====================================================================
 # 1. 工程定义（Workspace Orchestrator）
 # ====================================================================
-project(STARDIS_CPU_Workspace
+project(STARDIS_CUDA_Workspace
     VERSION 0.16.2
-    DESCRIPTION "STARDIS Monte Carlo Radiative Transfer Solver - CPU Edition (13 Modules with htpp)"
+    DESCRIPTION "STARDIS Monte Carlo Radiative Transfer Solver - CUDA Edition (13 Modules with htpp)"
     LANGUAGES C CXX
 )
 
@@ -38,7 +34,7 @@ list(APPEND CMAKE_MODULE_PATH
 include(ProjectOptions)       # 编译选项、输出目录、全局开关
 include(CompilerPolicy)       # 编译器检查、生成器验证
 include(RuntimeDeps)          # 运行时依赖管理（DLL 复制等）
-include(ThirdPartyRegistry)   # 第三方库注册（Random123, Embree, MPI 等）
+include(ThirdPartyRegistry)   # 第三方库注册（Random123, Embree, MPI CUDA）
 include(HelperFunctions)      # 辅助函数（简化项目级配置）
 
 # ====================================================================
@@ -54,8 +50,8 @@ endif()
 # ====================================================================
 # 4. 第三方依赖注册（工程级唯一位置）
 # ====================================================================
-# 注意：ThirdPartyRegistry.cmake 已处理 Random123 和 MPI
-# 如需添加其他第三方库（Embree / CUDA / DX12），在此注册
+# 注意：ThirdPartyRegistry.cmake 已处理 Embree、cuBQL、Random、MPI
+# 如需添加其他第三方库，在此注册
 
 # 示例：Embree（如果已解压到 third_party/embree）
 # if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/embree)
@@ -63,7 +59,7 @@ endif()
 #         NAME Embree
 #         ROOT ${CMAKE_SOURCE_DIR}/third_party/embree
 #         TYPE SHARED
-#         DLLS ${CMAKE_SOURCE_DIR}/third_party/embree/bin/embree3.dll
+#         DLLS ${CMAKE_SOURCE_DIR}/third_party/embree/bin/embree4.dll
 #     )
 # endif()
 
@@ -98,7 +94,7 @@ endmacro()
 # --------------------------------------------------------------------
 # 依赖层次（从底向上）：
 #   Layer 1: rsys (基础工具库)
-#   Layer 2: star-2d, star-3d, star-sp (几何和采样)
+#   Layer 2: star-2d, custar-3d, star-sp (几何和采样)
 #   Layer 3: star-enclosures-2d, star-enclosures-3d (包壳计算)
 #   Layer 4: star-wf, star-geometry-3d, star-stl, star-cmap (工具库)
 #   Layer 5: stardis-solver (核心求解器)
