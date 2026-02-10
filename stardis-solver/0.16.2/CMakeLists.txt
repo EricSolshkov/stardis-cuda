@@ -62,6 +62,7 @@ set(SDIS_SOURCES
     src/sdis_scene.c
     src/sdis_solve.c
     src/sdis_solve_camera.c
+    src/sdis_solve_wavefront.c
     src/sdis_source.c
     src/sdis_tile.c
 )

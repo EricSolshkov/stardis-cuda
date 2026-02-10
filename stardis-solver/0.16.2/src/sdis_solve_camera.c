@@ -22,6 +22,7 @@
 #include "sdis_medium_c.h"
 #include "sdis_realisation.h"
 #include "sdis_scene_c.h"
+#include "sdis_solve_wavefront.h"
 #include "sdis_tile.h"
 #ifdef SDIS_ENABLE_MPI
   #include "sdis_mpi.h"
@@ -33,6 +34,7 @@
 #include <rsys/morton.h>
 
 #include <omp.h>
+#include <stdlib.h> /* getenv */
 
 /*******************************************************************************
  * Helper function
@@ -607,6 +609,21 @@ sdis_solve_camera
   omp_set_num_threads((int)scn->dev->nthreads);
   register_paths = is_master_process
     ? args->register_paths : SDIS_HEAT_PATH_NONE;
+
+  /* Phase B-2: wavefront mode toggle.
+   * Set STARDIS_WAVEFRONT=1 to use the wavefront solver instead of the
+   * original per-pixel depth-first solver.  The wavefront solver batches
+   * ray requests across all active paths in a tile and traces them via the
+   * Phase B-1 batch trace API. */
+  {
+    const char* wf_env = getenv("STARDIS_WAVEFRONT");
+    //const int use_wavefront = (wf_env && wf_env[0] == '1');
+    const int use_wavefront = 1;
+
+    if(use_wavefront) {
+      log_info(scn->dev, "Wavefront solver enabled (Phase B-2).\n");
+    }
+
   #pragma omp parallel for schedule(static, 1/*chunk size*/)
   for(mcode = mcode_1st; mcode < (int64_t)ntiles_adjusted; mcode+=mcode_incr) {
     size_t tile_org[2] = {0, 0};
@@ -651,10 +668,17 @@ sdis_solve_camera
     tile_sz[1] = MMIN(TILE_SIZE, args->image_definition[1] - tile_org[1]);
 
     /* Draw the tile */
-    res_local = solve_tile
-      (scn, rng, enc_id, args->cam, args->time_range, tile_org, tile_sz,
-       args->spp, register_paths, pix_sz, args->picard_order, args->diff_algo,
-       buf, tile);
+    if(use_wavefront) {
+      res_local = solve_tile_wavefront
+        (scn, rng, enc_id, args->cam, args->time_range, tile_org, tile_sz,
+         args->spp, register_paths, pix_sz, args->picard_order, args->diff_algo,
+         buf, tile);
+    } else {
+      res_local = solve_tile
+        (scn, rng, enc_id, args->cam, args->time_range, tile_org, tile_sz,
+         args->spp, register_paths, pix_sz, args->picard_order, args->diff_algo,
+         buf, tile);
+    }
     if(res_local != RES_OK) {
       ATOMIC_SET(&res, res_local);
       continue;
@@ -669,12 +693,14 @@ sdis_solve_camera
       print_progress_update(scn->dev, progress, PROGRESS_MSG);
     }
   }
+  } /* end use_wavefront scope */
 
   /* Synchronise the processes */
   process_barrier(scn->dev);
 
   res = gather_res_T(scn->dev, (res_T)res);
-  if(res != RES_OK) goto error;
+  if(res != RES_OK) 
+      goto error;
 
   print_progress_completion(scn->dev, progress, PROGRESS_MSG);
   #undef PROGRESS_MSG
@@ -688,12 +714,14 @@ sdis_solve_camera
    * the master process is greater than the RNG proxy state of all other
    * processes */
   res = gather_rng_proxy_sequence_id(scn->dev, rng_proxy);
-  if(res != RES_OK) goto error;
+  if(res != RES_OK) 
+      goto error;
 
   time_current(&time0);
 
   res = gather_tiles(scn->dev, buf, args->spp, ntiles, &tiles);
-  if(res != RES_OK) goto error;
+  if(res != RES_OK) 
+      goto error;
 
   time_sub(&time0, time_current(&time1), &time0);
   time_dump(&time0, TIME_ALL, NULL, buffer, sizeof(buffer));
@@ -701,7 +729,8 @@ sdis_solve_camera
 
   if(is_master_process) {
     res = finalize_estimator_buffer(buf, rng_proxy, args->spp);
-    if(res != RES_OK) goto error;
+    if(res != RES_OK) 
+        goto error;
   }
 
 exit:
