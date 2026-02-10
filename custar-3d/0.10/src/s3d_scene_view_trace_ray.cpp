@@ -34,6 +34,7 @@
 #include "cus3d_trace.h"
 #include "cus3d_prim.h"
 #include "cus3d_geom_store.h"
+#include "cus3d_trace_util.h"
 
 #include <rsys/float3.h>
 #include <float.h>
@@ -46,52 +47,6 @@
 /* Maximum recursive fallback depth when all K candidates are rejected.
  * Prevents infinite recursion in degenerate scenes. */
 #define MAX_FALLBACK_DEPTH 4
-
-/*******************************************************************************
- * Internal: apply UV/normal convention conversion for a single candidate hit
- *
- * GPU kernel returns:
- *   - Triangle: Moller-Trumbore (u, v) and cross(e1, e2) normal
- *   - Sphere:   sphere_normal_to_uv and outward normal
- *
- * s3d convention:
- *   - Triangle UV: uv[0] = w = 1-u-v (v0 weight), uv[1] = u (v1 weight)
- *   - Triangle normal: negated vs cross(e1, e2) (CW winding convention)
- *   - flip_surface: already applied in GPU kernel
- ******************************************************************************/
-static INLINE void
-trace_hit_fixup
-  (struct s3d_hit* hit,
-   const struct geom_entry* ge)
-{
-  ASSERT(hit && ge);
-
-  if(ge->type == PRIM_TRIANGLE) {
-    /* Convert Moller-Trumbore (u,v) to s3d barycentric convention.
-     * M-T: u = edge1 parameter (v1 weight), v = edge2 parameter (v2 weight)
-     * s3d: uv[0] = w = 1-u-v (v0 weight), uv[1] = u (v1 weight)
-     *
-     * The GPU kernel stores M-T u in uv[0] and M-T v in uv[1]. */
-    float mt_u = hit->uv[0];
-    float mt_v = hit->uv[1];
-    float w = 1.0f - mt_u - mt_v;
-    if(w < 0.0f) { /* Handle precision error */
-      if(mt_u > mt_v) mt_u += w;
-      else mt_v += w;
-      w = 0.0f;
-    }
-    hit->uv[0] = w;     /* weight of vertex 0 */
-    hit->uv[1] = mt_u;  /* weight of vertex 1 */
-
-    /* Negate the normal: cross(e1,e2) orientation is opposite to
-     * s3d's CW-winding convention (same as Embree3 flip). */
-    hit->normal[0] = -hit->normal[0];
-    hit->normal[1] = -hit->normal[1];
-    hit->normal[2] = -hit->normal[2];
-  }
-  /* Sphere hits: UV and normal from GPU kernel match s3d convention.
-   * No fixup needed. */
-}
 
 /*******************************************************************************
  * Internal: recursive trace with fallback

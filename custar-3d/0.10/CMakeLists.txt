@@ -54,6 +54,7 @@ set(S3D_CPP_SOURCES
     src/s3d_primitive.cpp
     src/s3d_geometry.cpp
     src/s3d_scene_view_trace_ray.cpp
+    src/s3d_scene_view_batch_trace.cpp
     src/s3d_scene_view_closest_point.cpp
 
     # CUDA host-side C++

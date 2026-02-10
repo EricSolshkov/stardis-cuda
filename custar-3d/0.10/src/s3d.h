@@ -623,6 +623,70 @@ s3d_instance_transform
    const enum s3d_transform_space space,
    const float transform[12]); /* 3x4 column major matrix */
 
+/*******************************************************************************
+ * Batch Ray Tracing API (GPU-accelerated)
+ *
+ * Batch N rays into a single GPU kernel launch via cus3d_trace_ray_batch,
+ * with CPU-side post-processing (UV/normal fixup, filter evaluation).
+ * Rays rejected by the filter fall back to the existing Top-K single trace.
+ ******************************************************************************/
+
+/* Per-ray request descriptor for batch tracing */
+struct s3d_ray_request {
+  float    origin[3];       /* Ray origin */
+  float    direction[3];    /* Ray direction (must be normalized) */
+  float    range[2];        /* [tmin, tmax) */
+  void*    filter_data;     /* NULL = no filter; non-NULL = query_data for filter */
+  uint32_t user_id;         /* Caller-defined tag (for result dispatch) */
+};
+
+/* Statistics from a batch trace call (optional, pass NULL to skip) */
+struct s3d_batch_trace_stats {
+  size_t  total_rays;           /* Total rays submitted */
+  size_t  batch_accepted;       /* Accepted directly from batch */
+  size_t  filter_rejected;      /* Rejected by filter, needed re-trace */
+  size_t  retrace_accepted;     /* Re-trace accepted */
+  size_t  retrace_missed;       /* Re-trace resulted in miss */
+  double  batch_time_ms;        /* GPU batch + upload time */
+  double  postprocess_time_ms;  /* CPU post-processing time */
+  double  retrace_time_ms;      /* Re-trace (fallback) time */
+};
+
+/* Opaque batch trace context for buffer reuse across calls */
+struct s3d_batch_trace_context;
+
+/* Batch trace N rays. Allocates temporary GPU buffers per call.
+ * Can be called only if the scnview was created with the S3D_TRACE flag. */
+S3D_API res_T
+s3d_scene_view_trace_rays_batch
+  (struct s3d_scene_view* scnview,
+   const struct s3d_ray_request* requests,
+   size_t nrays,
+   struct s3d_hit* hits,
+   struct s3d_batch_trace_stats* stats);
+
+/* Create a reusable batch trace context (pre-allocated GPU buffers) */
+S3D_API res_T
+s3d_batch_trace_context_create
+  (struct s3d_batch_trace_context** ctx,
+   size_t max_rays);
+
+/* Destroy a batch trace context */
+S3D_API void
+s3d_batch_trace_context_destroy
+  (struct s3d_batch_trace_context* ctx);
+
+/* Batch trace using a pre-allocated context (avoids per-call allocation).
+ * nrays must not exceed the context's max_rays capacity. */
+S3D_API res_T
+s3d_scene_view_trace_rays_batch_ctx
+  (struct s3d_scene_view* scnview,
+   struct s3d_batch_trace_context* ctx,
+   const struct s3d_ray_request* requests,
+   size_t nrays,
+   struct s3d_hit* hits,
+   struct s3d_batch_trace_stats* stats);
+
 END_DECLS
 #ifdef __cplusplus
 }
