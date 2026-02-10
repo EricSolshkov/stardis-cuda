@@ -37,6 +37,7 @@
 #include "sdis_device_c.h"
 #include "sdis_estimator_buffer_c.h"
 #include "sdis_heat_path_boundary_c.h"
+#include "sdis_heat_path_conductive_c.h"
 #include "sdis_interface_c.h"
 #include "sdis_log.h"
 #include "sdis_medium_c.h"
@@ -263,10 +264,21 @@ init_all_paths(
 
       /* Zero the scratch areas */
       p->ds_delta_solid = 0;
+      p->ds_initialized = 0;
+      p->ds_enc_id = ENCLOSURE_ID_NULL;
+      p->ds_medium = NULL;
+      p->ds_props_ref = SOLID_PROPS_NULL;
+      p->ds_green_power_term = 0;
+      memset(p->ds_position_start, 0, sizeof(p->ds_position_start));
+      p->ds_robust_attempt = 0;
+      p->ds_delta = 0;
+      p->ds_delta_solid_param = 0;
       p->bnd_reinject_distance = 0;
       p->bnd_solid_enc_id = ENCLOSURE_ID_NULL;
       p->bnd_retry_count = 0;
       p->coupled_nbranchings = -1; /* sentinel: not yet entered sample_coupled_path */
+      p->steps_taken = 0;
+      p->done_reason = 0;
 
       path_idx++;
     }
@@ -313,10 +325,11 @@ setup_delta_sphere_rays(struct path_state* p, struct sdis_scene* scn)
   float pos[3];
   float dir[3];
   ASSERT(p && scn);
+  (void)scn;
 
   f3_set_d3(pos, p->rwalk.vtx.P);
 
-  /* Random sphere direction */
+  /* Random sphere direction — matches sample_next_step's RNG call */
   ssp_ran_sphere_uniform_float(p->rng, dir, NULL);
 
   p->ds_dir0[0] = dir[0];
@@ -334,14 +347,14 @@ setup_delta_sphere_rays(struct path_state* p, struct sdis_scene* scn)
   p->ray_req.direction[1] = p->ds_dir0[1];
   p->ray_req.direction[2] = p->ds_dir0[2];
   p->ray_req.range[0] = FLT_MIN;
-  p->ray_req.range[1] = (float)(p->ds_delta_solid * RAY_RANGE_MAX_SCALE);
+  p->ray_req.range[1] = p->ds_delta_solid_param * RAY_RANGE_MAX_SCALE;
 
   /* Ray 1: backward */
   p->ray_req.direction2[0] = p->ds_dir1[0];
   p->ray_req.direction2[1] = p->ds_dir1[1];
   p->ray_req.direction2[2] = p->ds_dir1[2];
   p->ray_req.range2[0] = FLT_MIN;
-  p->ray_req.range2[1] = (float)(p->ds_delta_solid * RAY_RANGE_MAX_SCALE);
+  p->ray_req.range2[1] = p->ds_delta_solid_param * RAY_RANGE_MAX_SCALE;
 
   p->ray_req.ray_count = 2;
   p->needs_ray = 1;
@@ -432,6 +445,7 @@ step_radiative_trace(
     p->phase = PATH_DONE;
     p->active = 0;
     p->needs_ray = 0;
+    p->done_reason = 1; /* radiative miss */
     goto exit;
   }
 
@@ -630,10 +644,9 @@ step_boundary(struct path_state* p, struct sdis_scene* scn)
   if(p->T.done) {
     p->phase = PATH_DONE;
     p->active = 0;
+    p->done_reason = 3; /* boundary done */
     goto exit;
   }
-
-  /* Determine next phase from T.func */
   if(p->T.func == conductive_path_3d) {
     p->phase = PATH_COUPLED_CONDUCTIVE;
   } else if(p->T.func == convective_path_3d) {
@@ -653,45 +666,332 @@ error:
   goto exit;
 }
 
-/* --- PATH_COUPLED_CONDUCTIVE: run conductive_path (contains trace_ray) --- */
+/* --- PATH_COUPLED_CONDUCTIVE: wavefront delta_sphere entry/loop --------- */
 static res_T
 step_conductive(struct path_state* p, struct sdis_scene* scn)
 {
   res_T res = RES_OK;
   ASSERT(p && scn);
 
-  /* The conductive path (delta_sphere or WoS) internally calls trace_ray.
-   * For Phase B-2 M1 (skeleton), we delegate to the original function
-   * which performs its own trace_ray calls synchronously.
-   *
-   * In later milestones, the trace_ray calls inside conductive_path will be
-   * split into explicit wavefront steps with delta_sphere ray emission. */
-
-  res = conductive_path_3d(scn, &p->ctx, &p->rwalk, p->rng, &p->T);
-  if(res != RES_OK && res != RES_BAD_OP) goto error;
-  if(res == RES_BAD_OP) {
-    p->phase = PATH_DONE;
-    p->active = 0;
+  /* Custom paths and WoS: still delegate to the synchronous implementation.
+   * Only delta_sphere is wavefront-ized. */
+  if(p->ctx.diff_algo != SDIS_DIFFUSION_DELTA_SPHERE) {
+    /* WoS or custom — synchronous fallback */
+    res = conductive_path_3d(scn, &p->ctx, &p->rwalk, p->rng, &p->T);
+    if(res != RES_OK && res != RES_BAD_OP) goto error;
+    if(res == RES_BAD_OP) {
+      p->phase = PATH_DONE;
+      p->active = 0;
+      goto exit;
+    }
+    if(p->T.done) {
+      p->phase = PATH_DONE;
+      p->active = 0;
+    } else if(p->T.func == boundary_path_3d) {
+      p->phase = PATH_COUPLED_BOUNDARY;
+    } else if(p->T.func == convective_path_3d) {
+      p->phase = PATH_COUPLED_CONVECTIVE;
+    } else if(p->T.func == radiative_path_3d) {
+      p->phase = PATH_COUPLED_RADIATIVE;
+    } else {
+      FATAL("wavefront: unexpected T.func after conductive_path (fallback)\n");
+    }
     goto exit;
   }
 
-  /* After conductive_path completes, check state */
-  if(p->T.done) {
-    p->phase = PATH_DONE;
-    p->active = 0;
-  } else if(p->T.func == boundary_path_3d) {
-    p->phase = PATH_COUPLED_BOUNDARY;
-  } else if(p->T.func == convective_path_3d) {
-    p->phase = PATH_COUPLED_CONVECTIVE;
-  } else if(p->T.func == radiative_path_3d) {
-    p->phase = PATH_COUPLED_RADIATIVE;
-  } else {
-    FATAL("wavefront: unexpected T.func after conductive_path\n");
+  /* ----- Delta-sphere wavefront path ----- */
+
+  /* Initialization (run once per conductive entry) */
+  if(!p->ds_initialized) {
+    unsigned enc_id = ENCLOSURE_ID_NULL;
+    struct sdis_medium* mdm = NULL;
+
+    res = scene_get_enclosure_id_in_closed_boundaries(
+      scn, p->rwalk.vtx.P, &enc_id);
+    if(res != RES_OK) goto error;
+    res = scene_get_enclosure_medium(
+      scn, scene_get_enclosure(scn, enc_id), &mdm);
+    if(res != RES_OK) goto error;
+
+    /* Must be a solid medium */
+    if(sdis_medium_get_type(mdm) != SDIS_SOLID) {
+      log_err(scn->dev,
+        "wavefront: conductive_path in non-solid medium at "
+        "(%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));
+      res = RES_BAD_OP;
+      goto error;
+    }
+
+    /* Check enclosure consistency */
+    if(enc_id != p->rwalk.enc_id) {
+      log_err(scn->dev,
+        "wavefront: conductive_path enclosure mismatch at "
+        "(%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));
+      res = RES_BAD_OP_IRRECOVERABLE;
+      goto error;
+    }
+
+    p->ds_enc_id = enc_id;
+    p->ds_medium = mdm;
+    d3_set(p->ds_position_start, p->rwalk.vtx.P);
+    solid_get_properties(mdm, &p->rwalk.vtx, &p->ds_props_ref);
+    p->ds_green_power_term = 0;
+    p->ds_initialized = 1;
+    p->ds_robust_attempt = 0;
+  }
+
+  /* --- Each loop iteration of the do-while --- */
+  {
+    struct solid_props props = SOLID_PROPS_NULL;
+
+    /* Fetch current properties */
+    res = solid_get_properties(p->ds_medium, &p->rwalk.vtx, &props);
+    if(res != RES_OK) goto error;
+    res = check_solid_constant_properties(
+      scn->dev, p->ctx.green_path != NULL, 0, &p->ds_props_ref, &props);
+    if(res != RES_OK) goto error;
+
+    /* Check temperature limit condition */
+    if(SDIS_TEMPERATURE_IS_KNOWN(props.temperature)) {
+      p->T.value += props.temperature;
+      p->T.done = 1;
+      if(p->ctx.heat_path) {
+        heat_path_get_last_vertex(p->ctx.heat_path)->weight = p->T.value;
+      }
+      p->phase = PATH_DONE;
+      p->active = 0;
+      p->done_reason = 2; /* temperature known */
+      goto exit;
+    }
+
+    /* Store delta_solid parameter for ray setup */
+    p->ds_delta_solid_param = (float)props.delta;
+    p->ds_robust_attempt = 0;
+
+    /* Emit 2 rays (forward + backward) */
+    setup_delta_sphere_rays(p, scn);
+    p->phase = PATH_COUPLED_COND_DS_PENDING;
   }
 
 exit:
   return res;
 error:
+  /* Mark path as failed */
+  p->phase = PATH_DONE;
+  p->active = 0;
+  p->done_reason = -1;
+  goto exit;
+}
+
+/* --- PATH_COUPLED_COND_DS_PENDING: process 2-ray results (delta sphere) -- */
+static res_T
+step_conductive_ds_process(
+  struct path_state* p,
+  struct sdis_scene* scn,
+  const struct s3d_hit* hit0,
+  const struct s3d_hit* hit1)
+{
+  res_T res = RES_OK;
+  float delta;
+  double delta_m, mu;
+  struct solid_props props = SOLID_PROPS_NULL;
+  const float delta_solid = p->ds_delta_solid_param;
+
+  ASSERT(p && scn && hit0 && hit1);
+
+  p->ds_hit0 = *hit0;
+  p->ds_hit1 = *hit1;
+
+  /* ------ Replicate sample_next_step logic ------ */
+  /* Compute delta = min of the two hit distances */
+  if(S3D_HIT_NONE(hit0) && S3D_HIT_NONE(hit1)) {
+    delta = delta_solid;
+  } else {
+    float d0 = S3D_HIT_NONE(hit0) ? delta_solid * RAY_RANGE_MAX_SCALE
+                                   : hit0->distance;
+    float d1 = S3D_HIT_NONE(hit1) ? delta_solid * RAY_RANGE_MAX_SCALE
+                                   : hit1->distance;
+    delta = MMIN(d0, d1);
+  }
+
+  /* Fix delta ≈ hit0.distance edge case */
+  if(!S3D_HIT_NONE(hit0)
+  && delta != hit0->distance
+  && fabs(hit0->distance - delta) < delta_solid * 0.1f) {
+    delta = hit0->distance;
+  }
+
+  /* Handle snap-to-boundary: if delta <= delta_solid*0.1 and hit1 closer */
+  if(delta <= delta_solid * 0.1f
+  && !S3D_HIT_NONE(hit1) && hit1->distance == delta) {
+    /* Swap: walk toward hit1 (the backward direction) */
+    float tmp[3];
+    struct s3d_hit tmp_hit;
+    f3_set(tmp, p->ds_dir0);
+    f3_set(p->ds_dir0, p->ds_dir1);
+    f3_set(p->ds_dir1, tmp);
+    tmp_hit = p->ds_hit0;
+    p->ds_hit0 = p->ds_hit1;
+    p->ds_hit1 = tmp_hit;
+    /* Recompute hit0 reference */
+    hit0 = &p->ds_hit0;
+    hit1 = &p->ds_hit1;
+  } else if(delta == hit0->distance) {
+    /* dir1 = dir0 (both track the same hit) */
+    f3_set(p->ds_dir1, p->ds_dir0);
+    p->ds_hit1 = *hit0;
+  } else if(!S3D_HIT_NONE(hit1) && delta == hit1->distance) {
+    /* dir1 tracks the backward hit */
+    f3_set(p->ds_dir1, p->ds_dir1); /* already correct */
+    p->ds_hit1 = *hit1;
+  } else {
+    /* No intersection drove delta — dir1 doesn't correspond to a hit */
+    p->ds_dir1[0] = 0; p->ds_dir1[1] = 0; p->ds_dir1[2] = 0;
+    p->ds_hit1 = S3D_HIT_NULL;
+  }
+  p->ds_delta = delta;
+
+  /* ------ Replicate sample_next_step_robust enclosure check ------ */
+  {
+    double pos_next[3];
+    unsigned enc_id = ENCLOSURE_ID_NULL;
+
+    if(S3D_HIT_NONE(&p->ds_hit0) || p->ds_hit0.distance > delta) {
+      /* No hit in forward direction at delta — check next position */
+      d3_set(pos_next, p->rwalk.vtx.P);
+      move_pos_3d(pos_next, p->ds_dir0, delta);
+      res = scene_get_enclosure_id_in_closed_boundaries(
+        scn, pos_next, &enc_id);
+      if(res == RES_BAD_OP) { enc_id = ENCLOSURE_ID_NULL; res = RES_OK; }
+      if(res != RES_OK) goto error;
+    } else {
+      /* Hit at forward — get enclosure from hit primitive */
+      unsigned enc_ids[2] = {ENCLOSURE_ID_NULL, ENCLOSURE_ID_NULL};
+      scene_get_enclosure_ids(scn, p->ds_hit0.prim.prim_id, enc_ids);
+      enc_id = f3_dot(p->ds_dir0, p->ds_hit0.normal) < 0
+             ? enc_ids[0] : enc_ids[1];
+    }
+
+    if(enc_id != p->ds_enc_id) {
+      /* Enclosure mismatch — retry with new direction */
+      p->ds_robust_attempt++;
+      if(p->ds_robust_attempt >= 100) {
+        log_warn(scn->dev,
+          "wavefront: conductive delta_sphere robust exceeded 100 attempts "
+          "at (%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));
+        res = RES_BAD_OP;
+        goto error;
+      }
+      /* Re-emit 2 rays with new random direction */
+      setup_delta_sphere_rays(p, scn);
+      p->phase = PATH_COUPLED_COND_DS_PENDING;
+      goto exit;
+    }
+  }
+
+  /* ------ Robust check passed — proceed with step ------ */
+  res = solid_get_properties(p->ds_medium, &p->rwalk.vtx, &props);
+  if(res != RES_OK) goto error;
+
+  /* Handle volumic power */
+  if(props.power != SDIS_VOLUMIC_POWER_NONE) {
+    double power_term = 0;
+    /* Inline handle_volumic_power logic for 3D */
+    if(S3D_HIT_NONE(&p->ds_hit0) && S3D_HIT_NONE(&p->ds_hit1)) {
+      double dim = (double)delta * scn->fp_to_meter;
+      power_term = dim * dim / (2.0 * 3 * props.lambda);
+      p->T.value += props.power * power_term;
+    } else {
+      const double delta_s_adjusted = delta_solid * RAY_RANGE_MAX_SCALE;
+      const double delta_s_in_meter = delta_solid * scn->fp_to_meter;
+      float N[3] = {0, 0, 0};
+      double cos_U_N, h, h_in_meter;
+
+      if(delta == p->ds_hit0.distance) {
+        f3_normalize(N, p->ds_hit0.normal);
+        cos_U_N = f3_dot(p->ds_dir0, N);
+      } else {
+        f3_normalize(N, p->ds_hit1.normal);
+        cos_U_N = f3_dot(p->ds_dir1, N);
+      }
+      h = delta * fabs(cos_U_N);
+      h_in_meter = h * scn->fp_to_meter;
+
+      power_term = h_in_meter * h_in_meter / (2.0 * props.lambda);
+
+      if(h == delta_s_adjusted) {
+        power_term += -(delta_s_in_meter * delta_s_in_meter)
+                     / (2.0 * 3 * props.lambda);
+      } else if(h < delta_s_adjusted) {
+        const double sin_a = h / delta_s_adjusted;
+        /* 3D correction */
+        const double tmp = (sin_a*sin_a*sin_a - sin_a) / (1 - sin_a);
+        power_term += (delta_s_in_meter * delta_s_in_meter)
+                    / (6.0 * props.lambda) * tmp;
+      }
+      p->T.value += props.power * power_term;
+    }
+
+    if(p->ctx.green_path && props.power != SDIS_VOLUMIC_POWER_NONE) {
+      p->ds_green_power_term += power_term;
+    }
+  }
+
+  /* Time rewind */
+  delta_m = (double)delta * scn->fp_to_meter;
+  mu = (2.0 * 3 * props.lambda) / (props.rho * props.cp * delta_m * delta_m);
+  res = time_rewind(scn, mu, props.t0, p->rng, &p->rwalk, &p->ctx, &p->T);
+  if(res != RES_OK) goto error;
+  if(p->T.done) {
+    p->phase = PATH_DONE;
+    p->active = 0;
+    p->done_reason = 4; /* time rewind */
+    goto exit;
+  }
+
+  /* Update hit info */
+  if(S3D_HIT_NONE(&p->ds_hit0) || p->ds_hit0.distance > delta) {
+    p->rwalk.hit_3d = S3D_HIT_NULL;
+    p->rwalk.hit_side = SDIS_SIDE_NULL__;
+  } else {
+    p->rwalk.hit_3d = p->ds_hit0;
+    p->rwalk.hit_side = f3_dot(p->ds_hit0.normal, p->ds_dir0) < 0
+                      ? SDIS_FRONT : SDIS_BACK;
+  }
+
+  /* Move position */
+  move_pos_3d(p->rwalk.vtx.P, p->ds_dir0, delta);
+
+  /* Register heat path vertex */
+  res = register_heat_vertex(p->ctx.heat_path, &p->rwalk.vtx, p->T.value,
+    SDIS_HEAT_VERTEX_CONDUCTION, (int)p->ctx.nbranchings);
+  if(res != RES_OK) goto error;
+
+  /* Check loop condition: keep walking while no hit */
+  if(S3D_HIT_NONE(&p->rwalk.hit_3d)) {
+    /* Still inside solid — enter next iteration */
+    p->phase = PATH_COUPLED_CONDUCTIVE;
+    p->needs_ray = 0;
+  } else {
+    /* Hit boundary — register green power term and transition */
+    if(p->ctx.green_path && p->ds_props_ref.power != SDIS_VOLUMIC_POWER_NONE) {
+      green_path_add_power_term(
+        p->ctx.green_path, p->ds_medium,
+        &p->rwalk.vtx, p->ds_green_power_term);
+    }
+    p->T.func = boundary_path_3d;
+    p->rwalk.enc_id = ENCLOSURE_ID_NULL;
+    p->ds_initialized = 0; /* reset for next conductive entry */
+    p->phase = PATH_COUPLED_BOUNDARY;
+    p->needs_ray = 0;
+  }
+
+exit:
+  return res;
+error:
+  p->phase = PATH_DONE;
+  p->active = 0;
+  p->done_reason = -1;
   goto exit;
 }
 
@@ -837,10 +1137,11 @@ advance_one_step_with_ray(struct path_state* p, struct sdis_scene* scn,
     res = step_radiative_trace(p, scn, hit0);
     break;
 
-  /* Future milestones will handle these with explicit ray results:
-   * case PATH_COUPLED_COND_DS_PENDING:
-   *   res = step_conductive_delta_sphere(p, scn, hit0, hit1);
-   *   break;
+  case PATH_COUPLED_COND_DS_PENDING:
+    res = step_conductive_ds_process(p, scn, hit0, hit1);
+    break;
+
+  /* Future milestones for boundary reinject:
    * case PATH_COUPLED_BOUNDARY_REINJECT:
    *   res = step_boundary_reinject(p, scn, hit0, hit1);
    *   break;
@@ -866,6 +1167,17 @@ collect_ray_requests(struct wavefront_context* wf)
     struct path_state* p = &wf->paths[i];
     if(!p->active || !p->needs_ray) continue;
     if(p->ray_req.ray_count < 1) continue;
+
+    /* Detailed stats: count by phase type */
+    if(p->phase == PATH_RAD_TRACE_PENDING)
+      wf->rays_radiative += (size_t)p->ray_req.ray_count;
+    else if(p->phase == PATH_COUPLED_COND_DS_PENDING) {
+      wf->conductive_steps++;
+      if(p->ds_robust_attempt > 0)
+        wf->rays_conductive_ds_retry += (size_t)p->ray_req.ray_count;
+      else
+        wf->rays_conductive_ds += (size_t)p->ray_req.ray_count;
+    }
 
     /* Ray 0 */
     {
@@ -962,8 +1274,10 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
       if(res == RES_BAD_OP) {
         p->phase = PATH_DONE;
         p->active = 0;
+        wf->paths_failed++;
         res = RES_OK; /* treated as path failure, not fatal */
       }
+      p->steps_taken++;
     }
   }
 
@@ -992,10 +1306,12 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
         if(res == RES_BAD_OP) {
           p->phase = PATH_DONE;
           p->active = 0;
+          wf->paths_failed++;
           res = RES_OK;
           break;
         }
         if(!advanced) break;
+        p->steps_taken++;
       }
     }
   }
@@ -1003,21 +1319,26 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
   return RES_OK;
 }
 
-/* Count active paths */
+/* Count active paths and compute per-path diagnostics */
 static void
 update_active_count(struct wavefront_context* wf)
 {
   size_t i, count = 0;
+  size_t max_depth = 0;
   for(i = 0; i < wf->total_paths; i++) {
     if(wf->paths[i].active) count++;
+    if(wf->paths[i].steps_taken > max_depth)
+      max_depth = wf->paths[i].steps_taken;
   }
   wf->active_count = count;
+  if(max_depth > wf->max_wavefront_depth)
+    wf->max_wavefront_depth = max_depth;
 }
 
 /* Collect results from completed paths into tile pixels */
 static res_T
 collect_results(
-  const struct wavefront_context* wf,
+  struct wavefront_context* wf,
   const size_t tile_size[2],
   struct tile* tile)
 {
@@ -1038,6 +1359,16 @@ collect_results(
       pix->acc_temp.count += 1;
       /* We don't track time per-realisation in wavefront mode yet */
       pix->acc_time.count += 1;
+    }
+
+    /* Classify path termination for statistics */
+    switch(p->done_reason) {
+    case 1:  wf->paths_done_radiative++;   break; /* radiative miss     */
+    case 2:  wf->paths_done_temperature++; break; /* temperature known  */
+    case 3:  wf->paths_done_boundary++;    break; /* boundary done      */
+    case 4:  wf->paths_done_temperature++; break; /* time rewind        */
+    case -1: wf->paths_failed++;           break; /* error              */
+    default: break;
     }
   }
 
@@ -1068,6 +1399,7 @@ solve_tile_wavefront(
   const size_t npixels = tile_size[0] * tile_size[1];
   const size_t total_paths = npixels * spp;
   res_T res = RES_OK;
+  struct time t_start, t_end, t_elapsed;
 
   ASSERT(scn && base_rng && cam && spp);
   ASSERT(tile_size && tile_size[0] && tile_size[1]);
@@ -1109,15 +1441,18 @@ solve_tile_wavefront(
         if(res == RES_BAD_OP) {
           p->phase = PATH_DONE;
           p->active = 0;
+          p->done_reason = -1;
           res = RES_OK;
           break;
         }
         if(!advanced) break;
+        p->steps_taken++;
       }
     }
   }
 
   /* ====== Wavefront main loop ====== */
+  time_current(&t_start);
   while(wf.active_count > 0) {
     wf.total_steps++;
 
@@ -1151,7 +1486,8 @@ solve_tile_wavefront(
 
     /* Step C: Distribute results + advance paths */
     res = distribute_and_advance(&wf, scn);
-    if(res != RES_OK) goto cleanup;
+    if(res != RES_OK) 
+        goto cleanup;
 
     /* Step D: Update active count */
     update_active_count(&wf);
@@ -1171,6 +1507,34 @@ solve_tile_wavefront(
 
   /* ====== Collect results into tile ====== */
   res = collect_results(&wf, tile_size, tile);
+
+  /* ====== Summary logging ====== */
+  time_current(&t_end);
+  time_sub(&t_elapsed, &t_end, &t_start);
+  {
+    char time_str[128];
+    time_dump(&t_elapsed, TIME_ALL, NULL, time_str, sizeof(time_str));
+    log_info(scn->dev,
+      "wavefront tile (%lu,%lu) %lux%lu spp=%lu:  "
+      "elapsed=%s  steps=%lu  rays=%lu  "
+      "(rad=%lu cond_ds=%lu ds_retry=%lu)  "
+      "done: rad=%lu temp=%lu bnd=%lu fail=%lu  "
+      "max_depth=%lu\n",
+      (unsigned long)tile_org[0], (unsigned long)tile_org[1],
+      (unsigned long)tile_size[0], (unsigned long)tile_size[1],
+      (unsigned long)spp,
+      time_str,
+      (unsigned long)wf.total_steps,
+      (unsigned long)wf.total_rays_traced,
+      (unsigned long)wf.rays_radiative,
+      (unsigned long)wf.rays_conductive_ds,
+      (unsigned long)wf.rays_conductive_ds_retry,
+      (unsigned long)wf.paths_done_radiative,
+      (unsigned long)wf.paths_done_temperature,
+      (unsigned long)wf.paths_done_boundary,
+      (unsigned long)wf.paths_failed,
+      (unsigned long)wf.max_wavefront_depth);
+  }
 
 cleanup:
   wf_context_destroy(&wf);

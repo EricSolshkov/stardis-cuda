@@ -36,6 +36,7 @@
 
 #include "sdis.h"
 #include "sdis_heat_path.h"
+#include "sdis_medium_c.h"
 #include "sdis_scene_c.h"
 #include "sdis_tile.h"
 
@@ -124,6 +125,17 @@ struct path_state {
   struct s3d_hit ds_hit0, ds_hit1;
   double  ds_delta_solid;
 
+  /* --- Conductive delta-sphere persistent state (wavefront M3) --- */
+  int     ds_initialized;         /* 1 = init phase done                   */
+  unsigned ds_enc_id;             /* enclosure id for conductive walk       */
+  struct sdis_medium* ds_medium;  /* solid medium pointer                   */
+  struct solid_props  ds_props_ref; /* reference properties at start        */
+  double  ds_green_power_term;    /* accumulated green function power       */
+  double  ds_position_start[3];   /* starting position backup              */
+  int     ds_robust_attempt;      /* robust retry counter                   */
+  float   ds_delta;               /* computed step distance                 */
+  float   ds_delta_solid_param;   /* props.delta (medium step parameter)    */
+
   /* --- Boundary reinjection scratch --- */
   struct s3d_hit bnd_hit0, bnd_hit1;
   double  bnd_reinject_distance;
@@ -132,6 +144,12 @@ struct path_state {
 
   /* --- Filter data for current ray request --- */
   struct hit_filter_data  filter_data_storage;
+
+  /* --- Diagnostics --- */
+  size_t  steps_taken;                 /* total steps this path has taken     */
+  int     done_reason;                 /* 0=none, 1=rad_miss, 2=temp_known,
+                                          3=boundary_done, 4=time_rewind,
+                                          -1=failed                          */
 
   /* --- Ray request output (set by step functions) --- */
   struct path_ray_request ray_req;
@@ -172,6 +190,17 @@ struct wavefront_context {
   /* Statistics */
   size_t  total_steps;
   size_t  total_rays_traced;
+
+  /* Detailed statistics (M4/M5 diagnostics) */
+  size_t  rays_radiative;          /* rays from radiative path traces       */
+  size_t  rays_conductive_ds;      /* rays from delta-sphere (2 per step)   */
+  size_t  rays_conductive_ds_retry;/* robust retry re-traces                */
+  size_t  paths_done_radiative;    /* paths terminated in radiative miss    */
+  size_t  paths_done_temperature;  /* paths terminated by known temperature */
+  size_t  paths_done_boundary;     /* paths terminated by boundary/absorb   */
+  size_t  paths_failed;            /* paths that errored out                */
+  size_t  conductive_steps;        /* delta-sphere iteration count          */
+  size_t  max_wavefront_depth;     /* max steps any single path took        */
 };
 
 /*******************************************************************************

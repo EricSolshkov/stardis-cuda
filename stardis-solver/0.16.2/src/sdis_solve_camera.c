@@ -617,8 +617,8 @@ sdis_solve_camera
    * Phase B-1 batch trace API. */
   {
     const char* wf_env = getenv("STARDIS_WAVEFRONT");
-    //const int use_wavefront = (wf_env && wf_env[0] == '1');
-    const int use_wavefront = 1;
+    /* Default to wavefront ON; set STARDIS_WAVEFRONT=0 to disable */
+    const int use_wavefront = !(wf_env && wf_env[0] == '0');
 
     if(use_wavefront) {
       log_info(scn->dev, "Wavefront solver enabled (Phase B-2).\n");

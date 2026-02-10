@@ -174,6 +174,7 @@ if(ENABLE_TESTS)
         src/test_sdis_volumic_power2.c
         src/test_sdis_volumic_power2_2d.c
         src/test_sdis_volumic_power3_2d.c
+        src/test_sdis_wavefront_benchmark.c
     )
     
     foreach(test_src ${SDIS_LONG_TESTS})
