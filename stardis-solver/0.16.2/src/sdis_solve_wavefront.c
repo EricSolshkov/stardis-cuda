@@ -1270,10 +1270,12 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
       }
 
       res = advance_one_step_with_ray(p, scn, h0, h1);
-      if(res != RES_OK && res != RES_BAD_OP) return res;
-      if(res == RES_BAD_OP) {
+      if(res != RES_OK && res != RES_BAD_OP
+      && res != RES_BAD_OP_IRRECOVERABLE) return res;
+      if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
         p->phase = PATH_DONE;
         p->active = 0;
+        p->done_reason = -1;
         wf->paths_failed++;
         res = RES_OK; /* treated as path failure, not fatal */
       }
@@ -1302,10 +1304,12 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
         }
 
         res = advance_one_step_no_ray(p, scn, &advanced);
-        if(res != RES_OK && res != RES_BAD_OP) return res;
-        if(res == RES_BAD_OP) {
+        if(res != RES_OK && res != RES_BAD_OP
+        && res != RES_BAD_OP_IRRECOVERABLE) return res;
+        if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
           p->phase = PATH_DONE;
           p->active = 0;
+          p->done_reason = -1;
           wf->paths_failed++;
           res = RES_OK;
           break;
@@ -1378,6 +1382,7 @@ collect_results(
 /*******************************************************************************
  * Public entry point
  ******************************************************************************/
+#ifndef SDIS_SOLVE_WAVEFRONT_SKIP_PUBLIC_API
 res_T
 solve_tile_wavefront(
   struct sdis_scene* scn,
@@ -1436,9 +1441,10 @@ solve_tile_wavefront(
         || p->phase == PATH_COUPLED_BOUNDARY_REINJECT) break;
 
         res = advance_one_step_no_ray(p, scn, &advanced);
-        if(res != RES_OK && res != RES_BAD_OP) 
+        if(res != RES_OK && res != RES_BAD_OP
+        && res != RES_BAD_OP_IRRECOVERABLE)
             goto cleanup;
-        if(res == RES_BAD_OP) {
+        if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
           p->phase = PATH_DONE;
           p->active = 0;
           p->done_reason = -1;
@@ -1540,3 +1546,4 @@ cleanup:
   wf_context_destroy(&wf);
   return res;
 }
+#endif /* SDIS_SOLVE_WAVEFRONT_SKIP_PUBLIC_API */

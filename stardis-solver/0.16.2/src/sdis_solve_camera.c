@@ -23,6 +23,7 @@
 #include "sdis_realisation.h"
 #include "sdis_scene_c.h"
 #include "sdis_solve_wavefront.h"
+#include "sdis_solve_persistent_wavefront.h"
 #include "sdis_tile.h"
 #ifdef SDIS_ENABLE_MPI
   #include "sdis_mpi.h"
@@ -610,6 +611,33 @@ sdis_solve_camera
   register_paths = is_master_process
     ? args->register_paths : SDIS_HEAT_PATH_NONE;
 
+  /* Phase B-3: persistent wavefront mode.
+   * Set STARDIS_PERSISTENT_WF=1 to use the persistent wavefront pool that
+   * processes the entire image in a single global pool (no per-tile
+   * isolation).  This dramatically improves GPU utilisation. */
+  {
+    const char* pwf_env = getenv("STARDIS_PERSISTENT_WF");
+    //const int use_persistent_wf = (pwf_env && pwf_env[0] == '1');
+    const int use_persistent_wf = 1;
+
+    if(use_persistent_wf) {
+      log_info(scn->dev, "Persistent wavefront solver enabled (Phase B-3).\n");
+
+      res = solve_camera_persistent_wavefront(
+        scn, per_thread_rng, scn->dev->nthreads,
+        enc_id, args->cam, args->time_range,
+        args->image_definition, args->spp, register_paths,
+        pix_sz, args->picard_order, args->diff_algo, buf,
+        progress, pcent_progress, PROGRESS_MSG);
+      if(res != RES_OK) goto error;
+
+      print_progress_completion(scn->dev, progress, PROGRESS_MSG);
+
+      /* Skip tile-based loop and gather — results already in buf */
+      goto persistent_wf_done;
+    }
+  }
+
   /* Phase B-2: wavefront mode toggle.
    * Set STARDIS_WAVEFRONT=1 to use the wavefront solver instead of the
    * original per-pixel depth-first solver.  The wavefront solver batches
@@ -727,6 +755,7 @@ sdis_solve_camera
   time_dump(&time0, TIME_ALL, NULL, buffer, sizeof(buffer));
   log_info(scn->dev, "Image tiles gathered in %s.\n", buffer);
 
+persistent_wf_done:
   if(is_master_process) {
     res = finalize_estimator_buffer(buf, rng_proxy, args->spp);
     if(res != RES_OK) 
