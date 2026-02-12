@@ -126,6 +126,13 @@ s3d_device_ref_put(struct s3d_device* dev)
   return RES_OK;
 }
 
+int
+s3d_device_get_gpu_sm_count(struct s3d_device* dev)
+{
+  if(!dev || !dev->gpu) return 0;
+  return dev->gpu->sm_count;
+}
+
 /*******************************************************************************
  * Local functions
  ******************************************************************************/

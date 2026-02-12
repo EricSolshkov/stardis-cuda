@@ -245,6 +245,11 @@ S3D_API res_T
 s3d_device_ref_put
   (struct s3d_device* dev);
 
+/* Query GPU streaming multiprocessor count (0 if no GPU). */
+S3D_API int
+s3d_device_get_gpu_sm_count
+  (struct s3d_device* dev);
+
 /*******************************************************************************
  * Scene API - A scene is a collection of untyped shapes. It can be ray-traced
  * and/or "instantiated" through a shape.
@@ -686,6 +691,70 @@ s3d_scene_view_trace_rays_batch_ctx
    size_t nrays,
    struct s3d_hit* hits,
    struct s3d_batch_trace_stats* stats);
+
+/*******************************************************************************
+ * Batch Closest Point API (GPU-accelerated)
+ *
+ * Batch N closest-point queries into a single GPU kernel launch via
+ * cus3d_closest_point_batch, with CPU-side post-processing (filter
+ * evaluation).  Queries rejected by the filter fall back to the existing
+ * single closest_point (brute-force).
+ ******************************************************************************/
+
+/* Per-query request descriptor for batch closest point */
+struct s3d_cp_request {
+  float    pos[3];         /* Query position */
+  float    radius;         /* Maximum search radius */
+  void*    query_data;     /* NULL = no filter; non-NULL = data for filter */
+  uint32_t user_id;        /* Caller-defined tag (for result dispatch) */
+};
+
+/* Statistics from a batch closest point call (optional, pass NULL to skip) */
+struct s3d_batch_cp_stats {
+  size_t  total_queries;        /* Total queries submitted */
+  size_t  batch_accepted;       /* Accepted directly from GPU batch */
+  size_t  filter_rejected;      /* Rejected by filter, needed re-query */
+  size_t  requery_accepted;     /* Re-query (CPU fallback) accepted */
+  size_t  requery_missed;       /* Re-query resulted in miss */
+  double  batch_time_ms;        /* GPU batch + upload time */
+  double  postprocess_time_ms;  /* CPU post-processing time */
+  double  requery_time_ms;      /* Re-query (CPU fallback) time */
+};
+
+/* Opaque batch closest point context for buffer reuse across calls */
+struct s3d_batch_cp_context;
+
+/* Batch closest point on N queries. Allocates temporary GPU buffers per call.
+ * Can be called only if the scnview was created with the S3D_TRACE flag. */
+S3D_API res_T
+s3d_scene_view_closest_point_batch
+  (struct s3d_scene_view* scnview,
+   const struct s3d_cp_request* requests,
+   size_t nqueries,
+   struct s3d_hit* hits,
+   struct s3d_batch_cp_stats* stats);
+
+/* Create a reusable batch closest point context (pre-allocated GPU buffers) */
+S3D_API res_T
+s3d_batch_cp_context_create
+  (struct s3d_batch_cp_context** ctx,
+   size_t max_queries);
+
+/* Destroy a batch closest point context */
+S3D_API void
+s3d_batch_cp_context_destroy
+  (struct s3d_batch_cp_context* ctx);
+
+/* Batch closest point using a pre-allocated context.
+ * nqueries must not exceed the context's max_queries capacity. */
+S3D_API res_T
+s3d_scene_view_closest_point_batch_ctx
+  (struct s3d_scene_view* scnview,
+   struct s3d_batch_cp_context* ctx,
+   const struct s3d_cp_request* requests,
+   size_t nqueries,
+   struct s3d_hit* hits,
+   struct s3d_batch_cp_stats* stats);
 
 END_DECLS
 #ifdef __cplusplus

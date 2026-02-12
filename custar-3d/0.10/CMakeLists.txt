@@ -56,6 +56,7 @@ set(S3D_CPP_SOURCES
     src/s3d_scene_view_trace_ray.cpp
     src/s3d_scene_view_batch_trace.cpp
     src/s3d_scene_view_closest_point.cpp
+    src/s3d_scene_view_batch_closest_point.cpp
 
     # CUDA host-side C++
     src/cus3d_device.cpp
@@ -68,6 +69,7 @@ set(S3D_CUDA_SOURCES
     src/cus3d_geom_store.cu
     src/cus3d_bvh.cu
     src/cus3d_trace.cu
+    src/cus3d_closest_point.cu
     src/cus3d_math.cu
 )
 
