@@ -29,6 +29,12 @@
  * scanning the full pool.  Paths are also bucketed by type (radiative vs
  * conductive) for cache-friendly step dispatch.
  *
+ * M3: Bucketed step dispatch + adaptive pool_size + enhanced diagnostics.
+ * Ray results are distributed via per-type loops (radiative then conductive)
+ * instead of a generic switch dispatch, improving branch prediction and
+ * cache locality.  pool_size is computed from GPU SM count.  Per-phase
+ * timing and average wavefront width are tracked for performance analysis.
+ *
  * Key design points:
  *   - Single-threaded CPU scheduling (no OMP) — one CUDA stream, no races.
  *   - Per-slot RNG shared from solve_camera's per_thread_rng via ref_get().
@@ -125,6 +131,7 @@ struct wavefront_pool {
   /* --- Drain phase control (M2) --- */
   int                 in_drain_phase;  /* 1 = task_queue exhausted          */
   size_t              drain_step_count;/* steps taken in drain phase        */
+  size_t              drain_fallback_threshold; /* batch < this → CPU (M3.5)*/
 
   /* --- Statistics --- */
   size_t total_steps;
@@ -141,12 +148,26 @@ struct wavefront_pool {
   size_t paths_done_temperature;
   size_t paths_done_boundary;
 
-  /* Diagnostics (M2.5) */
+  /* Diagnostics (M2.5 + M3) */
   size_t diag_min_batch;    /* smallest batch size seen              */
   size_t diag_max_batch;    /* largest batch size seen               */
   size_t diag_refill_count; /* total refill operations               */
   size_t diag_drain_rays;   /* rays traced during drain phase        */
   size_t diag_refill_rays;  /* rays traced during refill phase       */
+
+  /* M3: Per-phase wall-clock timing (seconds) */
+  double time_collect_s;    /* cumulative collect_ray_requests time  */
+  double time_trace_s;      /* cumulative GPU batch trace time       */
+  double time_distribute_s; /* cumulative distribute+advance time    */
+  double time_cascade_s;    /* cumulative cascade non-ray time       */
+  double time_compact_s;    /* cumulative stream compaction time     */
+  double time_harvest_s;    /* cumulative harvest+refill time        */
+  double time_refill_phase_s; /* wall-clock of refill phase total    */
+  double time_drain_phase_s;  /* wall-clock of drain phase total     */
+
+  /* M3: Wavefront width tracking */
+  size_t diag_total_active; /* sum of active_count across all steps  */
+  size_t paths_truncated;   /* paths force-terminated in drain (M3.5)*/
 };
 
 /*******************************************************************************
