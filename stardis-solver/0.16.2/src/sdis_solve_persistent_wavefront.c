@@ -345,11 +345,10 @@ advance_path_to_first_ray(struct path_state* p,
                           struct wavefront_pool* pool)
 {
   res_T res = RES_OK;
-  while(p->active && !p->needs_ray && p->phase != PATH_DONE) {
+  while(p->active && !p->needs_ray && p->phase != PATH_DONE
+      && p->phase != PATH_ERROR) {
     int advanced = 0;
-    if(p->phase == PATH_RAD_TRACE_PENDING
-    || p->phase == PATH_COUPLED_COND_DS_PENDING
-    || p->phase == PATH_COUPLED_BOUNDARY_REINJECT) break;
+    if(path_phase_is_ray_pending(p->phase)) break;
 
     res = advance_one_step_no_ray(p, scn, &advanced);
     if(res != RES_OK && res != RES_BAD_OP
@@ -429,7 +428,7 @@ compact_active_paths(struct wavefront_pool* pool)
   for(i = 0; i < pool->pool_size; i++) {
     struct path_state* p = &pool->slots[i];
 
-    if(p->phase == PATH_DONE) {
+    if(p->phase == PATH_DONE || p->phase == PATH_ERROR) {
       pool->done_indices[pool->done_count++] = (uint32_t)i;
       continue;
     }
@@ -665,12 +664,8 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
     for(;;) {
       int advanced = 0;
       if(p->needs_ray) break;
-      if(p->phase == PATH_DONE) break;
-      if(p->phase == PATH_RAD_TRACE_PENDING
-      || p->phase == PATH_COUPLED_COND_DS_PENDING
-      || p->phase == PATH_COUPLED_BOUNDARY_REINJECT) {
-        break;
-      }
+      if(p->phase == PATH_DONE || p->phase == PATH_ERROR) break;
+      if(path_phase_is_ray_pending(p->phase)) break;
 
       res = advance_one_step_no_ray(p, scn, &advanced);
       if(res != RES_OK && res != RES_BAD_OP
@@ -711,7 +706,8 @@ harvest_completed_paths(
     struct path_state* p = &pool->slots[i];
 
     /* Skip if already harvested (active==0 AND phase reset) */
-    if(!p->active && p->phase != PATH_DONE) continue;
+    if(!p->active && p->phase != PATH_DONE && p->phase != PATH_ERROR)
+      continue;
 
     {
       struct sdis_estimator* estimator =
@@ -774,7 +770,7 @@ refill_pool(struct wavefront_pool* pool, size_t* out_refill_count)
 
     /* Only refill slots that have been harvested */
     if(p->active) continue;
-    if(p->phase != PATH_DONE) continue;
+    if(p->phase != PATH_DONE && p->phase != PATH_ERROR) continue;
     if(pool->task_next >= pool->task_count) break;
 
     {

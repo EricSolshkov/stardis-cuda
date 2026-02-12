@@ -49,26 +49,154 @@ struct sdis_estimator_buffer;
 
 /*******************************************************************************
  * Path phase — models the state machine of a single Monte-Carlo path.
+ *
+ * Phase B-4: Fine-grained explicit state machine (~45 states).
+ * Each trace_ray call site becomes a wavefront suspend/resume point.
+ *
+ * Legend:
+ *   🔴 = ray-pending (needs batch trace result before resuming)
+ *   ✅ = pure-compute (advances without ray)
+ *
+ * States marked [B4-FUTURE] are defined here for completeness but currently
+ * fall through to the original synchronous code path.  They will be activated
+ * in subsequent B-4 milestones.
  ******************************************************************************/
 enum path_phase {
   /* === Initialisation === */
-  PATH_INIT,                          /* Not yet started                      */
+  PATH_INIT,                              /* ✅ Not yet started               */
 
   /* === Radiative path phases === */
-  PATH_RAD_TRACE_PENDING,             /* trace_ray request submitted          */
-  PATH_RAD_PROCESS_HIT,               /* hit obtained, processing BRDF/emit  */
+  PATH_RAD_TRACE_PENDING,                 /* 🔴 trace_ray submitted           */
+  PATH_RAD_PROCESS_HIT,                   /* ✅ hit: BRDF/emit [B4-FUTURE]    */
 
-  /* === Coupled path state machine === */
-  PATH_COUPLED_BOUNDARY,              /* boundary_path decision               */
-  PATH_COUPLED_BOUNDARY_REINJECT,     /* find_reinjection_ray: wait for trace */
-  PATH_COUPLED_CONDUCTIVE,            /* conductive_path entry                */
-  PATH_COUPLED_COND_DS_PENDING,       /* delta_sphere 2-ray wait             */
-  PATH_COUPLED_CONVECTIVE,            /* convective_path                      */
-  PATH_COUPLED_RADIATIVE,             /* bounce into radiative from boundary  */
+  /* === Coupled path state machine (B-2/B-3 legacy) === */
+  PATH_COUPLED_BOUNDARY,                  /* ✅ boundary_path decision         */
+  PATH_COUPLED_BOUNDARY_REINJECT,         /* 🔴 find_reinjection_ray wait     */
+  PATH_COUPLED_CONDUCTIVE,                /* ✅ conductive_path entry          */
+  PATH_COUPLED_COND_DS_PENDING,           /* 🔴 delta_sphere 2-ray wait       */
+  PATH_COUPLED_CONVECTIVE,                /* ✅ convective_path                */
+  PATH_COUPLED_RADIATIVE,                 /* ✅ bounce into radiative          */
+
+  /* === B-4 Fine-grained: Boundary dispatch === */
+  PATH_BND_DISPATCH,                      /* ✅ type → 3-way dispatch  [B4-FUTURE] */
+  PATH_BND_POST_ROBIN_CHECK,              /* ✅ Robin post-check       [B4-FUTURE] */
+
+  /* === B-4: Solid/Solid boundary === */
+  PATH_BND_SS_REINJECT_SAMPLE,            /* 🔴 4 reinjection rays     [B4-FUTURE] */
+  PATH_BND_SS_REINJECT_ENC,               /* 🔴 miss → ENC sub-query   [B4-FUTURE] */
+  PATH_BND_SS_REINJECT_DECIDE,            /* ✅ probability decision    [B4-FUTURE] */
+
+  /* === B-4: Solid/Fluid picard1 boundary === */
+  PATH_BND_SF_REINJECT_SAMPLE,            /* 🔴 2 reinjection rays     [B4-FUTURE] */
+  PATH_BND_SF_REINJECT_ENC,               /* 🔴 miss → ENC sub-query   [B4-FUTURE] */
+  PATH_BND_SF_PROB_DISPATCH,              /* ✅ prob dispatch           [B4-FUTURE] */
+  PATH_BND_SF_NULLCOLL_RAD_TRACE,         /* 🔴 null-collision rad ray [B4-FUTURE] */
+  PATH_BND_SF_NULLCOLL_DECIDE,            /* ✅ accept/reject          [B4-FUTURE] */
+
+  /* === B-4: Solid/Fluid picardN boundary === */
+  PATH_BND_SFN_PROB_DISPATCH,             /* ✅ prob + stack mgmt      [B4-FUTURE] */
+  PATH_BND_SFN_RAD_TRACE,                 /* 🔴 rad sub-path ray      [B4-FUTURE] */
+  PATH_BND_SFN_RAD_DONE,                  /* ✅ rad sub-path done      [B4-FUTURE] */
+  PATH_BND_SFN_COMPUTE_Ti,                /* ✅ push sub-path          [B4-FUTURE] */
+  PATH_BND_SFN_COMPUTE_Ti_RESUME,         /* ✅ pop sub-path           [B4-FUTURE] */
+  PATH_BND_SFN_CHECK_PMIN_PMAX,           /* ✅ early accept/reject    [B4-FUTURE] */
+
+  /* === B-4: External net flux (picard sub-process) === */
+  PATH_BND_EXT_CHECK,                     /* ✅ need ext flux?         [B4-FUTURE] */
+  PATH_BND_EXT_DIRECT_TRACE,              /* 🔴 shadow ray             [B4-FUTURE] */
+  PATH_BND_EXT_DIRECT_RESULT,             /* ✅ shadow result          [B4-FUTURE] */
+  PATH_BND_EXT_DIFFUSE_TRACE,             /* 🔴 diffuse bounce ray    [B4-FUTURE] */
+  PATH_BND_EXT_DIFFUSE_RESULT,            /* ✅ bounce result          [B4-FUTURE] */
+  PATH_BND_EXT_DIFFUSE_SHADOW_TRACE,      /* 🔴 bounce shadow ray     [B4-FUTURE] */
+  PATH_BND_EXT_DIFFUSE_SHADOW_RESULT,     /* ✅ bounce shadow result  [B4-FUTURE] */
+  PATH_BND_EXT_FINALIZE,                  /* ✅ sum flux → return      [B4-FUTURE] */
+
+  /* === B-4: Conductive path === */
+  PATH_CND_INIT_ENC,                      /* 🔴 init ENC query         [B4-FUTURE] */
+
+  /* --- Delta-sphere conductive --- */
+  PATH_CND_DS_CHECK_TEMP,                 /* ✅ check known temp        [B4-FUTURE] */
+  PATH_CND_DS_STEP_TRACE,                 /* 🔴 2 step rays (dir0+dir1)[B4-FUTURE] */
+  PATH_CND_DS_STEP_PROCESS,               /* ✅ process hit0/hit1       [B4-FUTURE] */
+  PATH_CND_DS_STEP_ENC_VERIFY,            /* 🔴 ENC verify             [B4-FUTURE] */
+  PATH_CND_DS_STEP_ADVANCE,               /* ✅ pos update + loop      [B4-FUTURE] */
+
+  /* --- Walk on Spheres (WoS) conductive --- */
+  PATH_CND_WOS_CHECK_TEMP,                /* ✅ check known temp        [B4-FUTURE] */
+  PATH_CND_WOS_CLOSEST,                   /* 🔴 closest_point query    [B4-FUTURE] */
+  PATH_CND_WOS_CLOSEST_RESULT,            /* ✅ ε-shell / diffuse      [B4-FUTURE] */
+  PATH_CND_WOS_FALLBACK_TRACE,            /* 🔴 fallback trace_ray    [B4-FUTURE] */
+  PATH_CND_WOS_FALLBACK_RESULT,           /* ✅ fallback result        [B4-FUTURE] */
+  PATH_CND_WOS_TIME_TRAVEL,               /* ✅ time rewind + loop     [B4-FUTURE] */
+
+  /* --- Custom conductive (Phase 7 plugin) --- */
+  PATH_CND_CUSTOM,                        /* ✅ custom callback         [B4-FUTURE] */
+
+  /* === B-4: Convective path === */
+  PATH_CNV_INIT,                           /* ✅ fluid temp check        [B4-FUTURE] */
+  PATH_CNV_STARTUP_TRACE,                 /* 🔴 1 startup ray          [B4-FUTURE] */
+  PATH_CNV_STARTUP_RESULT,                /* ✅ startup result          [B4-FUTURE] */
+  PATH_CNV_SAMPLE_LOOP,                   /* ✅ null-collision loop     [B4-FUTURE] */
+
+  /* === B-4: Enclosure query sub-state machine === */
+  PATH_ENC_QUERY_EMIT,                    /* 🔴 emit 6 directional rays[B4-FUTURE] */
+  PATH_ENC_QUERY_RESOLVE,                 /* ✅ resolve 6 hits → enc_id[B4-FUTURE] */
 
   /* === Terminal === */
-  PATH_DONE                           /* path finished; weight is valid       */
+  PATH_DONE,                               /* path finished              */
+  PATH_ERROR,                              /* error termination          */
+
+  PATH_PHASE_COUNT                         /* total state count          */
 };
+
+/*******************************************************************************
+ * Ray bucket type — classifies rays by BVH traversal pattern for
+ * warp-coherent GPU batching (Phase B-4).
+ ******************************************************************************/
+enum ray_bucket_type {
+  RAY_BUCKET_RADIATIVE,       /* long-range random direction, range=[ε,∞)    */
+  RAY_BUCKET_STEP_PAIR,       /* short-range opposing rays (delta-sphere)     */
+  RAY_BUCKET_ENCLOSURE,       /* 6 fixed-direction family, range=[ε,∞)       */
+  RAY_BUCKET_SHADOW,          /* fixed-distance shadow ray, range=[0,dist]   */
+  RAY_BUCKET_STARTUP,         /* single-direction probe ray                  */
+  RAY_BUCKET_COUNT
+};
+
+/*******************************************************************************
+ * path_phase_is_ray_pending — returns 1 if the phase requires a ray trace
+ * result before the path can advance.  Used by cascade loops and stream
+ * compaction to avoid attempting no-ray advance on these phases.
+ ******************************************************************************/
+static INLINE int
+path_phase_is_ray_pending(enum path_phase ph)
+{
+  switch(ph) {
+  /* B-2/B-3 legacy ray-pending */
+  case PATH_RAD_TRACE_PENDING:
+  case PATH_COUPLED_BOUNDARY_REINJECT:
+  case PATH_COUPLED_COND_DS_PENDING:
+  /* B-4 fine-grained ray-pending */
+  case PATH_BND_SS_REINJECT_SAMPLE:
+  case PATH_BND_SS_REINJECT_ENC:
+  case PATH_BND_SF_REINJECT_SAMPLE:
+  case PATH_BND_SF_REINJECT_ENC:
+  case PATH_BND_SF_NULLCOLL_RAD_TRACE:
+  case PATH_BND_SFN_RAD_TRACE:
+  case PATH_BND_EXT_DIRECT_TRACE:
+  case PATH_BND_EXT_DIFFUSE_TRACE:
+  case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
+  case PATH_CND_INIT_ENC:
+  case PATH_CND_DS_STEP_TRACE:
+  case PATH_CND_DS_STEP_ENC_VERIFY:
+  case PATH_CND_WOS_CLOSEST:
+  case PATH_CND_WOS_FALLBACK_TRACE:
+  case PATH_CNV_STARTUP_TRACE:
+  case PATH_ENC_QUERY_EMIT:
+    return 1;
+  default:
+    return 0;
+  }
+}
 
 /*******************************************************************************
  * Per-ray request descriptor (wavefront internal)
@@ -91,9 +219,9 @@ struct path_ray_request {
 /*******************************************************************************
  * struct path_state — fully externalised state of one MC path
  *
- * Approximately 600 bytes including padding.  For a tile of 4×4 pixels at
- * spp = 256, that is 4096 paths × 600 B ≈ 2.4 MB, well within stack / heap
- * budgets.
+ * B-4 expansion: ~600 B (original) + ~600 B (locals union) + ~200 B
+ * (ext_flux) + ~200 B (enc_query) + ~600 B (sfn_stack×3) ≈ 2.2 KB/path.
+ * 32K paths × 2.2 KB = 70 MB, well within CPU memory budget.
  ******************************************************************************/
 struct path_state {
   /* --- Identity --- */
@@ -160,6 +288,88 @@ struct path_state {
 
   /* --- Image-space pixel coords (in image plane) --- */
   size_t  ipix_image[2];
+
+  /* ===================================================================== */
+  /* B-4: Fine-grained state machine extensions                            */
+  /* ===================================================================== */
+
+  /* --- B-4: Fine-grained locale variables (union, one branch active) --- */
+  union {
+    struct {                            /* solid/solid reinjection         */
+      float   dir_frt[2][3];           /* front side 2 directions         */
+      float   dir_bck[2][3];           /* back side 2 directions          */
+      struct s3d_hit ray_frt[2];
+      struct s3d_hit ray_bck[2];
+      unsigned enc_ids[2];
+      double  lambda_frt, lambda_bck;
+      double  proba;
+      int     step_index;              /* 0=frt0,1=frt1,2=bck0,3=bck1    */
+    } bnd_ss;
+
+    struct {                            /* solid/fluid picard1/N           */
+      double  p_conv, p_cond, p_radi;
+      double  h_hat, h_conv, h_cond;
+      double  epsilon, Tref;
+      float   reinject_dir[2][3];
+      struct s3d_hit reinject_hit[2];
+      unsigned solid_enc_id;
+      double  r;                       /* saved random number              */
+      /* null-collision sub-path snapshot */
+      struct rwalk      rwalk_snapshot;
+      struct temperature T_snapshot;
+    } bnd_sf;
+
+    struct {                            /* WoS conductive                  */
+      double  query_pos[3];
+      double  query_radius;
+      float   new_pos[3];
+      float   dir[3];
+      struct s3d_hit cached_hit;
+      double  delta;
+      double  last_distance;
+    } cnd_wos;
+
+    struct {                            /* convective path                 */
+      unsigned enc_id;
+      double  hc_upper_bound;
+      double  rho_cp;
+      double  S_over_V;
+    } cnv;
+  } locals;
+
+  /* --- B-4: External net flux (independent, co-active with picard) --- */
+  struct {
+    float   pos[3], dir[3];
+    float   range;
+    struct s3d_hit hit;
+    double  flux_direct;
+    double  flux_diffuse_reflected;
+    double  flux_scattered;
+    int     nbounces;
+    enum path_phase return_state;      /* resume state after flux done     */
+  } ext_flux;
+
+  /* --- B-4: Enclosure query sub-state --- */
+  struct {
+    struct s3d_hit dir_hits[6];        /* 6 directional ray results        */
+    enum path_phase return_state;      /* resume state after ENC done      */
+  } enc_query;
+
+  /* --- B-4: PicardN recursive stack --- */
+  struct {
+    enum path_phase return_state;
+    double  partial_temperature;
+    struct rwalk rwalk_saved;
+    struct temperature T_saved;
+    double  T_values[6];
+    int     T_count;
+    double  r, p_conv, p_cond, h_hat;
+  } sfn_stack[3];                      /* MAX_PICARD_DEPTH = 3             */
+  int sfn_stack_depth;
+
+  /* --- B-4: Ray type tag --- */
+  enum ray_bucket_type ray_bucket;     /* bucket for current ray request   */
+  int  ray_count_ext;                  /* extended ray count (ENC=6, etc.) */
 };
 
 /*******************************************************************************

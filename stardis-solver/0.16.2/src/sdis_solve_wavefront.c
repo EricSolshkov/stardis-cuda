@@ -1110,8 +1110,62 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
     break;
 
   case PATH_DONE:
+  case PATH_ERROR:
     break;
 
+  /* --- B-4 fine-grained: ray-pending states (cannot advance w/o ray) --- */
+  case PATH_BND_SS_REINJECT_SAMPLE:
+  case PATH_BND_SS_REINJECT_ENC:
+  case PATH_BND_SF_REINJECT_SAMPLE:
+  case PATH_BND_SF_REINJECT_ENC:
+  case PATH_BND_SF_NULLCOLL_RAD_TRACE:
+  case PATH_BND_SFN_RAD_TRACE:
+  case PATH_BND_EXT_DIRECT_TRACE:
+  case PATH_BND_EXT_DIFFUSE_TRACE:
+  case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
+  case PATH_CND_INIT_ENC:
+  case PATH_CND_DS_STEP_TRACE:
+  case PATH_CND_DS_STEP_ENC_VERIFY:
+  case PATH_CND_WOS_CLOSEST:
+  case PATH_CND_WOS_FALLBACK_TRACE:
+  case PATH_CNV_STARTUP_TRACE:
+  case PATH_ENC_QUERY_EMIT:
+    /* B-4 ray-pending: not yet activated, cannot advance without ray */
+    break;
+
+  /* --- B-4 fine-grained: compute-only states (future, no-op for now) --- */
+  case PATH_RAD_PROCESS_HIT:
+  case PATH_BND_DISPATCH:
+  case PATH_BND_POST_ROBIN_CHECK:
+  case PATH_BND_SS_REINJECT_DECIDE:
+  case PATH_BND_SF_PROB_DISPATCH:
+  case PATH_BND_SF_NULLCOLL_DECIDE:
+  case PATH_BND_SFN_PROB_DISPATCH:
+  case PATH_BND_SFN_RAD_DONE:
+  case PATH_BND_SFN_COMPUTE_Ti:
+  case PATH_BND_SFN_COMPUTE_Ti_RESUME:
+  case PATH_BND_SFN_CHECK_PMIN_PMAX:
+  case PATH_BND_EXT_CHECK:
+  case PATH_BND_EXT_DIRECT_RESULT:
+  case PATH_BND_EXT_DIFFUSE_RESULT:
+  case PATH_BND_EXT_DIFFUSE_SHADOW_RESULT:
+  case PATH_BND_EXT_FINALIZE:
+  case PATH_CND_DS_CHECK_TEMP:
+  case PATH_CND_DS_STEP_PROCESS:
+  case PATH_CND_DS_STEP_ADVANCE:
+  case PATH_CND_WOS_CHECK_TEMP:
+  case PATH_CND_WOS_CLOSEST_RESULT:
+  case PATH_CND_WOS_FALLBACK_RESULT:
+  case PATH_CND_WOS_TIME_TRAVEL:
+  case PATH_CND_CUSTOM:
+  case PATH_CNV_INIT:
+  case PATH_CNV_STARTUP_RESULT:
+  case PATH_CNV_SAMPLE_LOOP:
+  case PATH_ENC_QUERY_RESOLVE:
+    /* B-4 compute-only: not yet activated, no-op fallback */
+    break;
+
+  case PATH_PHASE_COUNT:
   default:
     FATAL("wavefront: unknown path phase %d\n", (int)p->phase);
     break;
@@ -1146,6 +1200,30 @@ advance_one_step_with_ray(struct path_state* p, struct sdis_scene* scn,
    *   res = step_boundary_reinject(p, scn, hit0, hit1);
    *   break;
    */
+
+  /* --- B-4 fine-grained ray-pending states (activated in M1-M9) ---
+   * These cases should never be reached until the corresponding milestone
+   * sets the phase.  Listed explicitly so the compiler warns on missing
+   * enum values. */
+  case PATH_BND_SS_REINJECT_SAMPLE:
+  case PATH_BND_SS_REINJECT_ENC:
+  case PATH_BND_SF_REINJECT_SAMPLE:
+  case PATH_BND_SF_REINJECT_ENC:
+  case PATH_BND_SF_NULLCOLL_RAD_TRACE:
+  case PATH_BND_SFN_RAD_TRACE:
+  case PATH_BND_EXT_DIRECT_TRACE:
+  case PATH_BND_EXT_DIFFUSE_TRACE:
+  case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
+  case PATH_CND_INIT_ENC:
+  case PATH_CND_DS_STEP_TRACE:
+  case PATH_CND_DS_STEP_ENC_VERIFY:
+  case PATH_CND_WOS_CLOSEST:
+  case PATH_CND_WOS_FALLBACK_TRACE:
+  case PATH_CNV_STARTUP_TRACE:
+  case PATH_ENC_QUERY_EMIT:
+    FATAL("wavefront: advance_with_ray in B-4 phase %d not yet activated\n",
+          (int)p->phase);
+    break;
 
   default:
     FATAL("wavefront: advance_with_ray in unexpected phase %d\n",
@@ -1294,14 +1372,10 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
       for(;;) {
         int advanced = 0;
         if(p->needs_ray) break;
-        if(p->phase == PATH_DONE) break;
+        if(p->phase == PATH_DONE || p->phase == PATH_ERROR) break;
 
         /* Skip ray-waiting phases */
-        if(p->phase == PATH_RAD_TRACE_PENDING
-        || p->phase == PATH_COUPLED_COND_DS_PENDING
-        || p->phase == PATH_COUPLED_BOUNDARY_REINJECT) {
-          break;
-        }
+        if(path_phase_is_ray_pending(p->phase)) break;
 
         res = advance_one_step_no_ray(p, scn, &advanced);
         if(res != RES_OK && res != RES_BAD_OP
@@ -1435,10 +1509,9 @@ solve_tile_wavefront(
       struct path_state* p = &wf.paths[i];
 
       /* Run non-ray steps to get to the first ray request */
-      while(p->active && !p->needs_ray && p->phase != PATH_DONE) {
-        if(p->phase == PATH_RAD_TRACE_PENDING
-        || p->phase == PATH_COUPLED_COND_DS_PENDING
-        || p->phase == PATH_COUPLED_BOUNDARY_REINJECT) break;
+      while(p->active && !p->needs_ray
+          && p->phase != PATH_DONE && p->phase != PATH_ERROR) {
+        if(path_phase_is_ray_pending(p->phase)) break;
 
         res = advance_one_step_no_ray(p, scn, &advanced);
         if(res != RES_OK && res != RES_BAD_OP
