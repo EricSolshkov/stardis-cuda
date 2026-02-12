@@ -63,6 +63,7 @@ set(SDIS_SOURCES
     src/sdis_solve.c
     src/sdis_solve_camera.c
     src/sdis_solve_wavefront.c
+    src/sdis_wf_steps.c
     src/sdis_solve_persistent_wavefront.c
     src/sdis_source.c
     src/sdis_tile.c
@@ -72,12 +73,57 @@ set(SDIS_SOURCES
 # Library Target
 # ============================================================================
 
-if(BUILD_SHARED_LIBS)
-    add_library(sdis SHARED ${SDIS_SOURCES})
-    target_compile_definitions(sdis PRIVATE SDIS_SHARED_BUILD)
-else()
-    add_library(sdis STATIC ${SDIS_SOURCES})
+# OBJECT library: compile sources once, link into both DLL and test targets.
+# Tests link sdis_obj directly (all symbols visible, no DLL export needed).
+add_library(sdis_obj OBJECT ${SDIS_SOURCES})
+target_include_directories(sdis_obj
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+        $<INSTALL_INTERFACE:include>
+)
+
+# ============================================================================
+# Dependencies (on the OBJECT lib so both sdis and tests inherit them)
+# ============================================================================
+
+find_package(OpenMP)
+
+target_link_libraries(sdis_obj
+    PUBLIC
+        rsys
+        s2d
+        s3d
+        senc2d
+        senc3d
+        ssp
+        $<$<BOOL:${OpenMP_C_FOUND}>:OpenMP::OpenMP_C>
+)
+
+# Optional: star-wf
+if(TARGET swf)
+    target_link_libraries(sdis_obj PRIVATE swf)
 endif()
+
+# Math library (Unix only)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(sdis_obj PRIVATE m)
+endif()
+
+# ============================================================================
+# Shared / Static library (links the OBJECT lib)
+# ============================================================================
+
+# When building a DLL, EXPORT_SYM must expand to __declspec(dllexport)
+# during compilation — so the define goes on sdis_obj, not sdis.
+# For test EXEs the dllexport attribute is harmlessly ignored by the linker.
+if(BUILD_SHARED_LIBS)
+    target_compile_definitions(sdis_obj PRIVATE SDIS_SHARED_BUILD)
+    add_library(sdis SHARED)
+else()
+    add_library(sdis STATIC)
+endif()
+
+target_link_libraries(sdis PUBLIC sdis_obj)
 
 add_library(sdis::sdis ALIAS sdis)
 
@@ -86,41 +132,6 @@ set_target_properties(sdis PROPERTIES
     SOVERSION 0
     OUTPUT_NAME "sdis"
 )
-
-# ============================================================================
-# Include Directories
-# ============================================================================
-
-target_include_directories(sdis
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
-        $<INSTALL_INTERFACE:include>
-)
-
-# ============================================================================
-# Dependencies
-# ============================================================================
-
-target_link_libraries(sdis
-    PUBLIC
-        rsys
-        s2d
-        s3d
-        senc2d
-        senc3d
-        ssp
-        OpenMP::OpenMP_C
-)
-
-# Optional: star-wf
-if(TARGET swf)
-    target_link_libraries(sdis PRIVATE swf)
-endif()
-
-# Math library (Unix only)
-if(UNIX AND NOT APPLE)
-    target_link_libraries(sdis PRIVATE m)
-endif()
 
 # ============================================================================
 # Tests
@@ -186,28 +197,25 @@ if(ENABLE_TESTS)
         set_tests_properties(${test_name} PROPERTIES TIMEOUT 600)
     endforeach()
 
-    # ---- B-4 M1: Enclosure query sub-state machine test ----
-    # This test #includes sdis_solve_wavefront.c directly (with
-    # SDIS_SOLVE_WAVEFRONT_SKIP_PUBLIC_API) to access static step
-    # functions.  It links against sdis for external dependencies
-    # only — the static functions come from the included .c file.
+    # ---- B-4 tests link the OBJECT library directly ----
+    # sdis_obj gives direct access to all symbols (LOCAL_SYM included)
+    # without needing WINDOWS_EXPORT_ALL_SYMBOLS on the DLL.
+
     add_executable(test_sdis_b4_m1_enclosure_batch
         src/test_sdis_b4_m1_enclosure_batch.c)
-    target_link_libraries(test_sdis_b4_m1_enclosure_batch PRIVATE sdis)
+    target_link_libraries(test_sdis_b4_m1_enclosure_batch PRIVATE sdis_obj)
     add_test(NAME test_sdis_b4_m1_enclosure_batch
              COMMAND test_sdis_b4_m1_enclosure_batch)
 
-    # ---- B-4 M2: Ray bucketing framework test ----
     add_executable(test_sdis_b4_m2_ray_bucketing
         src/test_sdis_b4_m2_ray_bucketing.c)
-    target_link_libraries(test_sdis_b4_m2_ray_bucketing PRIVATE sdis)
+    target_link_libraries(test_sdis_b4_m2_ray_bucketing PRIVATE sdis_obj)
     add_test(NAME test_sdis_b4_m2_ray_bucketing
              COMMAND test_sdis_b4_m2_ray_bucketing)
 
-    # ---- B-4 M3: Solid/solid reinjection state machine test ----
     add_executable(test_sdis_b4_m3_solid_solid
         src/test_sdis_b4_m3_solid_solid.c)
-    target_link_libraries(test_sdis_b4_m3_solid_solid PRIVATE sdis)
+    target_link_libraries(test_sdis_b4_m3_solid_solid PRIVATE sdis_obj)
     add_test(NAME test_sdis_b4_m3_solid_solid
              COMMAND test_sdis_b4_m3_solid_solid)
 

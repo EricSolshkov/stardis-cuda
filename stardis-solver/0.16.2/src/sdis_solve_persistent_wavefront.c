@@ -55,13 +55,10 @@
 #include <string.h>
 
 /*******************************************************************************
- * Include sdis_solve_wavefront.c to access static step functions.
- * The SDIS_SOLVE_WAVEFRONT_SKIP_PUBLIC_API guard prevents
- * solve_tile_wavefront from being compiled into this TU.
+ * Step functions are now in sdis_wf_steps.c with LOCAL_SYM linkage.
+ * Include the header to access them.
  ******************************************************************************/
-#define SDIS_SOLVE_WAVEFRONT_SKIP_PUBLIC_API 1
-#include "sdis_solve_wavefront.c"
-#undef SDIS_SOLVE_WAVEFRONT_SKIP_PUBLIC_API
+#include "sdis_wf_steps.h"
 
 /*******************************************************************************
  * Pool allocation / deallocation
@@ -612,16 +609,9 @@ time_elapsed_sec(const struct time* t0, const struct time* t1)
  * boundaries are recorded in pool->bucket_offsets[RAY_BUCKET_COUNT+1].
  ******************************************************************************/
 
-/* Helper: count how many rays a single path_state will emit */
-static INLINE size_t
-count_path_rays(const struct path_state* p)
-{
-  if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT)
-    return 6;
-  return (size_t)p->ray_req.ray_count;
-}
+/* count_path_rays is now static INLINE in persistent_wavefront.h */
 
-static res_T
+LOCAL_SYM res_T
 pool_collect_ray_requests_bucketed(struct wavefront_pool* pool)
 {
   size_t k, b;

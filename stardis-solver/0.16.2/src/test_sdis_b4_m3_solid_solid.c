@@ -32,11 +32,12 @@
  */
 
 /* ========================================================================
- * Include the wavefront .c file to get access to static functions.
+ * Step functions are now in sdis_wf_steps.c with LOCAL_SYM linkage.
+ * collect_ray_requests is declared LOCAL_SYM in sdis_solve_wavefront.h.
+ * No more #include .c hack needed.
  * ======================================================================== */
-#define SDIS_SOLVE_WAVEFRONT_SKIP_PUBLIC_API 1
-#include "sdis_solve_wavefront.c"
-#undef SDIS_SOLVE_WAVEFRONT_SKIP_PUBLIC_API
+#include "sdis_solve_wavefront.h"
+#include "sdis_wf_steps.h"
 
 #include "test_sdis_utils.h"
 #include <stdio.h>

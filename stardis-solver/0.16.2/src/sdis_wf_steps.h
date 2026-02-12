@@ -1,0 +1,186 @@
+/* Copyright (C) 2016-2025 |Méso|Star> (contact@meso-star.com)
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>. */
+
+/* Wavefront step function library — declarations.
+ *
+ * All functions that implement individual path-state transitions or ray
+ * setup helpers are declared here with LOCAL_SYM visibility.  They live
+ * in sdis_wf_steps.c and are linked into the sdis library, accessible to
+ * any translation unit within the library (wavefront.c, persistent_wavefront.c,
+ * tests) but hidden from the public ABI.
+ *
+ * This header is the replacement for the `#include "sdis_solve_wavefront.c"`
+ * hack that previously gave persistent_wavefront.c and test files access
+ * to the static step functions.
+ */
+
+#ifndef SDIS_WF_STEPS_H
+#define SDIS_WF_STEPS_H
+
+#include "sdis_wf_state.h"  /* struct path_state, struct path_ray_request    */
+#include "sdis.h"           /* LOCAL_SYM, res_T                              */
+#include <star/s3d.h>       /* struct s3d_hit                                */
+
+/* Forward declarations — full definitions live in internal headers */
+struct sdis_scene;
+struct sdis_interface;
+struct sdis_interface_fragment;
+
+/*******************************************************************************
+ * Utility functions
+ ******************************************************************************/
+
+/* Check that an interface fragment is on the fluid side (copied from
+ * sdis_heat_path_radiative_Xd.h because it is static in that header). */
+extern LOCAL_SYM res_T
+wf_check_interface
+  (const struct sdis_interface* interf,
+   const struct sdis_interface_fragment* frag,
+   const int verbose);
+
+/* Sample reinjection direction around hit normal (replicates the static
+ * sample_reinjection_dir_3d from sdis_heat_path_boundary_Xd_c.h). */
+extern LOCAL_SYM void
+wf_sample_reinjection_dir_3d
+  (const struct rwalk* rwalk,
+   struct ssp_rng* rng,
+   float dir[3]);
+
+/*******************************************************************************
+ * Ray setup helpers — populate path_state::ray_req for the next batch
+ ******************************************************************************/
+
+extern LOCAL_SYM void
+setup_radiative_trace_ray(struct path_state* p, struct sdis_scene* scn);
+
+extern LOCAL_SYM void
+setup_delta_sphere_rays(struct path_state* p, struct sdis_scene* scn);
+
+extern LOCAL_SYM void
+setup_convective_startup_ray(struct path_state* p);
+
+extern LOCAL_SYM void
+setup_ss_reinject_rays(struct path_state* p);
+
+/*******************************************************************************
+ * Step functions — each advances a path by exactly one logical step
+ ******************************************************************************/
+
+/* PATH_INIT: emit first radiative trace ray */
+extern LOCAL_SYM res_T
+step_init(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_RAD_TRACE_PENDING: process hit / BRDF decision */
+extern LOCAL_SYM res_T
+step_radiative_trace
+  (struct path_state* p,
+   struct sdis_scene* scn,
+   const struct s3d_hit* trace_hit);
+
+/* PATH_COUPLED_BOUNDARY: boundary_path logic (no ray needed) */
+extern LOCAL_SYM res_T
+step_boundary(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_COUPLED_CONDUCTIVE: delta_sphere entry / loop */
+extern LOCAL_SYM res_T
+step_conductive(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_COUPLED_COND_DS_PENDING: process 2-ray delta sphere results */
+extern LOCAL_SYM res_T
+step_conductive_ds_process
+  (struct path_state* p,
+   struct sdis_scene* scn,
+   const struct s3d_hit* hit0,
+   const struct s3d_hit* hit1);
+
+/* PATH_COUPLED_CONVECTIVE: convective_path (may need startup ray) */
+extern LOCAL_SYM res_T
+step_convective(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_COUPLED_RADIATIVE: bounce into radiative from boundary */
+extern LOCAL_SYM res_T
+step_coupled_radiative_begin(struct path_state* p, struct sdis_scene* scn);
+
+/*******************************************************************************
+ * B-4 M1: Enclosure query sub-state machine
+ ******************************************************************************/
+
+/* Emit 6 rotated axis-aligned rays for enclosure identification */
+extern LOCAL_SYM void
+step_enc_query_emit(struct path_state* p);
+
+/* Resolve 6 hit results into an enclosure id */
+extern LOCAL_SYM res_T
+step_enc_query_resolve(struct path_state* p, struct sdis_scene* scn);
+
+/*******************************************************************************
+ * B-4 M3: Solid/solid reinjection batch state machine
+ ******************************************************************************/
+
+/* Prepare and emit 4 reinjection rays */
+extern LOCAL_SYM res_T
+step_bnd_ss_reinject_sample(struct path_state* p, struct sdis_scene* scn);
+
+/* Resolve 2-direction reinjection from hit results (pure compute helper) */
+extern LOCAL_SYM void
+resolve_reinjection_from_hits
+  (const struct s3d_hit* hit0,
+   const struct s3d_hit* hit1,
+   const float dir0[3],
+   const float dir1[3],
+   unsigned enc0_id,
+   unsigned enc1_id,
+   unsigned solid_enc_id,
+   double distance,
+   float out_dir[3],
+   float* out_dst,
+   struct s3d_hit* out_hit);
+
+/* Process 4-ray results for solid/solid reinjection */
+extern LOCAL_SYM res_T
+step_bnd_ss_reinject_process
+  (struct path_state* p,
+   struct sdis_scene* scn,
+   const struct s3d_hit* hit_frt0,
+   const struct s3d_hit* hit_frt1,
+   const struct s3d_hit* hit_bck0,
+   const struct s3d_hit* hit_bck1);
+
+/* ENC query result for reinjection verification */
+extern LOCAL_SYM res_T
+step_bnd_ss_reinject_enc_result(struct path_state* p, struct sdis_scene* scn);
+
+/* Probability choice + solid_reinjection */
+extern LOCAL_SYM res_T
+step_bnd_ss_reinject_decide(struct path_state* p, struct sdis_scene* scn);
+
+/*******************************************************************************
+ * Dispatch — advance one path by one step
+ ******************************************************************************/
+
+/* Advance without ray.  Returns *advanced=1 if the path was advanced. */
+extern LOCAL_SYM res_T
+advance_one_step_no_ray
+  (struct path_state* p, struct sdis_scene* scn, int* advanced);
+
+/* Advance after receiving ray trace result(s) */
+extern LOCAL_SYM res_T
+advance_one_step_with_ray
+  (struct path_state* p,
+   struct sdis_scene* scn,
+   const struct s3d_hit* hit0,
+   const struct s3d_hit* hit1);
+
+#endif /* SDIS_WF_STEPS_H */

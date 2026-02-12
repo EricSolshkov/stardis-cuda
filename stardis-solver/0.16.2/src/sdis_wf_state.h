@@ -1,0 +1,242 @@
+/* Copyright (C) 2016-2025 |Méso|Star> (contact@meso-star.com)
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>. */
+
+/* Wavefront per-path state structures.
+ *
+ * Extracted from sdis_solve_wavefront.h.  Contains the fully externalised
+ * state of one Monte-Carlo path (struct path_state) and its ray request
+ * descriptor (struct path_ray_request).
+ */
+
+#ifndef SDIS_WF_STATE_H
+#define SDIS_WF_STATE_H
+
+#include "sdis_wf_types.h"  /* enum path_phase, enum ray_bucket_type        */
+#include "sdis_heat_path.h" /* struct rwalk, rwalk_context, temperature      */
+#include "sdis_medium_c.h"  /* struct solid_props                            */
+#include "sdis_scene_c.h"   /* struct hit_filter_data                        */
+
+#include <star/s3d.h>        /* struct s3d_hit                                */
+#include <star/ssp.h>        /* struct ssp_rng                                */
+#include <stdint.h>          /* uint32_t, uint16_t                            */
+
+/* Forward declarations (pointer-only usage in path_state) */
+struct sdis_medium;
+
+/*******************************************************************************
+ * Per-ray request descriptor (wavefront internal)
+ ******************************************************************************/
+struct path_ray_request {
+  float    origin[3];
+  float    direction[3];
+  float    range[2];
+
+  /* Second ray (delta_sphere / find_reinjection_ray can emit 2 rays) */
+  float    direction2[3];
+  float    range2[2];
+  int      ray_count;        /* 1 or 2                                       */
+
+  /* Batch dispatch indices (set by collect_ray_requests) */
+  uint32_t batch_idx;        /* index of ray 0 in the batch                  */
+  uint32_t batch_idx2;       /* index of ray 1 in the batch (if ray_count==2)*/
+};
+
+/*******************************************************************************
+ * struct path_state — fully externalised state of one MC path
+ *
+ * B-4 expansion: ~600 B (original) + ~600 B (locals union) + ~200 B
+ * (ext_flux) + ~200 B (enc_query) + ~600 B (sfn_stack x 3) ~ 2.2 KB/path.
+ * 32K paths x 2.2 KB = 70 MB, well within CPU memory budget.
+ ******************************************************************************/
+struct path_state {
+  /* --- Identity --- */
+  uint32_t  path_id;                   /* global unique id within the tile   */
+  uint16_t  pixel_x, pixel_y;         /* pixel coords (tile-local)          */
+  uint32_t  realisation_idx;           /* SPP index                          */
+
+  /* --- Lifecycle --- */
+  enum path_phase  phase;
+  int              active;             /* 1 = still running                  */
+
+  /* --- Random walk core --- */
+  struct rwalk          rwalk;         /* position, time, hit, enc_id ...    */
+  struct rwalk_context  ctx;           /* Tmin/That/branchings ...           */
+
+  /* --- Temperature / weight --- */
+  struct temperature T;                /* func ptr + value + done            */
+
+  /* --- Radiative path scratch --- */
+  float   rad_direction[3];            /* current radiative direction        */
+  int     rad_bounce_count;
+  int     rad_retry_count;             /* find_next_fragment retries         */
+
+  /* --- Coupled path scratch --- */
+  int     coupled_nbranchings;
+
+  /* --- Conductive delta-sphere scratch --- */
+  float   ds_dir0[3], ds_dir1[3];
+  struct s3d_hit ds_hit0, ds_hit1;
+  double  ds_delta_solid;
+
+  /* --- Conductive delta-sphere persistent state (wavefront M3) --- */
+  int     ds_initialized;         /* 1 = init phase done                   */
+  unsigned ds_enc_id;             /* enclosure id for conductive walk       */
+  struct sdis_medium* ds_medium;  /* solid medium pointer                   */
+  struct solid_props  ds_props_ref; /* reference properties at start        */
+  double  ds_green_power_term;    /* accumulated green function power       */
+  double  ds_position_start[3];   /* starting position backup              */
+  int     ds_robust_attempt;      /* robust retry counter                   */
+  float   ds_delta;               /* computed step distance                 */
+  float   ds_delta_solid_param;   /* props.delta (medium step parameter)    */
+
+  /* --- Boundary reinjection scratch --- */
+  struct s3d_hit bnd_hit0, bnd_hit1;
+  double  bnd_reinject_distance;
+  unsigned bnd_solid_enc_id;
+  int     bnd_retry_count;
+
+  /* --- Filter data for current ray request --- */
+  struct hit_filter_data  filter_data_storage;
+
+  /* --- Diagnostics --- */
+  size_t  steps_taken;                 /* total steps this path has taken     */
+  int     done_reason;                 /* 0=none, 1=rad_miss, 2=temp_known,
+                                          3=boundary_done, 4=time_rewind,
+                                          -1=failed                          */
+
+  /* --- Ray request output (set by step functions) --- */
+  struct path_ray_request ray_req;
+  int    needs_ray;                    /* does this step need a trace?        */
+
+  /* --- RNG (shared per-thread, non-owning pointer) --- */
+  struct ssp_rng* rng;
+
+  /* --- Image-space pixel coords (in image plane) --- */
+  size_t  ipix_image[2];
+
+  /* ===================================================================== */
+  /* B-4: Fine-grained state machine extensions                            */
+  /* ===================================================================== */
+
+  /* --- B-4: Fine-grained locale variables (union, one branch active) --- */
+  union {
+    struct {                            /* solid/solid reinjection         */
+      float   dir_frt[2][3];           /* front side 2 directions         */
+      float   dir_bck[2][3];           /* back side 2 directions          */
+      struct s3d_hit ray_frt[2];       /* hit results for front dir0/dir1 */
+      struct s3d_hit ray_bck[2];       /* hit results for back dir0/dir1  */
+      unsigned enc_ids[2];             /* [FRONT] and [BACK] enclosure ids*/
+      double  lambda_frt, lambda_bck;
+      double  delta_boundary_frt;      /* reinject distance front side    */
+      double  delta_boundary_bck;      /* reinject distance back side     */
+      double  tcr;                     /* thermal contact resistance      */
+      double  proba;
+      int     multi_frt, multi_bck;    /* 1 if enclosure is MEDIUM_ID_MULTI */
+
+      /* Reinjection ray results (mirrors find_reinjection_ray output) */
+      float   reinject_dir_frt[3];     /* chosen front reinjection dir    */
+      float   reinject_dst_frt;        /* chosen front reinjection dist   */
+      struct s3d_hit reinject_hit_frt; /* chosen front reinjection hit    */
+      float   reinject_dir_bck[3];     /* chosen back reinjection dir     */
+      float   reinject_dst_bck;        /* chosen back reinjection dist    */
+      struct s3d_hit reinject_hit_bck; /* chosen back reinjection hit     */
+
+      /* Enclosure ids at reinjection endpoints (from trace or ENC query) */
+      unsigned enc0_frt, enc1_frt;     /* enc_id along frt dir0, dir1     */
+      unsigned enc0_bck, enc1_bck;     /* enc_id along bck dir0, dir1     */
+      int      need_enc_frt, need_enc_bck; /* which side needs ENC query  */
+      int      enc_side;               /* 0=frt,1=bck for current ENC    */
+
+      /* Position backup for retry logic */
+      double  rwalk_pos_backup[3];
+      int     position_was_moved;      /* did find_reinjection_ray move?  */
+      int     retry_count;             /* attempt counter (MAX=10)        */
+
+      /* Batch indices for 4-ray collect/distribute */
+      uint32_t batch_idx_frt0, batch_idx_frt1;
+      uint32_t batch_idx_bck0, batch_idx_bck1;
+    } bnd_ss;
+
+    struct {                            /* solid/fluid picard1/N           */
+      double  p_conv, p_cond, p_radi;
+      double  h_hat, h_conv, h_cond;
+      double  epsilon, Tref;
+      float   reinject_dir[2][3];
+      struct s3d_hit reinject_hit[2];
+      unsigned solid_enc_id;
+      double  r;                       /* saved random number              */
+      /* null-collision sub-path snapshot */
+      struct rwalk      rwalk_snapshot;
+      struct temperature T_snapshot;
+    } bnd_sf;
+
+    struct {                            /* WoS conductive                  */
+      double  query_pos[3];
+      double  query_radius;
+      float   new_pos[3];
+      float   dir[3];
+      struct s3d_hit cached_hit;
+      double  delta;
+      double  last_distance;
+    } cnd_wos;
+
+    struct {                            /* convective path                 */
+      unsigned enc_id;
+      double  hc_upper_bound;
+      double  rho_cp;
+      double  S_over_V;
+    } cnv;
+  } locals;
+
+  /* --- B-4: External net flux (independent, co-active with picard) --- */
+  struct {
+    float   pos[3], dir[3];
+    float   range;
+    struct s3d_hit hit;
+    double  flux_direct;
+    double  flux_diffuse_reflected;
+    double  flux_scattered;
+    int     nbounces;
+    enum path_phase return_state;      /* resume state after flux done     */
+  } ext_flux;
+
+  /* --- B-4: Enclosure query sub-state (M1) --- */
+  struct {
+    float   directions[6][3];          /* 6 rotated axis directions        */
+    struct s3d_hit dir_hits[6];        /* 6 directional ray results        */
+    uint32_t batch_indices[6];         /* batch array index per direction   */
+    enum path_phase return_state;      /* resume state after ENC done      */
+    unsigned resolved_enc_id;          /* result enclosure id              */
+    double   query_pos[3];            /* position used for query           */
+  } enc_query;
+
+  /* --- B-4: PicardN recursive stack --- */
+  struct {
+    enum path_phase return_state;
+    double  partial_temperature;
+    struct rwalk rwalk_saved;
+    struct temperature T_saved;
+    double  T_values[6];
+    int     T_count;
+    double  r, p_conv, p_cond, h_hat;
+  } sfn_stack[3];                      /* MAX_PICARD_DEPTH = 3             */
+  int sfn_stack_depth;
+
+  /* --- B-4: Ray type tag --- */
+  enum ray_bucket_type ray_bucket;     /* bucket for current ray request   */
+  int  ray_count_ext;                  /* extended ray count (ENC=6, etc.) */
+};
+
+#endif /* SDIS_WF_STATE_H */

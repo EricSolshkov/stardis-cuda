@@ -182,7 +182,26 @@ struct wavefront_pool {
  ******************************************************************************/
 
 /* Persistent wavefront replacement of the OMP tile loop.
- * Processes the entire image in a single wavefront pool.
+/* ============================================================================
+ * Internal helpers — LOCAL_SYM, accessible by unit tests via OBJECT lib
+ * ============================================================================ */
+
+static INLINE size_t
+count_path_rays(const struct path_state* p)
+{
+  if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT)
+    return 6;
+  return (size_t)p->ray_req.ray_count;
+}
+
+extern LOCAL_SYM res_T
+pool_collect_ray_requests_bucketed(struct wavefront_pool* pool);
+
+/* ============================================================================
+ * Public API
+ * ============================================================================ */
+
+/* Processes the entire image in a single wavefront pool.
  * Receives the already-created per-thread RNG array (nthreads entries)
  * from solve_camera.  The buckets are already locked by create_per_thread_rng
  * so we must not call ssp_rng_proxy_create_rng again. */

@@ -31,22 +31,13 @@
  */
 
 /* ================================================================
- * Include the wavefront .c file to access static functions.
- * We include sdis_solve_persistent_wavefront.c which internally
- * includes sdis_solve_wavefront.c via the SKIP_PUBLIC_API guard.
- * This gives us access to both pool_collect_ray_requests_bucketed
- * and the setup_*() functions.
+ * pool_collect_ray_requests_bucketed is now LOCAL_SYM in the
+ * persistent_wavefront TU.  Tests link against sdis_obj (OBJECT
+ * library) so all symbols are directly visible — no #include .c
+ * hack needed.
  * ================================================================ */
-
-/* Prevent the public solve_camera_persistent_wavefront from being compiled
- * (it requires full scene infrastructure).  We only need the static helpers. */
-#define SDIS_SOLVE_PERSISTENT_WAVEFRONT_SKIP_PUBLIC_API 1
-#define SDIS_SOLVE_WAVEFRONT_SKIP_PUBLIC_API 1
-#include "sdis_solve_persistent_wavefront.c"
-#undef SDIS_SOLVE_PERSISTENT_WAVEFRONT_SKIP_PUBLIC_API
-#undef SDIS_SOLVE_WAVEFRONT_SKIP_PUBLIC_API
-
 #include "sdis_solve_persistent_wavefront.h"
+#include "sdis_wf_steps.h"
 
 #include "test_sdis_utils.h"
 #include <stdio.h>
