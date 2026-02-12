@@ -204,6 +204,13 @@ if(ENABLE_TESTS)
     add_test(NAME test_sdis_b4_m2_ray_bucketing
              COMMAND test_sdis_b4_m2_ray_bucketing)
 
+    # ---- B-4 M3: Solid/solid reinjection state machine test ----
+    add_executable(test_sdis_b4_m3_solid_solid
+        src/test_sdis_b4_m3_solid_solid.c)
+    target_link_libraries(test_sdis_b4_m3_solid_solid PRIVATE sdis)
+    add_test(NAME test_sdis_b4_m3_solid_solid
+             COMMAND test_sdis_b4_m3_solid_solid)
+
 endif()
 
 # ============================================================================

@@ -298,12 +298,38 @@ struct path_state {
     struct {                            /* solid/solid reinjection         */
       float   dir_frt[2][3];           /* front side 2 directions         */
       float   dir_bck[2][3];           /* back side 2 directions          */
-      struct s3d_hit ray_frt[2];
-      struct s3d_hit ray_bck[2];
-      unsigned enc_ids[2];
+      struct s3d_hit ray_frt[2];       /* hit results for front dir0/dir1 */
+      struct s3d_hit ray_bck[2];       /* hit results for back dir0/dir1  */
+      unsigned enc_ids[2];             /* [FRONT] and [BACK] enclosure ids*/
       double  lambda_frt, lambda_bck;
+      double  delta_boundary_frt;      /* reinject distance front side    */
+      double  delta_boundary_bck;      /* reinject distance back side     */
+      double  tcr;                     /* thermal contact resistance      */
       double  proba;
-      int     step_index;              /* 0=frt0,1=frt1,2=bck0,3=bck1    */
+      int     multi_frt, multi_bck;    /* 1 if enclosure is MEDIUM_ID_MULTI */
+
+      /* Reinjection ray results (mirrors find_reinjection_ray output) */
+      float   reinject_dir_frt[3];     /* chosen front reinjection dir    */
+      float   reinject_dst_frt;        /* chosen front reinjection dist   */
+      struct s3d_hit reinject_hit_frt; /* chosen front reinjection hit    */
+      float   reinject_dir_bck[3];     /* chosen back reinjection dir     */
+      float   reinject_dst_bck;        /* chosen back reinjection dist    */
+      struct s3d_hit reinject_hit_bck; /* chosen back reinjection hit     */
+
+      /* Enclosure ids at reinjection endpoints (from trace or ENC query) */
+      unsigned enc0_frt, enc1_frt;     /* enc_id along frt dir0, dir1     */
+      unsigned enc0_bck, enc1_bck;     /* enc_id along bck dir0, dir1     */
+      int      need_enc_frt, need_enc_bck; /* which side needs ENC query  */
+      int      enc_side;               /* 0=frt,1=bck for current ENC    */
+
+      /* Position backup for retry logic */
+      double  rwalk_pos_backup[3];
+      int     position_was_moved;      /* did find_reinjection_ray move?  */
+      int     retry_count;             /* attempt counter (MAX=10)        */
+
+      /* Batch indices for 4-ray collect/distribute */
+      uint32_t batch_idx_frt0, batch_idx_frt1;
+      uint32_t batch_idx_bck0, batch_idx_bck1;
     } bnd_ss;
 
     struct {                            /* solid/fluid picard1/N           */
