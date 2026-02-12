@@ -349,10 +349,14 @@ struct path_state {
     enum path_phase return_state;      /* resume state after flux done     */
   } ext_flux;
 
-  /* --- B-4: Enclosure query sub-state --- */
+  /* --- B-4: Enclosure query sub-state (M1) --- */
   struct {
+    float   directions[6][3];          /* 6 rotated axis directions        */
     struct s3d_hit dir_hits[6];        /* 6 directional ray results        */
+    uint32_t batch_indices[6];         /* batch array index per direction   */
     enum path_phase return_state;      /* resume state after ENC done      */
+    unsigned resolved_enc_id;          /* result enclosure id              */
+    double   query_pos[3];            /* position used for query           */
   } enc_query;
 
   /* --- B-4: PicardN recursive stack --- */

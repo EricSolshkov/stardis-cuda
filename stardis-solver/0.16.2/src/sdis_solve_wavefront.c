@@ -31,6 +31,9 @@
 
 #include "sdis_solve_wavefront.h"
 #include "sdis.h"
+
+#include <rsys/float33.h>   /* f33_rotation, f33_mulf3 (B-4 M1 ENC query) */
+#include <rsys/rsys_math.h> /* PI */
 #include "sdis_brdf.h"
 #include "sdis_c.h"
 #include "sdis_camera.h"
@@ -124,8 +127,8 @@ wf_context_create(struct wavefront_context* wf, size_t total_paths)
   wf->paths = (struct path_state*)calloc(total_paths, sizeof(struct path_state));
   if(!wf->paths) return RES_MEM_ERR;
 
-  /* Each path can request up to 2 rays per step */
-  wf->max_rays = total_paths * 2;
+  /* Each path can request up to 6 rays per step (B-4 M1: ENC query) */
+  wf->max_rays = total_paths * 6;
   wf->ray_requests = (struct s3d_ray_request*)malloc(
     wf->max_rays * sizeof(struct s3d_ray_request));
   wf->ray_to_path = (uint32_t*)malloc(wf->max_rays * sizeof(uint32_t));
@@ -316,6 +319,9 @@ setup_radiative_trace_ray(struct path_state* p, struct sdis_scene* scn)
   p->filter_data_storage.scn = scn;
   p->filter_data_storage.enc_id = p->rwalk.enc_id;
 
+  /* B-4 M2: bucket classification */
+  p->ray_bucket = RAY_BUCKET_RADIATIVE;
+  p->ray_count_ext = 1;
   p->needs_ray = 1;
 }
 
@@ -357,6 +363,10 @@ setup_delta_sphere_rays(struct path_state* p, struct sdis_scene* scn)
   p->ray_req.range2[1] = p->ds_delta_solid_param * RAY_RANGE_MAX_SCALE;
 
   p->ray_req.ray_count = 2;
+
+  /* B-4 M2: bucket classification */
+  p->ray_bucket = RAY_BUCKET_STEP_PAIR;
+  p->ray_count_ext = 2;
   p->needs_ray = 1;
 }
 
@@ -378,6 +388,10 @@ setup_convective_startup_ray(struct path_state* p)
   p->ray_req.range[0] = FLT_MIN;
   p->ray_req.range[1] = FLT_MAX;
   p->ray_req.ray_count = 1;
+
+  /* B-4 M2: bucket classification */
+  p->ray_bucket = RAY_BUCKET_STARTUP;
+  p->ray_count_ext = 1;
   p->needs_ray = 1;
 }
 
@@ -995,6 +1009,119 @@ error:
   goto exit;
 }
 
+/*******************************************************************************
+ * B-4 M1: Enclosure query sub-state machine
+ *
+ * Converts scene_get_enclosure_id_in_closed_boundaries() from a synchronous
+ * loop of up to 6 trace_ray calls into a single batch of 6 rays.
+ *
+ * Usage pattern (from any caller):
+ *   p->enc_query.return_state = <state to resume after query>;
+ *   d3_set(p->enc_query.query_pos, position);
+ *   step_enc_query_emit(p);
+ *   // path is now in PATH_ENC_QUERY_EMIT, waiting for 6 ray results
+ *
+ * After batch trace delivers results:
+ *   advance_one_step_with_ray(PATH_ENC_QUERY_EMIT)
+ *     -> sets phase = PATH_ENC_QUERY_RESOLVE
+ *   advance_one_step_no_ray(PATH_ENC_QUERY_RESOLVE)
+ *     -> calls step_enc_query_resolve() -> sets enc_query.resolved_enc_id
+ *     -> sets phase = enc_query.return_state
+ ******************************************************************************/
+
+/* Emit 6 rotated axis-aligned rays for enclosure identification.
+ * Mirrors sdis_scene_Xd.h:scene_get_enclosure_id_in_closed_boundaries_3d.
+ * The rotation by PI/4 around each axis avoids alignment with mesh edges. */
+static void
+step_enc_query_emit(struct path_state* p)
+{
+  float dirs[6][3] = {
+    { 1, 0, 0}, {-1, 0, 0},
+    { 0, 1, 0}, { 0,-1, 0},
+    { 0, 0, 1}, { 0, 0,-1}
+  };
+  float frame[9];
+  float pos[3];
+  int i;
+
+  ASSERT(p);
+
+  /* Build rotation frame identical to the original function */
+  f33_rotation(frame, (float)PI/4, (float)PI/4, (float)PI/4);
+
+  /* Rotate all 6 directions */
+  for(i = 0; i < 6; i++) {
+    f33_mulf3(dirs[i], frame, dirs[i]);
+    p->enc_query.directions[i][0] = dirs[i][0];
+    p->enc_query.directions[i][1] = dirs[i][1];
+    p->enc_query.directions[i][2] = dirs[i][2];
+  }
+
+  /* Set ray origin from query position */
+  pos[0] = (float)p->enc_query.query_pos[0];
+  pos[1] = (float)p->enc_query.query_pos[1];
+  pos[2] = (float)p->enc_query.query_pos[2];
+  p->ray_req.origin[0] = pos[0];
+  p->ray_req.origin[1] = pos[1];
+  p->ray_req.origin[2] = pos[2];
+
+  /* Range: same as original [FLT_MIN, FLT_MAX] */
+  p->ray_req.range[0] = FLT_MIN;
+  p->ray_req.range[1] = FLT_MAX;
+
+  /* Signal 6-ray extended request */
+  p->ray_req.ray_count = 1; /* base count for collect compatibility */
+  p->ray_count_ext = 6;
+  p->ray_bucket = RAY_BUCKET_ENCLOSURE;
+  p->needs_ray = 1;
+  p->phase = PATH_ENC_QUERY_EMIT;
+}
+
+/* Resolve 6 directional hit results into an enclosure id.
+ * Mirrors the original FOR_EACH(idir, 0, 6) loop + fallback logic. */
+static res_T
+step_enc_query_resolve(struct path_state* p, struct sdis_scene* scn)
+{
+  int i;
+  unsigned enc_id = ENCLOSURE_ID_NULL;
+  res_T res = RES_OK;
+
+  ASSERT(p && scn);
+
+  for(i = 0; i < 6; i++) {
+    const struct s3d_hit* hit = &p->enc_query.dir_hits[i];
+    float N[3];
+    float cos_N_dir;
+
+    if(S3D_HIT_NONE(hit)) continue;
+
+    f3_normalize(N, hit->normal);
+    cos_N_dir = f3_dot(N, p->enc_query.directions[i]);
+
+    /* Same thresholds as original: distance > 1e-6, |cos| > 0.01 */
+    if(hit->distance > 1.e-6f && fabsf(cos_N_dir) > 1.e-2f) {
+      unsigned enc_ids[2];
+      scene_get_enclosure_ids(scn, hit->prim.prim_id, enc_ids);
+      enc_id = cos_N_dir < 0 ? enc_ids[0] : enc_ids[1];
+      break; /* First valid hit determines enclosure */
+    }
+  }
+
+  if(i >= 6) {
+    /* All 6 directions failed — fallback to brute-force traversal.
+     * This matches the original fallback to scene_get_enclosure_id(). */
+    res = scene_get_enclosure_id(scn, p->enc_query.query_pos, &enc_id);
+    if(res != RES_OK) {
+      p->enc_query.resolved_enc_id = ENCLOSURE_ID_NULL;
+      return res;
+    }
+  }
+
+  p->enc_query.resolved_enc_id = enc_id;
+  p->phase = p->enc_query.return_state;
+  return RES_OK;
+}
+
 /* --- PATH_COUPLED_CONVECTIVE: run convective_path (may need startup ray) - */
 static res_T
 step_convective(struct path_state* p, struct sdis_scene* scn)
@@ -1130,7 +1257,13 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
   case PATH_CND_WOS_FALLBACK_TRACE:
   case PATH_CNV_STARTUP_TRACE:
   case PATH_ENC_QUERY_EMIT:
-    /* B-4 ray-pending: not yet activated, cannot advance without ray */
+    /* B-4 M1: ray-pending, cannot advance without ray */
+    break;
+
+  /* --- B-4 M1: Enclosure query resolve (compute-only, activated) --- */
+  case PATH_ENC_QUERY_RESOLVE:
+    res = step_enc_query_resolve(p, scn);
+    *advanced = 1;
     break;
 
   /* --- B-4 fine-grained: compute-only states (future, no-op for now) --- */
@@ -1161,7 +1294,6 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
   case PATH_CNV_INIT:
   case PATH_CNV_STARTUP_RESULT:
   case PATH_CNV_SAMPLE_LOOP:
-  case PATH_ENC_QUERY_RESOLVE:
     /* B-4 compute-only: not yet activated, no-op fallback */
     break;
 
@@ -1220,9 +1352,11 @@ advance_one_step_with_ray(struct path_state* p, struct sdis_scene* scn,
   case PATH_CND_WOS_CLOSEST:
   case PATH_CND_WOS_FALLBACK_TRACE:
   case PATH_CNV_STARTUP_TRACE:
+  /* --- B-4 M1: Enclosure query — receive 6 ray results --- */
   case PATH_ENC_QUERY_EMIT:
-    FATAL("wavefront: advance_with_ray in B-4 phase %d not yet activated\n",
-          (int)p->phase);
+    /* 6 hits already pre-delivered to enc_query.dir_hits[] by distribute.
+     * Transition to resolve phase (will be cascaded immediately). */
+    p->phase = PATH_ENC_QUERY_RESOLVE;
     break;
 
   default:
@@ -1286,7 +1420,7 @@ collect_ray_requests(struct wavefront_context* wf)
     }
 
     /* Ray 1 (if 2-ray request) */
-    if(p->ray_req.ray_count >= 2) {
+    if(p->ray_req.ray_count >= 2 && p->ray_count_ext != 6) {
       struct s3d_ray_request* rr = &wf->ray_requests[ray_idx];
       rr->origin[0]    = p->ray_req.origin[0];
       rr->origin[1]    = p->ray_req.origin[1];
@@ -1304,6 +1438,45 @@ collect_ray_requests(struct wavefront_context* wf)
       p->ray_req.batch_idx2    = (uint32_t)ray_idx;
       ray_idx++;
     }
+
+    /* B-4 M1: 6-ray enclosure query.
+     * Emit all 6 directional rays from enc_query.directions[].
+     * Ray 0 was already emitted above (using direction[0] from ray_req);
+     * we replace it and emit all 6 here for clarity. */
+    if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT) {
+      int j;
+      /* Overwrite ray 0 with enc direction 0 (ray_req.direction may differ) */
+      {
+        struct s3d_ray_request* rr = &wf->ray_requests[p->ray_req.batch_idx];
+        rr->direction[0] = p->enc_query.directions[0][0];
+        rr->direction[1] = p->enc_query.directions[0][1];
+        rr->direction[2] = p->enc_query.directions[0][2];
+        rr->range[0]     = p->ray_req.range[0];
+        rr->range[1]     = p->ray_req.range[1];
+        rr->filter_data  = NULL;
+      }
+      p->enc_query.batch_indices[0] = p->ray_req.batch_idx;
+
+      /* Emit directions 1..5 */
+      for(j = 1; j < 6; j++) {
+        struct s3d_ray_request* rr = &wf->ray_requests[ray_idx];
+        rr->origin[0]    = p->ray_req.origin[0];
+        rr->origin[1]    = p->ray_req.origin[1];
+        rr->origin[2]    = p->ray_req.origin[2];
+        rr->direction[0] = p->enc_query.directions[j][0];
+        rr->direction[1] = p->enc_query.directions[j][1];
+        rr->direction[2] = p->enc_query.directions[j][2];
+        rr->range[0]     = p->ray_req.range[0];
+        rr->range[1]     = p->ray_req.range[1];
+        rr->filter_data  = NULL;
+        rr->user_id      = (uint32_t)i;
+
+        wf->ray_to_path[ray_idx] = (uint32_t)i;
+        wf->ray_slot[ray_idx]    = (uint32_t)j;
+        p->enc_query.batch_indices[j] = (uint32_t)ray_idx;
+        ray_idx++;
+      }
+    }
   }
 
   wf->ray_count = ray_idx;
@@ -1317,11 +1490,18 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
   size_t r;
   res_T res = RES_OK;
 
-  /* First, deliver ray results to every path that requested rays */
+  /* First, deliver ray results to every path that requested rays.
+   * B-4 M1: pre-deliver 6-ray ENC results into enc_query.dir_hits[]. */
   for(r = 0; r < wf->ray_count; r++) {
     uint32_t pid = wf->ray_to_path[r];
     uint32_t slot = wf->ray_slot[r];
     struct path_state* p = &wf->paths[pid];
+
+    /* B-4 M1: ENC 6-ray pre-delivery */
+    if(p->phase == PATH_ENC_QUERY_EMIT && slot < 6) {
+      p->enc_query.dir_hits[slot] = wf->ray_hits[r];
+      continue;
+    }
 
     if(slot == 0) {
       /* This is hit0 for the path */

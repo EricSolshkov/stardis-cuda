@@ -123,7 +123,11 @@ struct wavefront_pool {
   uint32_t*           ray_slot_sub;    /* ray → sub-ray (0 or 1) */
   struct s3d_hit*     ray_hits;
   size_t              ray_count;
-  size_t              max_rays;        /* pool_size × 2 */
+  size_t              max_rays;        /* pool_size × 6 */
+
+  /* --- Ray bucket offsets (B-4 M2) --- */
+  size_t              bucket_offsets[RAY_BUCKET_COUNT + 1];
+  size_t              bucket_counts[RAY_BUCKET_COUNT];
 
   /* --- Batch trace context (Phase B-1) --- */
   struct s3d_batch_trace_context* batch_ctx;
@@ -144,6 +148,9 @@ struct wavefront_pool {
   size_t rays_radiative;
   size_t rays_conductive_ds;
   size_t rays_conductive_ds_retry;
+  size_t rays_enclosure;
+  size_t rays_shadow;
+  size_t rays_startup;
   size_t paths_done_radiative;
   size_t paths_done_temperature;
   size_t paths_done_boundary;

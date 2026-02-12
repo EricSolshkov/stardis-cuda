@@ -185,6 +185,25 @@ if(ENABLE_TESTS)
         add_test(NAME ${test_name} COMMAND ${test_name})
         set_tests_properties(${test_name} PROPERTIES TIMEOUT 600)
     endforeach()
+
+    # ---- B-4 M1: Enclosure query sub-state machine test ----
+    # This test #includes sdis_solve_wavefront.c directly (with
+    # SDIS_SOLVE_WAVEFRONT_SKIP_PUBLIC_API) to access static step
+    # functions.  It links against sdis for external dependencies
+    # only — the static functions come from the included .c file.
+    add_executable(test_sdis_b4_m1_enclosure_batch
+        src/test_sdis_b4_m1_enclosure_batch.c)
+    target_link_libraries(test_sdis_b4_m1_enclosure_batch PRIVATE sdis)
+    add_test(NAME test_sdis_b4_m1_enclosure_batch
+             COMMAND test_sdis_b4_m1_enclosure_batch)
+
+    # ---- B-4 M2: Ray bucketing framework test ----
+    add_executable(test_sdis_b4_m2_ray_bucketing
+        src/test_sdis_b4_m2_ray_bucketing.c)
+    target_link_libraries(test_sdis_b4_m2_ray_bucketing PRIVATE sdis)
+    add_test(NAME test_sdis_b4_m2_ray_bucketing
+             COMMAND test_sdis_b4_m2_ray_bucketing)
+
 endif()
 
 # ============================================================================
