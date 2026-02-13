@@ -225,6 +225,34 @@ extern LOCAL_SYM res_T
 step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn);
 
 /*******************************************************************************
+ * B-4 M7: External net flux batch state machine
+ ******************************************************************************/
+
+/* PATH_BND_EXT_CHECK: check if external flux is needed, set up shared state */
+extern LOCAL_SYM res_T
+step_bnd_ext_check(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_BND_EXT_DIRECT_TRACE: process shadow ray result (direct contribution) */
+extern LOCAL_SYM res_T
+step_bnd_ext_direct_result(struct path_state* p, struct sdis_scene* scn,
+                           const struct s3d_hit* hit);
+
+/* PATH_BND_EXT_DIFFUSE_RESULT: process diffuse bounce ray result */
+extern LOCAL_SYM res_T
+step_bnd_ext_diffuse_result(struct path_state* p, struct sdis_scene* scn,
+                            const struct s3d_hit* hit);
+
+/* PATH_BND_EXT_DIFFUSE_SHADOW_RESULT: process bounce shadow ray result */
+extern LOCAL_SYM res_T
+step_bnd_ext_diffuse_shadow_result(struct path_state* p,
+                                   struct sdis_scene* scn,
+                                   const struct s3d_hit* hit);
+
+/* PATH_BND_EXT_FINALIZE: sum flux contributions, apply to T, return to caller */
+extern LOCAL_SYM res_T
+step_bnd_ext_finalize(struct path_state* p, struct sdis_scene* scn);
+
+/*******************************************************************************
  * B-4 M6: Convective path + boundary dispatch + Robin post-check
  ******************************************************************************/
 

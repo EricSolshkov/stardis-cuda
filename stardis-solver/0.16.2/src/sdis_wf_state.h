@@ -27,6 +27,7 @@
 #include "sdis_heat_path.h" /* struct rwalk, rwalk_context, temperature      */
 #include "sdis_medium_c.h"  /* struct solid_props                            */
 #include "sdis_scene_c.h"   /* struct hit_filter_data                        */
+#include "sdis_source_c.h"  /* struct source_props, source_sample (M7)       */
 
 #include <star/s3d.h>        /* struct s3d_hit                                */
 #include <star/ssp.h>        /* struct ssp_rng                                */
@@ -34,6 +35,7 @@
 
 /* Forward declarations (pointer-only usage in path_state) */
 struct sdis_medium;
+struct green_path_handle;
 
 /*******************************************************************************
  * Per-ray request descriptor (wavefront internal)
@@ -220,15 +222,38 @@ struct path_state {
     } cnv;
   } locals;
 
-  /* --- B-4: External net flux (independent, co-active with picard) --- */
+  /* --- B-4 M7: External net flux (independent, co-active with picard) --- */
   struct {
-    float   pos[3], dir[3];
-    float   range;
-    struct s3d_hit hit;
-    double  flux_direct;
-    double  flux_diffuse_reflected;
-    double  flux_scattered;
-    int     nbounces;
+    /* Ray data for current shadow / diffuse ray */
+    float   pos[3];                    /* current bounce position (float)  */
+    float   dir[3];                    /* current diffuse bounce direction  */
+    float   range;                     /* ray range (shadow: src dist)     */
+    struct s3d_hit hit;                /* current hit from boundary/bounce  */
+
+    /* Accumulated flux components */
+    double  flux_direct;               /* incident_flux_direct [W/m^2]     */
+    double  flux_diffuse_reflected;    /* sum of L contributions [W/m^2/sr]*/
+    double  flux_scattered;            /* PI if miss (scattered component) */
+    double  scattered_dir[3];          /* direction of scattered component  */
+    int     nbounces;                  /* bounce counter                    */
+
+    /* Persistent state across suspend points */
+    double  emissivity;                /* interface emissivity for source   */
+    double  sum_h;                     /* h_cond + h_conv + h_radi          */
+    double  cos_theta;                 /* N . src_sample.dir                */
+    double  N[3];                      /* outward normal (toward fluid)     */
+    unsigned enc_id_fluid;             /* enclosure id on fluid side        */
+    struct source_props  src_props;    /* source properties at frag.time    */
+    struct source_sample src_sample;   /* sampled direction toward source   */
+
+    /* Fragment info for BRDF at bounce */
+    double  frag_time;                 /* fragment time [s]                 */
+    double  frag_P[3];                 /* original fragment position        */
+
+    /* Green function handle (non-owning pointer) */
+    struct green_path_handle* green_path;
+
+    /* Return state after flux computation is done */
     enum path_phase return_state;      /* resume state after flux done     */
   } ext_flux;
 

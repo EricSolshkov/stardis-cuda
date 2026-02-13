@@ -245,7 +245,7 @@ bench_create_solid(struct sdis_device* dev)
   struct sdis_medium* solid = NULL;
   struct bench_solid params;
 
-  params.temperature = SDIS_TEMPERATURE_UNKNOWN;
+  params.temperature = SDIS_TEMPERATURE_NONE;
   params.lambda = 0.1;
   params.cp = 800.0;
   params.rho = 2700.0;

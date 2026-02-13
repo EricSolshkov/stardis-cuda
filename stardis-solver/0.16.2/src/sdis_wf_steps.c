@@ -47,6 +47,7 @@
 #include "sdis_radiative_env_c.h"
 #include "sdis_realisation.h"
 #include "sdis_scene_c.h"
+#include "sdis_source_c.h"
 #include "sdis_tile.h"
 
 #include <float.h>
@@ -1964,8 +1965,6 @@ step_bnd_sf_prob_dispatch(struct path_state* p, struct sdis_scene* scn)
   struct reinjection_step reinject_step = REINJECTION_STEP_NULL;
   struct solid_reinjection_args solid_reinject_args = SOLID_REINJECTION_ARGS_NULL;
   struct handle_net_flux_args net_flux_args = HANDLE_NET_FLUX_ARGS_NULL;
-  struct handle_external_net_flux_args ext_flux_args =
-      HANDLE_EXTERNAL_NET_FLUX_ARGS_NULL;
   struct sdis_interface* interf = NULL;
   struct sdis_interface_fragment frag = SDIS_INTERFACE_FRAGMENT_NULL;
   double r;
@@ -2021,24 +2020,19 @@ step_bnd_sf_prob_dispatch(struct path_state* p, struct sdis_scene* scn)
     res = handle_net_flux_3d(scn, &net_flux_args, &p->T);
     if(res != RES_OK) goto error;
 
-    /* handle_external_net_flux (synchronous for now — M7 will parallelize) */
-    ext_flux_args.interf = interf;
-    ext_flux_args.frag = &frag;
-    ext_flux_args.hit_3d = &p->rwalk.hit_3d;
-    ext_flux_args.green_path = p->ctx.green_path;
-    ext_flux_args.heat_path = p->ctx.heat_path;
-    ext_flux_args.picard_order = get_picard_order(&p->ctx);
-    ext_flux_args.h_cond = p->locals.bnd_sf.h_cond;
-    ext_flux_args.h_conv = p->locals.bnd_sf.h_conv;
-    ext_flux_args.h_radi = p->locals.bnd_sf.h_radi_hat;
-    res = handle_external_net_flux_3d(scn, p->rng, &ext_flux_args, &p->T);
-    if(res != RES_OK) goto error;
-
-    /* Save heat vertex for null-collision restart */
+    /* Save heat vertex for null-collision restart (before ext flux) */
     if(p->ctx.heat_path) {
       p->locals.bnd_sf.hvtx_saved =
           *heat_path_get_last_vertex(p->ctx.heat_path);
     }
+
+    /* M7: route to external net flux sub-state machine instead of sync call.
+     * When EXT completes, it returns to PATH_BND_SF_PROB_DISPATCH where
+     * h_hat != 0 → goes directly to null-collision dispatch. */
+    p->ext_flux.return_state = PATH_BND_SF_PROB_DISPATCH;
+    p->phase = PATH_BND_EXT_CHECK;
+    p->needs_ray = 0;
+    return step_bnd_ext_check(p, scn);
   }
 
   /* === Null-collision dispatch === */
@@ -2480,6 +2474,621 @@ step_convective(struct path_state* p, struct sdis_scene* scn)
   /* M6: redirect to fine-grained convective state machine */
   p->phase = PATH_CNV_INIT;
   return step_cnv_init(p, scn);
+}
+
+/*******************************************************************************
+ * B-4 M7: External net flux batch state machine
+ *
+ * Replaces the synchronous handle_external_net_flux_3d() call with a sub-state
+ * machine that emits shadow rays and diffuse bounce rays through the wavefront
+ * batch trace pipeline.
+ *
+ * State flow:
+ *   EXT_CHECK → (shadow)   EXT_DIRECT_TRACE → EXT_DIRECT_RESULT
+ *             → (diffuse)  EXT_DIFFUSE_TRACE → EXT_DIFFUSE_RESULT
+ *                          → (reflect) EXT_DIFFUSE_SHADOW_TRACE
+ *                                      → EXT_DIFFUSE_SHADOW_RESULT → loop
+ *                          → (miss/absorb) EXT_FINALIZE
+ *             → (no flux)  return_state (bypass)
+ *
+ * See CPU reference: sdis_heat_path_boundary_Xd_handle_external_net_flux.h
+ ******************************************************************************/
+
+/* --- PATH_BND_EXT_CHECK: initialise ext flux, decide shadow ray ---------- */
+LOCAL_SYM res_T
+step_bnd_ext_check(struct path_state* p, struct sdis_scene* scn)
+{
+  struct sdis_interface* interf = NULL;
+  struct sdis_interface_fragment frag = SDIS_INTERFACE_FRAGMENT_NULL;
+  unsigned enc_ids[2] = {ENCLOSURE_ID_NULL, ENCLOSURE_ID_NULL};
+  int handle_flux = 0;
+  unsigned src_id = 0;
+  double cos_theta = 0;
+  res_T res = RES_OK;
+
+  ASSERT(p && scn);
+
+  /* Zero accumulated flux */
+  p->ext_flux.flux_direct = 0;
+  p->ext_flux.flux_diffuse_reflected = 0;
+  p->ext_flux.flux_scattered = 0;
+  p->ext_flux.scattered_dir[0] = 0;
+  p->ext_flux.scattered_dir[1] = 0;
+  p->ext_flux.scattered_dir[2] = 0;
+  p->ext_flux.nbounces = 0;
+
+  /* Get interface from the boundary hit */
+  interf = scene_get_interface(scn, p->rwalk.hit_3d.prim.prim_id);
+
+  /* Setup fluid-side fragment */
+  setup_interface_fragment_3d(&frag, &p->rwalk.vtx,
+                              &p->rwalk.hit_3d, p->rwalk.hit_side);
+  if(sdis_medium_get_type(interf->medium_front) == SDIS_FLUID) {
+    frag.side = SDIS_FRONT;
+  } else {
+    ASSERT(sdis_medium_get_type(interf->medium_back) == SDIS_FLUID);
+    frag.side = SDIS_BACK;
+  }
+
+  /* Retrieve enclosure ids */
+  scene_get_enclosure_ids(scn, p->rwalk.hit_3d.prim.prim_id, enc_ids);
+  p->ext_flux.enc_id_fluid = enc_ids[frag.side];
+
+  /* Check if external flux handling is needed */
+  handle_flux = interface_side_is_external_flux_handled(interf, &frag);
+  handle_flux = handle_flux && (scn->source != NULL);
+  if(!handle_flux) {
+    /* No external flux → skip directly to caller */
+    p->phase = p->ext_flux.return_state;
+    p->needs_ray = 0;
+    goto exit;
+  }
+
+  /* Check emissivity */
+  src_id = sdis_source_get_id(scn->source);
+  p->ext_flux.emissivity =
+      interface_side_get_emissivity(interf, src_id, &frag);
+  res = interface_side_check_emissivity(scn->dev, p->ext_flux.emissivity,
+                                        frag.P, frag.time);
+  if(res != RES_OK) goto error;
+
+  if(p->ext_flux.emissivity == 0) {
+    p->phase = p->ext_flux.return_state;
+    p->needs_ray = 0;
+    goto exit;
+  }
+
+  /* Get source properties */
+  res = source_get_props(scn->source, frag.time, &p->ext_flux.src_props);
+  if(res != RES_OK) goto error;
+
+  /* Sample a direction toward the source */
+  res = source_sample(scn->source, &p->ext_flux.src_props, p->rng,
+                      frag.P, &p->ext_flux.src_sample);
+  if(res != RES_OK) goto error;
+
+  /* Save fragment info for later */
+  p->ext_flux.frag_time = frag.time;
+  d3_set(p->ext_flux.frag_P, frag.P);
+
+  /* Compute outward normal (toward fluid) */
+  d3_set(p->ext_flux.N, frag.Ng);
+  if(frag.side == SDIS_BACK) {
+    d3_minus(p->ext_flux.N, p->ext_flux.N);
+  }
+
+  /* Compute sum_h for denominator */
+  p->ext_flux.sum_h = p->locals.bnd_sf.h_cond
+                    + p->locals.bnd_sf.h_conv
+                    + p->locals.bnd_sf.h_radi_hat;
+
+  /* Save green_path handle */
+  p->ext_flux.green_path = p->ctx.green_path;
+
+  /* cos_theta for direct contribution check */
+  cos_theta = d3_dot(p->ext_flux.N, p->ext_flux.src_sample.dir);
+  p->ext_flux.cos_theta = cos_theta;
+
+  if(cos_theta > 0) {
+    /* Source is above the surface → emit shadow ray to check occlusion */
+    float pos_f[3];
+    f3_set_d3(pos_f, p->ext_flux.frag_P);
+
+    p->ext_flux.pos[0] = pos_f[0];
+    p->ext_flux.pos[1] = pos_f[1];
+    p->ext_flux.pos[2] = pos_f[2];
+
+    p->ray_req.origin[0] = pos_f[0];
+    p->ray_req.origin[1] = pos_f[1];
+    p->ray_req.origin[2] = pos_f[2];
+    p->ray_req.direction[0] = (float)p->ext_flux.src_sample.dir[0];
+    p->ray_req.direction[1] = (float)p->ext_flux.src_sample.dir[1];
+    p->ray_req.direction[2] = (float)p->ext_flux.src_sample.dir[2];
+    p->ray_req.range[0] = 0.0f;
+    p->ray_req.range[1] = (float)p->ext_flux.src_sample.dst;
+    p->ray_req.ray_count = 1;
+
+    /* Filter: skip self-intersection with current hit */
+    p->filter_data_storage = HIT_FILTER_DATA_NULL;
+    p->filter_data_storage.hit_3d = p->rwalk.hit_3d;
+    p->filter_data_storage.epsilon = 1.e-6;
+    p->filter_data_storage.scn = scn;
+    p->filter_data_storage.enc_id = p->ext_flux.enc_id_fluid;
+
+    p->ray_bucket = RAY_BUCKET_SHADOW;
+    p->ray_count_ext = 1;
+    p->needs_ray = 1;
+    p->phase = PATH_BND_EXT_DIRECT_TRACE;
+  } else {
+    /* Source behind surface → skip direct contribution, go to diffuse */
+    p->ext_flux.flux_direct = 0;
+
+    /* Set up initial diffuse bounce ray */
+    {
+      float pos_f[3], dir_f[3];
+      double dir_d[3];
+
+      f3_set_d3(pos_f, p->ext_flux.frag_P);
+
+      /* Cosine-weighted hemisphere sample for diffuse */
+      ssp_ran_hemisphere_cos(p->rng, p->ext_flux.N, dir_d, NULL);
+      dir_f[0] = (float)dir_d[0];
+      dir_f[1] = (float)dir_d[1];
+      dir_f[2] = (float)dir_d[2];
+
+      p->ext_flux.pos[0] = pos_f[0];
+      p->ext_flux.pos[1] = pos_f[1];
+      p->ext_flux.pos[2] = pos_f[2];
+      p->ext_flux.dir[0] = dir_f[0];
+      p->ext_flux.dir[1] = dir_f[1];
+      p->ext_flux.dir[2] = dir_f[2];
+      p->ext_flux.hit = p->rwalk.hit_3d;
+
+      p->ray_req.origin[0] = pos_f[0];
+      p->ray_req.origin[1] = pos_f[1];
+      p->ray_req.origin[2] = pos_f[2];
+      p->ray_req.direction[0] = dir_f[0];
+      p->ray_req.direction[1] = dir_f[1];
+      p->ray_req.direction[2] = dir_f[2];
+      p->ray_req.range[0] = 0.0f;
+      p->ray_req.range[1] = FLT_MAX;
+      p->ray_req.ray_count = 1;
+
+      p->filter_data_storage = HIT_FILTER_DATA_NULL;
+      p->filter_data_storage.hit_3d = p->rwalk.hit_3d;
+      p->filter_data_storage.epsilon = 1.e-6;
+      p->filter_data_storage.scn = scn;
+      p->filter_data_storage.enc_id = p->ext_flux.enc_id_fluid;
+
+      p->ray_bucket = RAY_BUCKET_RADIATIVE;
+      p->ray_count_ext = 1;
+      p->needs_ray = 1;
+      p->phase = PATH_BND_EXT_DIFFUSE_TRACE;
+    }
+  }
+
+exit:
+  return res;
+error:
+  p->phase = PATH_DONE;
+  p->active = 0;
+  p->done_reason = -1;
+  goto exit;
+}
+
+/* --- PATH_BND_EXT_DIRECT_RESULT: process shadow ray result --------------- */
+LOCAL_SYM res_T
+step_bnd_ext_direct_result(struct path_state* p, struct sdis_scene* scn,
+                           const struct s3d_hit* hit)
+{
+  res_T res = RES_OK;
+  double dir_d[3];
+  float  pos_f[3], dir_f[3];
+
+  ASSERT(p && scn && hit);
+
+  /* Shadow ray: if we hit something, source is occluded → direct = 0 */
+  if(!S3D_HIT_NONE(hit)) {
+    p->ext_flux.flux_direct = 0;
+  } else {
+    /* Source visible → compute direct contribution */
+    double Ld = p->ext_flux.src_sample.radiance_term; /* [W/m^2/sr] */
+    p->ext_flux.flux_direct =
+        p->ext_flux.cos_theta * Ld / p->ext_flux.src_sample.pdf; /* [W/m^2] */
+  }
+
+  /* Now set up the first diffuse bounce ray (same as CPU's
+   * compute_incident_diffuse_flux entry) */
+  f3_set_d3(pos_f, p->ext_flux.frag_P);
+
+  /* Cosine-weighted hemisphere sample for diffuse bounce */
+  ssp_ran_hemisphere_cos(p->rng, p->ext_flux.N, dir_d, NULL);
+  dir_f[0] = (float)dir_d[0];
+  dir_f[1] = (float)dir_d[1];
+  dir_f[2] = (float)dir_d[2];
+
+  p->ext_flux.pos[0] = pos_f[0];
+  p->ext_flux.pos[1] = pos_f[1];
+  p->ext_flux.pos[2] = pos_f[2];
+  p->ext_flux.dir[0] = dir_f[0];
+  p->ext_flux.dir[1] = dir_f[1];
+  p->ext_flux.dir[2] = dir_f[2];
+  p->ext_flux.hit = p->rwalk.hit_3d;
+
+  p->ray_req.origin[0] = pos_f[0];
+  p->ray_req.origin[1] = pos_f[1];
+  p->ray_req.origin[2] = pos_f[2];
+  p->ray_req.direction[0] = dir_f[0];
+  p->ray_req.direction[1] = dir_f[1];
+  p->ray_req.direction[2] = dir_f[2];
+  p->ray_req.range[0] = 0.0f;
+  p->ray_req.range[1] = FLT_MAX;
+  p->ray_req.ray_count = 1;
+
+  p->filter_data_storage = HIT_FILTER_DATA_NULL;
+  p->filter_data_storage.hit_3d = p->rwalk.hit_3d;
+  p->filter_data_storage.epsilon = 1.e-6;
+  p->filter_data_storage.scn = scn;
+  p->filter_data_storage.enc_id = p->ext_flux.enc_id_fluid;
+
+  p->ray_bucket = RAY_BUCKET_RADIATIVE;
+  p->ray_count_ext = 1;
+  p->needs_ray = 1;
+  p->phase = PATH_BND_EXT_DIFFUSE_TRACE;
+
+  return res;
+}
+
+/* --- PATH_BND_EXT_DIFFUSE_RESULT: process diffuse bounce ray result ------ */
+LOCAL_SYM res_T
+step_bnd_ext_diffuse_result(struct path_state* p, struct sdis_scene* scn,
+                            const struct s3d_hit* hit)
+{
+  res_T res = RES_OK;
+
+  ASSERT(p && scn && hit);
+
+  /* --- Miss: ray escaped to environment → scattered flux = PI --- */
+  if(S3D_HIT_NONE(hit)) {
+    p->ext_flux.flux_scattered = PI;
+    p->ext_flux.scattered_dir[0] = p->ext_flux.dir[0];
+    p->ext_flux.scattered_dir[1] = p->ext_flux.dir[1];
+    p->ext_flux.scattered_dir[2] = p->ext_flux.dir[2];
+
+    p->phase = PATH_BND_EXT_FINALIZE;
+    p->needs_ray = 0;
+    goto exit;
+  }
+
+  /* --- Hit: BRDF decision at bounce position --- */
+  {
+    struct sdis_interface_fragment frag = SDIS_INTERFACE_FRAGMENT_NULL;
+    struct sdis_interface* interf = NULL;
+    struct brdf brdf = BRDF_NULL;
+    struct brdf_sample bounce = BRDF_SAMPLE_NULL;
+    struct brdf_setup_args brdf_args = BRDF_SETUP_ARGS_NULL;
+    double dir_d[3], pos_d[3], N[3], wi[3];
+
+    /* Update stored hit */
+    p->ext_flux.hit = *hit;
+
+    /* Compute new position from ray origin + t * direction */
+    d3_set_f3(dir_d, p->ext_flux.dir);
+    d3_normalize(dir_d, dir_d);
+    d3_set_f3(pos_d, p->ext_flux.pos);
+    {
+      double vec[3];
+      d3_add(pos_d, pos_d, d3_muld(vec, dir_d, hit->distance));
+    }
+
+    /* Update position in ext_flux for next bounce */
+    p->ext_flux.pos[0] = (float)pos_d[0];
+    p->ext_flux.pos[1] = (float)pos_d[1];
+    p->ext_flux.pos[2] = (float)pos_d[2];
+
+    /* Normal at hit */
+    d3_set_f3(N, hit->normal);
+    d3_normalize(N, N);
+
+    /* Determine hit side */
+    {
+      enum sdis_side side = d3_dot(dir_d, N) < 0 ? SDIS_FRONT : SDIS_BACK;
+
+      /* Get interface at hit */
+      interf = scene_get_interface(scn, hit->prim.prim_id);
+
+      /* Set up fragment */
+      {
+        struct sdis_rwalk_vertex vtx = SDIS_RWALK_VERTEX_NULL;
+        d3_set(vtx.P, pos_d);
+        vtx.time = p->ext_flux.frag_time;
+        setup_interface_fragment_3d(&frag, &vtx, hit, side);
+      }
+
+      /* BRDF at intersection */
+      brdf_args.interf = interf;
+      brdf_args.frag = &frag;
+      brdf_args.source_id = sdis_source_get_id(scn->source);
+      res = brdf_setup(scn->dev, &brdf_args, &brdf);
+      if(res != RES_OK) goto error;
+
+      /* Absorption test */
+      if(ssp_rng_canonical(p->rng) < brdf.emissivity) {
+        /* Absorbed → diffuse bounce terminates with no further contribution */
+        p->phase = PATH_BND_EXT_FINALIZE;
+        p->needs_ray = 0;
+        goto exit;
+      }
+
+      /* Reflection: sample new direction */
+      d3_minus(wi, dir_d);
+      switch(side) {
+      case SDIS_FRONT: break;
+      case SDIS_BACK: d3_minus(N, N); break;
+      default: FATAL("Unreachable\n"); break;
+      }
+      brdf_sample(&brdf, p->rng, wi, N, &bounce);
+
+      /* Calculate the direct contribution at this bounce position.
+       * This depends on whether the bounce is specular or diffuse. */
+      if(bounce.cpnt == BRDF_SPECULAR) {
+        /* Specular bounce: trace to source along specular direction */
+        struct source_sample samp = SOURCE_SAMPLE_NULL;
+        res = source_trace_to(scn->source, &p->ext_flux.src_props,
+                              pos_d, bounce.dir, &samp);
+        if(res != RES_OK) goto error;
+
+        if(!SOURCE_SAMPLE_NONE(&samp)) {
+          /* Emit shadow ray along specular direction to check occlusion */
+          p->ext_flux.dir[0] = (float)bounce.dir[0];
+          p->ext_flux.dir[1] = (float)bounce.dir[1];
+          p->ext_flux.dir[2] = (float)bounce.dir[2];
+
+          /* Store the source sample radiance_term for shadow result.
+           * Mark cos_theta <= 0 so that diffuse_shadow_result uses L = Ld
+           * (specular contribution) rather than L = Ld*cos/(PI*pdf). */
+          p->ext_flux.src_sample = samp;
+          p->ext_flux.cos_theta = -1;
+
+          p->ray_req.origin[0] = p->ext_flux.pos[0];
+          p->ray_req.origin[1] = p->ext_flux.pos[1];
+          p->ray_req.origin[2] = p->ext_flux.pos[2];
+          p->ray_req.direction[0] = (float)samp.dir[0];
+          p->ray_req.direction[1] = (float)samp.dir[1];
+          p->ray_req.direction[2] = (float)samp.dir[2];
+          p->ray_req.range[0] = 0.0f;
+          p->ray_req.range[1] = (float)samp.dst;
+          p->ray_req.ray_count = 1;
+
+          p->filter_data_storage = HIT_FILTER_DATA_NULL;
+          p->filter_data_storage.hit_3d = *hit;
+          p->filter_data_storage.epsilon = 1.e-6;
+          p->filter_data_storage.scn = scn;
+          p->filter_data_storage.enc_id = p->ext_flux.enc_id_fluid;
+
+          p->ray_bucket = RAY_BUCKET_SHADOW;
+          p->ray_count_ext = 1;
+          p->needs_ray = 1;
+          p->phase = PATH_BND_EXT_DIFFUSE_SHADOW_TRACE;
+
+          /* Save the specular bounce direction as the next diffuse dir */
+          /* (will be used after shadow result to continue bouncing) */
+          p->ext_flux.dir[0] = (float)bounce.dir[0];
+          p->ext_flux.dir[1] = (float)bounce.dir[1];
+          p->ext_flux.dir[2] = (float)bounce.dir[2];
+          goto exit;
+        }
+        /* Source not reachable from specular bounce → no shadow ray needed,
+         * just continue bouncing in the specular direction */
+        p->ext_flux.dir[0] = (float)bounce.dir[0];
+        p->ext_flux.dir[1] = (float)bounce.dir[1];
+        p->ext_flux.dir[2] = (float)bounce.dir[2];
+
+      } else {
+        /* Diffuse bounce: sample a direction toward the source */
+        struct source_sample samp = SOURCE_SAMPLE_NULL;
+        double cos_theta_bounce;
+
+        ASSERT(bounce.cpnt == BRDF_DIFFUSE);
+
+        res = source_sample(scn->source, &p->ext_flux.src_props, p->rng,
+                            pos_d, &samp);
+        if(res != RES_OK) goto error;
+
+        cos_theta_bounce = d3_dot(samp.dir, N);
+        if(cos_theta_bounce > 0) {
+          /* Source above this surface → emit shadow ray */
+          p->ext_flux.src_sample = samp;
+          p->ext_flux.cos_theta = cos_theta_bounce;
+
+          p->ray_req.origin[0] = p->ext_flux.pos[0];
+          p->ray_req.origin[1] = p->ext_flux.pos[1];
+          p->ray_req.origin[2] = p->ext_flux.pos[2];
+          p->ray_req.direction[0] = (float)samp.dir[0];
+          p->ray_req.direction[1] = (float)samp.dir[1];
+          p->ray_req.direction[2] = (float)samp.dir[2];
+          p->ray_req.range[0] = 0.0f;
+          p->ray_req.range[1] = (float)samp.dst;
+          p->ray_req.ray_count = 1;
+
+          p->filter_data_storage = HIT_FILTER_DATA_NULL;
+          p->filter_data_storage.hit_3d = *hit;
+          p->filter_data_storage.epsilon = 1.e-6;
+          p->filter_data_storage.scn = scn;
+          p->filter_data_storage.enc_id = p->ext_flux.enc_id_fluid;
+
+          p->ray_bucket = RAY_BUCKET_SHADOW;
+          p->ray_count_ext = 1;
+          p->needs_ray = 1;
+          p->phase = PATH_BND_EXT_DIFFUSE_SHADOW_TRACE;
+
+          /* Save bounce direction for next diffuse bounce */
+          p->ext_flux.dir[0] = (float)bounce.dir[0];
+          p->ext_flux.dir[1] = (float)bounce.dir[1];
+          p->ext_flux.dir[2] = (float)bounce.dir[2];
+          goto exit;
+        }
+        /* Source behind this surface → L = 0, no shadow ray needed */
+        /* Just continue bouncing */
+        p->ext_flux.dir[0] = (float)bounce.dir[0];
+        p->ext_flux.dir[1] = (float)bounce.dir[1];
+        p->ext_flux.dir[2] = (float)bounce.dir[2];
+      }
+
+      /* No shadow ray needed at this bounce → emit next diffuse bounce ray */
+      p->ext_flux.nbounces++;
+
+      p->ray_req.origin[0] = p->ext_flux.pos[0];
+      p->ray_req.origin[1] = p->ext_flux.pos[1];
+      p->ray_req.origin[2] = p->ext_flux.pos[2];
+      p->ray_req.direction[0] = p->ext_flux.dir[0];
+      p->ray_req.direction[1] = p->ext_flux.dir[1];
+      p->ray_req.direction[2] = p->ext_flux.dir[2];
+      p->ray_req.range[0] = 0.0f;
+      p->ray_req.range[1] = FLT_MAX;
+      p->ray_req.ray_count = 1;
+
+      p->filter_data_storage = HIT_FILTER_DATA_NULL;
+      p->filter_data_storage.hit_3d = *hit;
+      p->filter_data_storage.epsilon = 1.e-6;
+      p->filter_data_storage.scn = scn;
+      p->filter_data_storage.enc_id = p->ext_flux.enc_id_fluid;
+
+      p->ray_bucket = RAY_BUCKET_RADIATIVE;
+      p->ray_count_ext = 1;
+      p->needs_ray = 1;
+      p->phase = PATH_BND_EXT_DIFFUSE_TRACE;
+    }
+  }
+
+exit:
+  return res;
+error:
+  p->phase = PATH_DONE;
+  p->active = 0;
+  p->done_reason = -1;
+  goto exit;
+}
+
+/* --- PATH_BND_EXT_DIFFUSE_SHADOW_RESULT: shadow ray at bounce position --- */
+LOCAL_SYM res_T
+step_bnd_ext_diffuse_shadow_result(struct path_state* p,
+                                   struct sdis_scene* scn,
+                                   const struct s3d_hit* hit)
+{
+  res_T res = RES_OK;
+
+  ASSERT(p && scn && hit);
+
+  /* Process shadow ray result at bounce position */
+  if(S3D_HIT_NONE(hit)) {
+    /* Not occluded → accumulate direct contribution at this bounce.
+     * For specular bounces, L = Ld (radiance_term).
+     * For diffuse bounces, L = Ld * cos_theta / (PI * pdf). */
+    double Ld = p->ext_flux.src_sample.radiance_term;
+    double L;
+
+    if(p->ext_flux.cos_theta > 0
+    && p->ext_flux.src_sample.pdf > 0) {
+      /* Diffuse bounce: L = Ld * cos / (PI * pdf) */
+      L = Ld * p->ext_flux.cos_theta
+        / (PI * p->ext_flux.src_sample.pdf);
+    } else {
+      /* Specular bounce: L = Ld */
+      L = Ld;
+    }
+    p->ext_flux.flux_diffuse_reflected += L; /* [W/m^2/sr] */
+  }
+  /* If occluded, no contribution */
+
+  /* Continue with next diffuse bounce ray */
+  p->ext_flux.nbounces++;
+
+  p->ray_req.origin[0] = p->ext_flux.pos[0];
+  p->ray_req.origin[1] = p->ext_flux.pos[1];
+  p->ray_req.origin[2] = p->ext_flux.pos[2];
+  p->ray_req.direction[0] = p->ext_flux.dir[0];
+  p->ray_req.direction[1] = p->ext_flux.dir[1];
+  p->ray_req.direction[2] = p->ext_flux.dir[2];
+  p->ray_req.range[0] = 0.0f;
+  p->ray_req.range[1] = FLT_MAX;
+  p->ray_req.ray_count = 1;
+
+  p->filter_data_storage = HIT_FILTER_DATA_NULL;
+  p->filter_data_storage.hit_3d = p->ext_flux.hit;
+  p->filter_data_storage.epsilon = 1.e-6;
+  p->filter_data_storage.scn = scn;
+  p->filter_data_storage.enc_id = p->ext_flux.enc_id_fluid;
+
+  p->ray_bucket = RAY_BUCKET_RADIATIVE;
+  p->ray_count_ext = 1;
+  p->needs_ray = 1;
+  p->phase = PATH_BND_EXT_DIFFUSE_TRACE;
+
+  return res;
+}
+
+/* --- PATH_BND_EXT_FINALIZE: sum flux, apply to T, return to caller ------- */
+LOCAL_SYM res_T
+step_bnd_ext_finalize(struct path_state* p, struct sdis_scene* scn)
+{
+  struct sdis_green_external_flux_terms green =
+      SDIS_GREEN_EXTERNAL_FLUX_TERMS_NULL;
+  double incident_flux;
+  double net_flux, net_flux_sc;
+  res_T res = RES_OK;
+
+  ASSERT(p && scn);
+
+  /* CPU reference: handle_external_net_flux lines 340-385 */
+
+  /* flux_diffuse_reflected is accumulated as [W/m^2/sr], multiply by PI to
+   * get [W/m^2] (matches CPU: diffuse_flux->reflected *= PI) */
+  p->ext_flux.flux_diffuse_reflected *= PI; /* [W/m^2] */
+
+  /* incident_flux = direct + diffuse_reflected (excludes scattered) */
+  incident_flux = p->ext_flux.flux_direct
+                + p->ext_flux.flux_diffuse_reflected;
+
+  /* net_flux (relative to source power) */
+  net_flux = incident_flux * p->ext_flux.emissivity;
+
+  /* net_flux_sc (relative to source diffuse radiance) */
+  net_flux_sc = p->ext_flux.flux_scattered * p->ext_flux.emissivity;
+
+  /* Green function terms */
+  green.term_wrt_power = net_flux / p->ext_flux.sum_h;
+  green.term_wrt_diffuse_radiance = net_flux_sc / p->ext_flux.sum_h;
+  green.time = p->ext_flux.frag_time;
+  green.dir[0] = p->ext_flux.scattered_dir[0];
+  green.dir[1] = p->ext_flux.scattered_dir[1];
+  green.dir[2] = p->ext_flux.scattered_dir[2];
+
+  /* Apply to temperature */
+  p->T.value += green.term_wrt_power * p->ext_flux.src_props.power;
+  if(green.term_wrt_diffuse_radiance) {
+    p->T.value +=
+        green.term_wrt_diffuse_radiance
+      * source_get_diffuse_radiance(scn->source, green.time, green.dir);
+  }
+
+  /* Register in green path if available */
+  if(p->ext_flux.green_path) {
+    res = green_path_add_external_flux_terms(p->ext_flux.green_path, &green);
+    if(res != RES_OK) goto error;
+  }
+
+  /* Return to caller */
+  p->phase = p->ext_flux.return_state;
+  p->needs_ray = 0;
+
+exit:
+  return res;
+error:
+  p->phase = PATH_DONE;
+  p->active = 0;
+  p->done_reason = -1;
+  goto exit;
 }
 
 /*******************************************************************************
@@ -3077,6 +3686,16 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
     *advanced = 1;
     break;
 
+  /* --- B-4 M7: External net flux (compute-only, activated) --- */
+  case PATH_BND_EXT_CHECK:
+    res = step_bnd_ext_check(p, scn);
+    *advanced = 1;
+    break;
+  case PATH_BND_EXT_FINALIZE:
+    res = step_bnd_ext_finalize(p, scn);
+    *advanced = 1;
+    break;
+
   /* --- B-4 fine-grained: compute-only states (future, no-op for now) --- */
   case PATH_RAD_PROCESS_HIT:
   case PATH_BND_SFN_PROB_DISPATCH:
@@ -3084,11 +3703,6 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
   case PATH_BND_SFN_COMPUTE_Ti:
   case PATH_BND_SFN_COMPUTE_Ti_RESUME:
   case PATH_BND_SFN_CHECK_PMIN_PMAX:
-  case PATH_BND_EXT_CHECK:
-  case PATH_BND_EXT_DIRECT_RESULT:
-  case PATH_BND_EXT_DIFFUSE_RESULT:
-  case PATH_BND_EXT_DIFFUSE_SHADOW_RESULT:
-  case PATH_BND_EXT_FINALIZE:
   case PATH_CND_DS_STEP_PROCESS:
   case PATH_CND_WOS_CHECK_TEMP:
   case PATH_CND_WOS_CLOSEST_RESULT:
@@ -3097,6 +3711,13 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
   case PATH_CND_CUSTOM:
   case PATH_CNV_STARTUP_RESULT:
     /* B-4 compute-only: not yet activated, no-op fallback */
+    break;
+
+  /* M7 result phases: handled inline by advance_one_step_with_ray
+   * (TRACE → step_*_result). Never assigned as p->phase directly. */
+  case PATH_BND_EXT_DIRECT_RESULT:
+  case PATH_BND_EXT_DIFFUSE_RESULT:
+  case PATH_BND_EXT_DIFFUSE_SHADOW_RESULT:
     break;
 
   case PATH_PHASE_COUNT:
@@ -3157,11 +3778,19 @@ advance_one_step_with_ray(struct path_state* p, struct sdis_scene* scn,
     res = step_bnd_sf_nullcoll_rad_trace(p, scn, hit0);
     break;
 
+  /* --- B-4 M7: External net flux ray results (activated) --- */
+  case PATH_BND_EXT_DIRECT_TRACE:
+    res = step_bnd_ext_direct_result(p, scn, hit0);
+    break;
+  case PATH_BND_EXT_DIFFUSE_TRACE:
+    res = step_bnd_ext_diffuse_result(p, scn, hit0);
+    break;
+  case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
+    res = step_bnd_ext_diffuse_shadow_result(p, scn, hit0);
+    break;
+
   /* --- B-4 future: ray-pending states, not yet activated --- */
   case PATH_BND_SFN_RAD_TRACE:
-  case PATH_BND_EXT_DIRECT_TRACE:
-  case PATH_BND_EXT_DIFFUSE_TRACE:
-  case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
   case PATH_CND_INIT_ENC:
   case PATH_CND_DS_STEP_ENC_VERIFY:
   case PATH_CND_WOS_CLOSEST:
