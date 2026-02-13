@@ -186,6 +186,31 @@ extern LOCAL_SYM res_T
 step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn);
 
 /*******************************************************************************
+ * B-4 M6: Convective path + boundary dispatch + Robin post-check
+ ******************************************************************************/
+
+/* PATH_CNV_INIT: check known fluid temperature, decide startup ray or loop */
+extern LOCAL_SYM res_T
+step_cnv_init(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_CNV_STARTUP_RESULT: process startup ray result, set hit_side */
+extern LOCAL_SYM res_T
+step_cnv_startup_result(struct path_state* p, struct sdis_scene* scn,
+                        const struct s3d_hit* hit);
+
+/* PATH_CNV_SAMPLE_LOOP: null-collision sampling loop (pure compute, no ray) */
+extern LOCAL_SYM res_T
+step_cnv_sample_loop(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_BND_DISPATCH: Dirichlet check + 3-way dispatch */
+extern LOCAL_SYM res_T
+step_bnd_dispatch(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_BND_POST_ROBIN_CHECK: Robin boundary condition post-check */
+extern LOCAL_SYM res_T
+step_bnd_post_robin_check(struct path_state* p, struct sdis_scene* scn);
+
+/*******************************************************************************
  * Dispatch — advance one path by one step
  ******************************************************************************/
 

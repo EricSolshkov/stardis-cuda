@@ -450,71 +450,13 @@ step_boundary(struct path_state* p, struct sdis_scene* scn)
     goto error;
   }
 
-  /* B4-M3: Check if interface is solid/solid. If so, redirect to the
-   * batched reinjection state machine instead of calling boundary_path_3d()
-   * synchronously. This replaces the synchronous trace_ray calls inside
-   * solid_solid_boundary_path_3d with batched ray submissions. */
-  {
-    struct sdis_interface* interf_ss = NULL;
-    struct sdis_medium* mdm_frt_ss = NULL;
-    struct sdis_medium* mdm_bck_ss = NULL;
-    double tmp_T;
-
-    if(!S3D_HIT_NONE(&p->rwalk.hit_3d)) {
-      interf_ss = scene_get_interface(scn, p->rwalk.hit_3d.prim.prim_id);
-      mdm_frt_ss = interface_get_medium(interf_ss, SDIS_FRONT);
-      mdm_bck_ss = interface_get_medium(interf_ss, SDIS_BACK);
-
-      /* Replicate boundary_path prefix: check known temperature FIRST */
-      {
-        struct sdis_interface_fragment frag_tmp = SDIS_INTERFACE_FRAGMENT_NULL;
-        setup_interface_fragment_3d(&frag_tmp, &p->rwalk.vtx,
-                                    &p->rwalk.hit_3d, p->rwalk.hit_side);
-        f3_normalize(p->rwalk.hit_3d.normal, p->rwalk.hit_3d.normal);
-        tmp_T = interface_side_get_temperature(interf_ss, &frag_tmp);
-      }
-
-      if(!SDIS_TEMPERATURE_IS_KNOWN(tmp_T)
-      && mdm_frt_ss->type == mdm_bck_ss->type
-      && mdm_frt_ss->type == SDIS_SOLID) {
-        /* Solid/solid interface detected: enter batched reinjection */
-        res = step_bnd_ss_reinject_sample(p, scn);
-        goto exit;
-      }
-    }
-  }
-
-  /* Non solid/solid boundary OR known temperature: proceed synchronously. */
-  res = boundary_path_3d(scn, &p->ctx, &p->rwalk, p->rng, &p->T);
-  /* Persist nbranchings (in case internal recursion changed our level) */
+  /* B4-M6: redirect ALL boundary dispatch to the fine-grained state machine.
+   * step_bnd_dispatch handles solid/solid (M3 batch), picard1/N (sync
+   * fallback until M5/M8), Dirichlet, and Robin post-check. */
+  p->phase = PATH_BND_DISPATCH;
+  res = step_bnd_dispatch(p, scn);
+  /* Persist nbranchings */
   p->coupled_nbranchings = (int)p->ctx.nbranchings;
-  if(res != RES_OK && res != RES_BAD_OP) goto error;
-  if(res == RES_BAD_OP) {
-    /* Path failure -- mark as done */
-    p->phase = PATH_DONE;
-    p->active = 0;
-    goto exit;
-  }
-
-  /* Check where boundary_path sent us */
-  if(p->T.done) {
-    p->phase = PATH_DONE;
-    p->active = 0;
-    p->done_reason = 3; /* boundary done */
-    goto exit;
-  }
-  if(p->T.func == conductive_path_3d) {
-    p->phase = PATH_COUPLED_CONDUCTIVE;
-  } else if(p->T.func == convective_path_3d) {
-    p->phase = PATH_COUPLED_CONVECTIVE;
-  } else if(p->T.func == radiative_path_3d) {
-    p->phase = PATH_COUPLED_RADIATIVE;
-  } else if(p->T.func == boundary_path_3d) {
-    /* Still boundary -> re-enter */
-    p->phase = PATH_COUPLED_BOUNDARY;
-  } else {
-    FATAL("wavefront: unexpected T.func after boundary_path\n");
-  }
 
 exit:
   return res;
@@ -1695,30 +1637,456 @@ step_convective(struct path_state* p, struct sdis_scene* scn)
   res_T res = RES_OK;
   ASSERT(p && scn);
 
-  res = convective_path_3d(scn, &p->ctx, &p->rwalk, p->rng, &p->T);
-  if(res != RES_OK && res != RES_BAD_OP) goto error;
-  if(res == RES_BAD_OP) {
+  /* M6: redirect to fine-grained convective state machine */
+  p->phase = PATH_CNV_INIT;
+  return step_cnv_init(p, scn);
+}
+
+/*******************************************************************************
+ * B-4 M6: Convective path fine-grained state machine
+ ******************************************************************************/
+
+/* --- PATH_CNV_INIT: check known fluid temp + decide startup ray or loop -- */
+LOCAL_SYM res_T
+step_cnv_init(struct path_state* p, struct sdis_scene* scn)
+{
+  const struct enclosure* enc = NULL;
+  struct sdis_medium* mdm = NULL;
+  double temperature;
+  struct fluid_props props_ref = FLUID_PROPS_NULL;
+  res_T res = RES_OK;
+
+  ASSERT(p && scn);
+
+  /* Get the enclosure and its medium */
+  enc = scene_get_enclosure(scn, p->rwalk.enc_id);
+  if(enc->medium_id == MEDIUM_ID_MULTI) {
+    log_err(scn->dev,
+      "wavefront M6: enclosure with multiple media at (%g, %g, %g)\n",
+      SPLIT3(p->rwalk.vtx.P));
+    res = RES_BAD_ARG;
+    goto error;
+  }
+  res = scene_get_enclosure_medium(scn, enc, &mdm);
+  if(res != RES_OK) goto error;
+  if(sdis_medium_get_type(mdm) != SDIS_FLUID) {
+    log_err(scn->dev,
+      "wavefront M6: convective path in non-fluid medium at (%g, %g, %g)\n",
+      SPLIT3(p->rwalk.vtx.P));
+    res = RES_BAD_OP;
+    goto error;
+  }
+
+  /* Check known fluid temperature */
+  temperature = fluid_get_temperature(mdm, &p->rwalk.vtx);
+  if(SDIS_TEMPERATURE_IS_KNOWN(temperature)) {
+    p->T.value += temperature;
+    p->T.done = 1;
+    if(p->ctx.green_path) {
+      res = green_path_set_limit_vertex(
+        p->ctx.green_path, mdm, &p->rwalk.vtx, p->rwalk.elapsed_time);
+      if(res != RES_OK) goto error;
+    }
+    if(p->ctx.heat_path) {
+      heat_path_get_last_vertex(p->ctx.heat_path)->weight = p->T.value;
+    }
     p->phase = PATH_DONE;
     p->active = 0;
+    p->done_reason = 2; /* temperature known */
     goto exit;
   }
 
+  /* Check if path starts from fluid interior (HIT_NONE) */
+  if(S3D_HIT_NONE(&p->rwalk.hit_3d)) {
+    /* Need startup ray along +Z to find initial hit */
+    setup_convective_startup_ray(p);
+    p->phase = PATH_CNV_STARTUP_TRACE;
+    goto exit;
+  }
+
+  /* Already have a hit — get fluid properties for the loop */
+  res = fluid_get_properties(mdm, &p->rwalk.vtx, &props_ref);
+  if(res != RES_OK) goto error;
+
+  /* Store loop parameters in locals.cnv */
+  p->locals.cnv.enc_id = p->rwalk.enc_id;
+  p->locals.cnv.hc_upper_bound = enc->hc_upper_bound;
+  p->locals.cnv.rho_cp = props_ref.rho * props_ref.cp;
+  p->locals.cnv.S_over_V = enc->S_over_V;
+
+  /* Handle edge case: hc_upper_bound == 0 → initial condition */
+  if(enc->hc_upper_bound == 0) {
+    p->rwalk.vtx.time = props_ref.t0;
+    temperature = fluid_get_temperature(mdm, &p->rwalk.vtx);
+    if(SDIS_TEMPERATURE_IS_KNOWN(temperature)) {
+      p->T.value += temperature;
+      p->T.done = 1;
+      if(p->ctx.green_path) {
+        res = green_path_set_limit_vertex(
+          p->ctx.green_path, mdm, &p->rwalk.vtx, p->rwalk.elapsed_time);
+        if(res != RES_OK) goto error;
+      }
+      if(p->ctx.heat_path) {
+        heat_path_get_last_vertex(p->ctx.heat_path)->weight = p->T.value;
+      }
+      p->phase = PATH_DONE;
+      p->active = 0;
+      p->done_reason = 2;
+    } else {
+      log_err(scn->dev,
+        "wavefront M6: undefined initial condition at (%g, %g, %g)\n",
+        SPLIT3(p->rwalk.vtx.P));
+      res = RES_BAD_OP;
+      goto error;
+    }
+    goto exit;
+  }
+
+  /* Ready for sampling loop */
+  p->phase = PATH_CNV_SAMPLE_LOOP;
+
+exit:
+  return res;
+error:
+  p->phase = PATH_DONE;
+  p->active = 0;
+  p->done_reason = -1;
+  goto exit;
+}
+
+/* --- PATH_CNV_STARTUP_RESULT: process startup ray result ----------------- */
+LOCAL_SYM res_T
+step_cnv_startup_result(struct path_state* p, struct sdis_scene* scn,
+                        const struct s3d_hit* hit)
+{
+  const struct enclosure* enc = NULL;
+  struct sdis_medium* mdm = NULL;
+  struct fluid_props props_ref = FLUID_PROPS_NULL;
+  res_T res = RES_OK;
+
+  ASSERT(p && scn && hit);
+
+  if(S3D_HIT_NONE(hit)) {
+    log_err(scn->dev,
+      "wavefront M6: convective startup ray missed — position (%g, %g, %g) "
+      "lies in surrounding fluid whose temperature must be known.\n",
+      SPLIT3(p->rwalk.vtx.P));
+    res = RES_BAD_OP;
+    goto error;
+  }
+
+  /* Set hit and determine hit_side */
+  p->rwalk.hit_3d = *hit;
+  {
+    float startup_dir[3] = {0.0f, 0.0f, 1.0f};
+    p->rwalk.hit_side = f3_dot(hit->normal, startup_dir) < 0
+      ? SDIS_FRONT : SDIS_BACK;
+  }
+
+  /* Get enclosure and fluid properties for the loop */
+  enc = scene_get_enclosure(scn, p->rwalk.enc_id);
+  res = scene_get_enclosure_medium(scn, enc, &mdm);
+  if(res != RES_OK) goto error;
+
+  res = fluid_get_properties(mdm, &p->rwalk.vtx, &props_ref);
+  if(res != RES_OK) goto error;
+
+  p->locals.cnv.enc_id = p->rwalk.enc_id;
+  p->locals.cnv.hc_upper_bound = enc->hc_upper_bound;
+  p->locals.cnv.rho_cp = props_ref.rho * props_ref.cp;
+  p->locals.cnv.S_over_V = enc->S_over_V;
+
+  /* Handle edge case: hc_upper_bound == 0 */
+  if(enc->hc_upper_bound == 0) {
+    double temperature;
+    p->rwalk.vtx.time = props_ref.t0;
+    temperature = fluid_get_temperature(mdm, &p->rwalk.vtx);
+    if(SDIS_TEMPERATURE_IS_KNOWN(temperature)) {
+      p->T.value += temperature;
+      p->T.done = 1;
+      p->phase = PATH_DONE;
+      p->active = 0;
+      p->done_reason = 2;
+    } else {
+      log_err(scn->dev,
+        "wavefront M6: undefined initial condition at (%g, %g, %g)\n",
+        SPLIT3(p->rwalk.vtx.P));
+      res = RES_BAD_OP;
+      goto error;
+    }
+    goto exit;
+  }
+
+  p->phase = PATH_CNV_SAMPLE_LOOP;
+
+exit:
+  return res;
+error:
+  p->phase = PATH_DONE;
+  p->active = 0;
+  p->done_reason = -1;
+  goto exit;
+}
+
+/* --- PATH_CNV_SAMPLE_LOOP: null-collision sampling (pure compute) -------- */
+LOCAL_SYM res_T
+step_cnv_sample_loop(struct path_state* p, struct sdis_scene* scn)
+{
+  const struct enclosure* enc = NULL;
+  struct sdis_medium* mdm = NULL;
+  struct sdis_interface* interf = NULL;
+  struct sdis_interface_fragment frag = SDIS_INTERFACE_FRAGMENT_NULL;
+  struct s3d_primitive prim;
+  struct s3d_attrib attr_P, attr_N;
+  unsigned enc_ids[2] = {ENCLOSURE_ID_NULL, ENCLOSURE_ID_NULL};
+  struct fluid_props props = FLUID_PROPS_NULL;
+  double mu, hc, r;
+  float st[2];
+  res_T res = RES_OK;
+
+  ASSERT(p && scn);
+
+  enc = scene_get_enclosure(scn, p->locals.cnv.enc_id);
+  res = scene_get_enclosure_medium(scn, enc, &mdm);
+  if(res != RES_OK) goto error;
+
+  /* Fetch fluid properties at current position */
+  res = fluid_get_properties(mdm, &p->rwalk.vtx, &props);
+  if(res != RES_OK) goto error;
+
+  /* Time rewind */
+  mu = p->locals.cnv.hc_upper_bound
+     / (props.rho * props.cp) * p->locals.cnv.S_over_V;
+  res = time_rewind(scn, mu, props.t0, p->rng, &p->rwalk, &p->ctx, &p->T);
+  if(res != RES_OK) goto error;
   if(p->T.done) {
     p->phase = PATH_DONE;
     p->active = 0;
-  } else if(p->T.func == boundary_path_3d) {
-    p->phase = PATH_COUPLED_BOUNDARY;
-  } else if(p->T.func == conductive_path_3d) {
-    p->phase = PATH_COUPLED_CONDUCTIVE;
-  } else if(p->T.func == radiative_path_3d) {
-    p->phase = PATH_COUPLED_RADIATIVE;
+    p->done_reason = 4; /* time rewind */
+    goto exit;
+  }
+
+  /* Uniformly sample the enclosure surface */
+  s3d_scene_view_sample(
+    enc->s3d_view,
+    ssp_rng_canonical_float(p->rng),
+    ssp_rng_canonical_float(p->rng),
+    ssp_rng_canonical_float(p->rng),
+    &prim, p->rwalk.hit_3d.uv);
+  f2_set(st, p->rwalk.hit_3d.uv);
+
+  /* Map from enclosure local to scene global prim_id */
+  p->rwalk.hit_3d.prim.prim_id =
+      enclosure_local2global_prim_id(enc, prim.prim_id);
+
+  /* Get position and normal at sampled point */
+  s3d_primitive_get_attrib(&p->rwalk.hit_3d.prim, S3D_POSITION, st, &attr_P);
+  s3d_primitive_get_attrib(&p->rwalk.hit_3d.prim, S3D_GEOMETRY_NORMAL,
+                           st, &attr_N);
+  d3_set_f3(p->rwalk.vtx.P, attr_P.value);
+  f3_set(p->rwalk.hit_3d.normal, attr_N.value);
+
+  /* Determine interface side */
+  scene_get_enclosure_ids(scn, p->rwalk.hit_3d.prim.prim_id, enc_ids);
+  if(p->locals.cnv.enc_id == enc_ids[SDIS_BACK]) {
+    p->rwalk.hit_side = SDIS_BACK;
+  } else if(p->locals.cnv.enc_id == enc_ids[SDIS_FRONT]) {
+    p->rwalk.hit_side = SDIS_FRONT;
   } else {
-    FATAL("wavefront: unexpected T.func after convective_path\n");
+    FATAL("wavefront M6: unexpected fluid interface\n");
+  }
+
+  /* Get interface */
+  interf = scene_get_interface(scn, p->rwalk.hit_3d.prim.prim_id);
+
+  /* Register heat path vertex */
+  res = register_heat_vertex(p->ctx.heat_path, &p->rwalk.vtx, p->T.value,
+    SDIS_HEAT_VERTEX_CONVECTION, (int)p->ctx.nbranchings);
+  if(res != RES_OK) goto error;
+
+  /* Setup fragment at sampled position */
+  setup_interface_fragment_3d(&frag, &p->rwalk.vtx,
+                              &p->rwalk.hit_3d, p->rwalk.hit_side);
+
+  /* Get convection coefficient */
+  hc = interface_get_convection_coef(interf, &frag);
+  if(hc > enc->hc_upper_bound) {
+    log_err(scn->dev,
+      "wavefront M6: hc (%g) exceeds hc_upper_bound (%g) at (%g, %g, %g)\n",
+      hc, enc->hc_upper_bound, SPLIT3(p->rwalk.vtx.P));
+    res = RES_BAD_OP;
+    goto error;
+  }
+
+  /* Accept/reject null-collision */
+  r = ssp_rng_canonical_float(p->rng);
+  if(r < hc / enc->hc_upper_bound) {
+    /* True convection → boundary dispatch */
+    p->rwalk.hit_3d.distance = 0;
+    p->rwalk.enc_id = ENCLOSURE_ID_NULL;
+    p->T.func = boundary_path_3d;
+    p->phase = PATH_BND_DISPATCH;
+    p->needs_ray = 0;
+  } else {
+    /* Null-collision → loop back to self */
+    p->phase = PATH_CNV_SAMPLE_LOOP;
+    p->needs_ray = 0;
   }
 
 exit:
   return res;
 error:
+  p->phase = PATH_DONE;
+  p->active = 0;
+  p->done_reason = -1;
+  goto exit;
+}
+
+/*******************************************************************************
+ * B-4 M6: Boundary dispatch + Robin post-check
+ ******************************************************************************/
+
+/* --- PATH_BND_DISPATCH: Dirichlet check + 3-way dispatch ----------------- */
+LOCAL_SYM res_T
+step_bnd_dispatch(struct path_state* p, struct sdis_scene* scn)
+{
+  struct sdis_interface* interf = NULL;
+  struct sdis_interface_fragment frag = SDIS_INTERFACE_FRAGMENT_NULL;
+  struct sdis_medium* mdm_front = NULL;
+  struct sdis_medium* mdm_back = NULL;
+  double tmp;
+  res_T res = RES_OK;
+
+  ASSERT(p && scn);
+  ASSERT(!S3D_HIT_NONE(&p->rwalk.hit_3d));
+
+  /* Replicate boundary_path_3d entry logic:
+   *   1. Setup fragment + normalize normal
+   *   2. Check Dirichlet temperature
+   *   3. Get front/back media → 3-way dispatch
+   *   4. Robin post-check */
+
+  setup_interface_fragment_3d(&frag, &p->rwalk.vtx,
+                              &p->rwalk.hit_3d, p->rwalk.hit_side);
+  f3_normalize(p->rwalk.hit_3d.normal, p->rwalk.hit_3d.normal);
+
+  interf = scene_get_interface(scn, p->rwalk.hit_3d.prim.prim_id);
+
+  /* Check Dirichlet temperature */
+  tmp = interface_side_get_temperature(interf, &frag);
+  if(SDIS_TEMPERATURE_IS_KNOWN(tmp)) {
+    p->T.value += tmp;
+    p->T.done = 1;
+    if(p->ctx.green_path) {
+      res = green_path_set_limit_interface_fragment(
+        p->ctx.green_path, interf, &frag, p->rwalk.elapsed_time);
+      if(res != RES_OK) goto error;
+    }
+    if(p->ctx.heat_path) {
+      heat_path_get_last_vertex(p->ctx.heat_path)->weight = p->T.value;
+    }
+    p->phase = PATH_DONE;
+    p->active = 0;
+    p->done_reason = 3; /* boundary done */
+    goto exit;
+  }
+
+  mdm_front = interface_get_medium(interf, SDIS_FRONT);
+  mdm_back = interface_get_medium(interf, SDIS_BACK);
+
+  /* 3-way dispatch */
+  if(mdm_front->type == mdm_back->type) {
+    /* solid/solid → M3 batched reinjection */
+    res = step_bnd_ss_reinject_sample(p, scn);
+  } else if(p->ctx.nbranchings == p->ctx.max_branchings) {
+    /* solid/fluid picard1 → synchronous fallback (until M5) */
+    res = solid_fluid_boundary_picard1_path_3d(
+      scn, &p->ctx, &frag, &p->rwalk, p->rng, &p->T);
+    if(res != RES_OK && res != RES_BAD_OP) goto error;
+    if(res == RES_BAD_OP) {
+      p->phase = PATH_DONE;
+      p->active = 0;
+      goto exit;
+    }
+    /* Route based on T.func after picard1 */
+    if(p->T.done) {
+      p->phase = PATH_DONE;
+      p->active = 0;
+      p->done_reason = 3;
+    } else {
+      p->phase = PATH_BND_POST_ROBIN_CHECK;
+    }
+  } else {
+    /* solid/fluid picardN → synchronous fallback (until M8) */
+    res = solid_fluid_boundary_picardN_path_3d(
+      scn, &p->ctx, &frag, &p->rwalk, p->rng, &p->T);
+    if(res != RES_OK && res != RES_BAD_OP) goto error;
+    if(res == RES_BAD_OP) {
+      p->phase = PATH_DONE;
+      p->active = 0;
+      goto exit;
+    }
+    if(p->T.done) {
+      p->phase = PATH_DONE;
+      p->active = 0;
+      p->done_reason = 3;
+    } else {
+      p->phase = PATH_BND_POST_ROBIN_CHECK;
+    }
+  }
+
+exit:
+  return res;
+error:
+  p->phase = PATH_DONE;
+  p->active = 0;
+  p->done_reason = -1;
+  goto exit;
+}
+
+/* --- PATH_BND_POST_ROBIN_CHECK: Robin boundary condition post-check ------ */
+LOCAL_SYM res_T
+step_bnd_post_robin_check(struct path_state* p, struct sdis_scene* scn)
+{
+  res_T res = RES_OK;
+
+  ASSERT(p && scn);
+
+  /* Robin post-check: if next path is convective or conductive, check
+   * whether the medium temperature is already known from the boundary.
+   * Mirrors boundary_path_3d lines 101-105. */
+  if(p->T.func == convective_path_3d || p->T.func == conductive_path_3d) {
+    res = query_medium_temperature_from_boundary_3d(
+      scn, &p->ctx, &p->rwalk, &p->T);
+    if(res != RES_OK) goto error;
+    if(p->T.done) {
+      p->phase = PATH_DONE;
+      p->active = 0;
+      p->done_reason = 2; /* temperature known */
+      goto exit;
+    }
+  }
+
+  /* Temperature not known — route to next path type */
+  if(p->T.func == convective_path_3d) {
+    p->phase = PATH_COUPLED_CONVECTIVE;
+  } else if(p->T.func == conductive_path_3d) {
+    p->phase = PATH_COUPLED_CONDUCTIVE;
+  } else if(p->T.func == radiative_path_3d) {
+    p->phase = PATH_COUPLED_RADIATIVE;
+  } else if(p->T.func == boundary_path_3d) {
+    p->phase = PATH_BND_DISPATCH;
+  } else {
+    FATAL("wavefront M6: unexpected T.func in post-robin check\n");
+  }
+  p->needs_ray = 0;
+
+exit:
+  return res;
+error:
+  p->phase = PATH_DONE;
+  p->active = 0;
+  p->done_reason = -1;
   goto exit;
 }
 
@@ -1851,10 +2219,28 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
     *advanced = 1;
     break;
 
+  /* --- B-4 M6: Convective path fine-grained (compute-only, activated) --- */
+  case PATH_CNV_INIT:
+    res = step_cnv_init(p, scn);
+    *advanced = 1;
+    break;
+  case PATH_CNV_SAMPLE_LOOP:
+    res = step_cnv_sample_loop(p, scn);
+    *advanced = 1;
+    break;
+
+  /* --- B-4 M6: Boundary dispatch + Robin post-check (activated) --- */
+  case PATH_BND_DISPATCH:
+    res = step_bnd_dispatch(p, scn);
+    *advanced = 1;
+    break;
+  case PATH_BND_POST_ROBIN_CHECK:
+    res = step_bnd_post_robin_check(p, scn);
+    *advanced = 1;
+    break;
+
   /* --- B-4 fine-grained: compute-only states (future, no-op for now) --- */
   case PATH_RAD_PROCESS_HIT:
-  case PATH_BND_DISPATCH:
-  case PATH_BND_POST_ROBIN_CHECK:
   case PATH_BND_SF_PROB_DISPATCH:
   case PATH_BND_SF_NULLCOLL_DECIDE:
   case PATH_BND_SFN_PROB_DISPATCH:
@@ -1873,9 +2259,7 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
   case PATH_CND_WOS_FALLBACK_RESULT:
   case PATH_CND_WOS_TIME_TRAVEL:
   case PATH_CND_CUSTOM:
-  case PATH_CNV_INIT:
   case PATH_CNV_STARTUP_RESULT:
-  case PATH_CNV_SAMPLE_LOOP:
     /* B-4 compute-only: not yet activated, no-op fallback */
     break;
 
@@ -1939,12 +2323,16 @@ advance_one_step_with_ray(struct path_state* p, struct sdis_scene* scn,
   case PATH_CND_DS_STEP_ENC_VERIFY:
   case PATH_CND_WOS_CLOSEST:
   case PATH_CND_WOS_FALLBACK_TRACE:
-  case PATH_CNV_STARTUP_TRACE:
   /* --- B-4 M1: Enclosure query -- receive 6 ray results --- */
   case PATH_ENC_QUERY_EMIT:
     /* 6 hits already pre-delivered to enc_query.dir_hits[] by distribute.
      * Transition to resolve phase (will be cascaded immediately). */
     p->phase = PATH_ENC_QUERY_RESOLVE;
+    break;
+
+  /* --- B-4 M6: Convective startup ray result --- */
+  case PATH_CNV_STARTUP_TRACE:
+    res = step_cnv_startup_result(p, scn, hit0);
     break;
 
   default:
