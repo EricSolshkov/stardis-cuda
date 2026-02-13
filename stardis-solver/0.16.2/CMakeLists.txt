@@ -231,6 +231,12 @@ if(ENABLE_TESTS)
     add_test(NAME test_sdis_b4_m6_convective
              COMMAND test_sdis_b4_m6_convective)
 
+    add_executable(test_sdis_b4_m5_picard1
+        src/test_sdis_b4_m5_picard1.c)
+    target_link_libraries(test_sdis_b4_m5_picard1 PRIVATE sdis_obj)
+    add_test(NAME test_sdis_b4_m5_picard1
+             COMMAND test_sdis_b4_m5_picard1)
+
     # Deploy runtime DLLs (Embree4, TBB, etc.) for all B4 test executables
     if(WIN32 AND COMMAND deploy_runtime_dependencies)
         deploy_runtime_dependencies(test_sdis_b4_m1_enclosure_batch)
@@ -238,6 +244,7 @@ if(ENABLE_TESTS)
         deploy_runtime_dependencies(test_sdis_b4_m3_solid_solid)
         deploy_runtime_dependencies(test_sdis_b4_m4_delta_sphere)
         deploy_runtime_dependencies(test_sdis_b4_m6_convective)
+        deploy_runtime_dependencies(test_sdis_b4_m5_picard1)
     endif()
 
 endif()

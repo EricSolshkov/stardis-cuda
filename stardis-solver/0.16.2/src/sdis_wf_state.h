@@ -172,14 +172,34 @@ struct path_state {
     struct {                            /* solid/fluid picard1/N           */
       double  p_conv, p_cond, p_radi;
       double  h_hat, h_conv, h_cond;
+      double  h_radi_hat;              /* radiative coeff upper bound      */
       double  epsilon, Tref;
-      float   reinject_dir[2][3];
-      struct s3d_hit reinject_hit[2];
+      double  lambda;                  /* solid thermal conductivity       */
+      double  delta_boundary;          /* sqrt(DIM)*delta                  */
+      double  delta_m;                 /* delta in meters                  */
+      float   reinject_dir[2][3];      /* 2 candidate directions           */
+      struct s3d_hit reinject_hit[2];  /* 2 hit results                    */
+      float   chosen_dir[3];          /* resolved reinjection direction    */
+      float   chosen_dst;             /* resolved reinjection distance     */
+      struct s3d_hit chosen_hit;      /* resolved reinjection hit          */
       unsigned solid_enc_id;
+      unsigned enc_ids[2];            /* [FRONT] and [BACK] enclosure ids  */
+      unsigned enc0_id, enc1_id;      /* enclosure ids at ray endpoints    */
+      enum sdis_side solid_side;      /* which side is solid               */
+      enum sdis_side fluid_side;      /* which side is fluid               */
+      int     need_enc;               /* whether ENC query is needed       */
+      int     retry_count;            /* reinjection retry counter         */
+      double  rwalk_pos_backup[3];    /* position backup for retry logic   */
       double  r;                       /* saved random number              */
-      /* null-collision sub-path snapshot */
+      /* null-collision radiative sub-path state */
+      float   rad_sub_direction[3];   /* current radiative direction       */
+      int     rad_sub_bounce_count;   /* bounce counter                    */
+      int     rad_sub_retry_count;    /* find_next_fragment retries        */
       struct rwalk      rwalk_snapshot;
       struct temperature T_snapshot;
+      /* heat path restart vertex saved before null-collision loop */
+      struct sdis_heat_vertex hvtx_saved;
+      size_t  ihvtx_radi_begin;       /* radiative sub-path vertex start   */
     } bnd_sf;
 
     struct {                            /* WoS conductive                  */

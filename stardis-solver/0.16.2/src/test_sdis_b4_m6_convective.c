@@ -750,17 +750,27 @@ test_bnd_dispatch_sf(void)
   /* Use solid/fluid scene */
   res = step_bnd_dispatch(&p, g_scn_sf);
 
-  /* The picard1 path runs synchronously. Regardless of whether it succeeds
-   * or hits a termination condition, the result should be one of:
-   *   - PATH_DONE (picard1 found temperature or errored)
-   *   - PATH_BND_POST_ROBIN_CHECK (picard1 set T.func and continues) */
-  CHK(p.phase == PATH_DONE || p.phase == PATH_BND_POST_ROBIN_CHECK);
-
-  /* If done, the path was resolved */
-  if(p.phase == PATH_DONE) {
-    CHK(p.active == 0);
-  }
-  /* If POST_ROBIN_CHECK, T.func should be set */
+  /* Before M5, picard1 ran synchronously inside step_bnd_dispatch, so the
+   * result was either PATH_DONE or PATH_BND_POST_ROBIN_CHECK.
+   *
+   * After M5, picard1 is decomposed into an asynchronous state machine:
+   *   step_bnd_dispatch -> step_bnd_sf_reinject_sample (emit rays)
+   *                     -> PATH_BND_SF_REINJECT_SAMPLE (await ray results)
+   *                     -> ... null-collision loop states ...
+   *                     -> PATH_BND_POST_ROBIN_CHECK or PATH_DONE
+   *
+   * Both behaviors faithfully implement the CPU algorithm
+   * (solid_fluid_boundary_picard1_path_3d): the synchronous version
+   * executes the whole algorithm in one call, while the asynchronous
+   * version suspends at ray-trace points.  The final outcome is identical.
+   *
+   * For this test, step_bnd_dispatch now returns PATH_BND_SF_REINJECT_SAMPLE
+   * because the picard1 state machine has entered its first reinjection
+   * ray-emit step and is awaiting trace results. */
+  CHK(p.phase == PATH_BND_SF_REINJECT_SAMPLE);
+  CHK(p.needs_ray == 1);
+  CHK(p.ray_count_ext == 2);
+  CHK(p.ray_bucket == RAY_BUCKET_STEP_PAIR);
 
   printf("PASS\n");
 }

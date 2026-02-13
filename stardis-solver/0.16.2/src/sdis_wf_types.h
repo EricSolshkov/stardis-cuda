@@ -161,7 +161,7 @@ path_phase_is_ray_pending(enum path_phase ph)
   case PATH_BND_SS_REINJECT_SAMPLE:
   /* PATH_BND_SS_REINJECT_ENC is compute-only (post-ENC-resolve) */
   case PATH_BND_SF_REINJECT_SAMPLE:
-  case PATH_BND_SF_REINJECT_ENC:
+  /* PATH_BND_SF_REINJECT_ENC is compute-only (post-ENC-resolve) */
   case PATH_BND_SF_NULLCOLL_RAD_TRACE:
   case PATH_BND_SFN_RAD_TRACE:
   case PATH_BND_EXT_DIRECT_TRACE:

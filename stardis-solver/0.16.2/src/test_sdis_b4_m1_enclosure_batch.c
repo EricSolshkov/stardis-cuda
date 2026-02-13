@@ -400,8 +400,11 @@ test_path_state_size(void)
   printf("  path_state size check... ");
   printf("(sizeof=%lu) ", (unsigned long)sizeof(struct path_state));
 
-  /* B-4 design budget: ~2.2 KB, allow up to 3 KB */
-  CHK(sizeof(struct path_state) <= 3072);
+  /* B-4 design budget: ~2.2 KB (original 3 KB limit).
+   * M5 bnd_sf snapshot fields (rwalk_snapshot, hvtx_saved etc.) expanded
+   * the locals union by ~96 B, raising the total to ~3.15 KB.
+   * Budget relaxed to 4 KB to accommodate picard1 state machine. */
+  CHK(sizeof(struct path_state) <= 4096);
 
   printf("PASS\n");
 }

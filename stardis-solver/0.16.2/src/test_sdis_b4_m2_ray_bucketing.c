@@ -698,9 +698,10 @@ test_setup_functions_tag_bucket(void)
 static void
 test_path_state_size(void)
 {
-  printf("  T2.10: path_state size <= 3072... ");
+  printf("  T2.10: path_state size <= 4096... ");
   printf("sizeof(path_state)=%lu  ", (unsigned long)sizeof(struct path_state));
-  CHK(sizeof(struct path_state) <= 3072);
+  /* Original budget was 3 KB; raised to 4 KB after M5 bnd_sf expansion */
+  CHK(sizeof(struct path_state) <= 4096);
   printf("PASS\n");
 }
 

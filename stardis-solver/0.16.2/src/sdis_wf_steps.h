@@ -167,6 +167,45 @@ extern LOCAL_SYM res_T
 step_bnd_ss_reinject_decide(struct path_state* p, struct sdis_scene* scn);
 
 /*******************************************************************************
+ * B-4 M5: Solid/fluid picard1 batch state machine
+ ******************************************************************************/
+
+/* Ray setup helper for SF reinjection (2 rays: dir0 + reflect(dir0)) */
+extern LOCAL_SYM void
+setup_sf_reinject_rays(struct path_state* p);
+
+/* PATH_BND_SF_REINJECT_SAMPLE: prepare interface data + emit 2 rays */
+extern LOCAL_SYM res_T
+step_bnd_sf_reinject_sample(struct path_state* p, struct sdis_scene* scn);
+
+/* Process 2-ray results for solid/fluid reinjection */
+extern LOCAL_SYM res_T
+step_bnd_sf_reinject_process
+  (struct path_state* p,
+   struct sdis_scene* scn,
+   const struct s3d_hit* hit0,
+   const struct s3d_hit* hit1);
+
+/* PATH_BND_SF_REINJECT_ENC: ENC query result for reinjection verification */
+extern LOCAL_SYM res_T
+step_bnd_sf_reinject_enc_result(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_BND_SF_PROB_DISPATCH: compute probabilities + null-collision dispatch */
+extern LOCAL_SYM res_T
+step_bnd_sf_prob_dispatch(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_BND_SF_NULLCOLL_RAD_TRACE: process radiative trace hit in sub-path */
+extern LOCAL_SYM res_T
+step_bnd_sf_nullcoll_rad_trace
+  (struct path_state* p,
+   struct sdis_scene* scn,
+   const struct s3d_hit* hit);
+
+/* PATH_BND_SF_NULLCOLL_DECIDE: accept/reject radiative path (pure compute) */
+extern LOCAL_SYM res_T
+step_bnd_sf_nullcoll_decide(struct path_state* p, struct sdis_scene* scn);
+
+/*******************************************************************************
  * B-4 M4: Delta-sphere conductive fine-grained state machine
  ******************************************************************************/
 
