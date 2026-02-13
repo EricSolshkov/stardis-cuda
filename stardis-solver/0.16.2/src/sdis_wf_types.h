@@ -159,7 +159,7 @@ path_phase_is_ray_pending(enum path_phase ph)
   case PATH_COUPLED_COND_DS_PENDING:
   /* B-4 fine-grained ray-pending */
   case PATH_BND_SS_REINJECT_SAMPLE:
-  case PATH_BND_SS_REINJECT_ENC:
+  /* PATH_BND_SS_REINJECT_ENC is compute-only (post-ENC-resolve) */
   case PATH_BND_SF_REINJECT_SAMPLE:
   case PATH_BND_SF_REINJECT_ENC:
   case PATH_BND_SF_NULLCOLL_RAD_TRACE:
@@ -169,7 +169,7 @@ path_phase_is_ray_pending(enum path_phase ph)
   case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
   case PATH_CND_INIT_ENC:
   case PATH_CND_DS_STEP_TRACE:
-  case PATH_CND_DS_STEP_ENC_VERIFY:
+  /* PATH_CND_DS_STEP_ENC_VERIFY is compute-only (sets up ENC query) */
   case PATH_CND_WOS_CLOSEST:
   case PATH_CND_WOS_FALLBACK_TRACE:
   case PATH_CNV_STARTUP_TRACE:

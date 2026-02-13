@@ -219,6 +219,20 @@ if(ENABLE_TESTS)
     add_test(NAME test_sdis_b4_m3_solid_solid
              COMMAND test_sdis_b4_m3_solid_solid)
 
+    add_executable(test_sdis_b4_m4_delta_sphere
+        src/test_sdis_b4_m4_delta_sphere.c)
+    target_link_libraries(test_sdis_b4_m4_delta_sphere PRIVATE sdis_obj)
+    add_test(NAME test_sdis_b4_m4_delta_sphere
+             COMMAND test_sdis_b4_m4_delta_sphere)
+
+    # Deploy runtime DLLs (Embree4, TBB, etc.) for all B4 test executables
+    if(WIN32 AND COMMAND deploy_runtime_dependencies)
+        deploy_runtime_dependencies(test_sdis_b4_m1_enclosure_batch)
+        deploy_runtime_dependencies(test_sdis_b4_m2_ray_bucketing)
+        deploy_runtime_dependencies(test_sdis_b4_m3_solid_solid)
+        deploy_runtime_dependencies(test_sdis_b4_m4_delta_sphere)
+    endif()
+
 endif()
 
 # ============================================================================

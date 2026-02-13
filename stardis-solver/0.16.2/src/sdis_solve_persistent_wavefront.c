@@ -439,7 +439,8 @@ compact_active_paths(struct wavefront_pool* pool)
       /* Bucket by phase type */
       if(p->phase == PATH_RAD_TRACE_PENDING) {
         pool->bucket_radiative[pool->bucket_radiative_n++] = (uint32_t)i;
-      } else if(p->phase == PATH_COUPLED_COND_DS_PENDING) {
+      } else if(p->phase == PATH_COUPLED_COND_DS_PENDING
+             || p->phase == PATH_CND_DS_STEP_TRACE) {
         pool->bucket_conductive[pool->bucket_conductive_n++] = (uint32_t)i;
       }
       /* Other ray-pending phases (boundary reinject) go into
@@ -468,7 +469,8 @@ pool_collect_ray_requests_compact(struct wavefront_pool* pool)
     /* Detailed stats by phase type */
     if(p->phase == PATH_RAD_TRACE_PENDING)
       pool->rays_radiative += (size_t)p->ray_req.ray_count;
-    else if(p->phase == PATH_COUPLED_COND_DS_PENDING) {
+    else if(p->phase == PATH_COUPLED_COND_DS_PENDING
+         || p->phase == PATH_CND_DS_STEP_TRACE) {
       if(p->ds_robust_attempt > 0)
         pool->rays_conductive_ds_retry += (size_t)p->ray_req.ray_count;
       else
@@ -652,7 +654,8 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool)
     /* Detailed stats by phase type */
     if(p->phase == PATH_RAD_TRACE_PENDING)
       pool->rays_radiative += (size_t)p->ray_req.ray_count;
-    else if(p->phase == PATH_COUPLED_COND_DS_PENDING) {
+    else if(p->phase == PATH_COUPLED_COND_DS_PENDING
+         || p->phase == PATH_CND_DS_STEP_TRACE) {
       if(p->ds_robust_attempt > 0)
         pool->rays_conductive_ds_retry += (size_t)p->ray_req.ray_count;
       else
@@ -825,6 +828,7 @@ pool_distribute_ray_results(struct wavefront_pool* pool, struct sdis_scene* scn)
       /* Skip already-processed buckets */
       if(p->phase == PATH_RAD_TRACE_PENDING) continue;
       if(p->phase == PATH_COUPLED_COND_DS_PENDING) continue;
+      if(p->phase == PATH_CND_DS_STEP_TRACE) continue;
       /* These paths have already been advanced by the bucketed loops above,
        * so their phase has changed.  Check needs_ray to find remaining ones. */
       if(!p->needs_ray) continue;

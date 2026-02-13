@@ -555,79 +555,21 @@ step_conductive(struct path_state* p, struct sdis_scene* scn)
     goto exit;
   }
 
-  /* ----- Delta-sphere wavefront path ----- */
+  /* ----- Delta-sphere wavefront path (M4 fine-grained) ----- */
 
-  /* Initialization (run once per conductive entry) */
+  /* Initialization: first entry dispatches ENC sub-state */
   if(!p->ds_initialized) {
-    unsigned enc_id = ENCLOSURE_ID_NULL;
-    struct sdis_medium* mdm = NULL;
-
-    res = scene_get_enclosure_id_in_closed_boundaries(
-      scn, p->rwalk.vtx.P, &enc_id);
-    if(res != RES_OK) goto error;
-    res = scene_get_enclosure_medium(
-      scn, scene_get_enclosure(scn, enc_id), &mdm);
-    if(res != RES_OK) goto error;
-
-    /* Must be a solid medium */
-    if(sdis_medium_get_type(mdm) != SDIS_SOLID) {
-      log_err(scn->dev,
-        "wavefront: conductive_path in non-solid medium at "
-        "(%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));
-      res = RES_BAD_OP;
-      goto error;
-    }
-
-    /* Check enclosure consistency */
-    if(enc_id != p->rwalk.enc_id) {
-      log_err(scn->dev,
-        "wavefront: conductive_path enclosure mismatch at "
-        "(%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));
-      res = RES_BAD_OP_IRRECOVERABLE;
-      goto error;
-    }
-
-    p->ds_enc_id = enc_id;
-    p->ds_medium = mdm;
-    d3_set(p->ds_position_start, p->rwalk.vtx.P);
-    solid_get_properties(mdm, &p->rwalk.vtx, &p->ds_props_ref);
-    p->ds_green_power_term = 0;
-    p->ds_initialized = 1;
-    p->ds_robust_attempt = 0;
+    /* Emit 6-direction ENC query from current position.
+     * After resolve, PATH_CND_DS_CHECK_TEMP finalises init. */
+    d3_set(p->enc_query.query_pos, p->rwalk.vtx.P);
+    p->enc_query.return_state = PATH_CND_DS_CHECK_TEMP;
+    step_enc_query_emit(p);
+    /* phase = PATH_ENC_QUERY_EMIT, needs_ray = 1 */
+    goto exit;
   }
 
-  /* --- Each loop iteration of the do-while --- */
-  {
-    struct solid_props props = SOLID_PROPS_NULL;
-
-    /* Fetch current properties */
-    res = solid_get_properties(p->ds_medium, &p->rwalk.vtx, &props);
-    if(res != RES_OK) goto error;
-    res = check_solid_constant_properties(
-      scn->dev, p->ctx.green_path != NULL, 0, &p->ds_props_ref, &props);
-    if(res != RES_OK) goto error;
-
-    /* Check temperature limit condition */
-    if(SDIS_TEMPERATURE_IS_KNOWN(props.temperature)) {
-      p->T.value += props.temperature;
-      p->T.done = 1;
-      if(p->ctx.heat_path) {
-        heat_path_get_last_vertex(p->ctx.heat_path)->weight = p->T.value;
-      }
-      p->phase = PATH_DONE;
-      p->active = 0;
-      p->done_reason = 2; /* temperature known */
-      goto exit;
-    }
-
-    /* Store delta_solid parameter for ray setup */
-    p->ds_delta_solid_param = (float)props.delta;
-    p->ds_robust_attempt = 0;
-
-    /* Emit 2 rays (forward + backward) */
-    setup_delta_sphere_rays(p, scn);
-    p->phase = PATH_COUPLED_COND_DS_PENDING;
-  }
+  /* Already initialised — go directly to temperature check */
+  p->phase = PATH_CND_DS_CHECK_TEMP;
 
 exit:
   return res;
@@ -639,7 +581,13 @@ error:
   goto exit;
 }
 
-/* --- PATH_COUPLED_COND_DS_PENDING: process 2-ray results (delta sphere) -- */
+/* --- PATH_COUPLED_COND_DS_PENDING / PATH_CND_DS_STEP_TRACE:
+ *     process 2-ray results (delta sphere).
+ *
+ *     M4: this function now ONLY does hit processing + enc verification
+ *     decision.  Volumic power / time rewind / position update / loop
+ *     check are deferred to step_cnd_ds_step_advance().
+ * -------------------------------------------------------------------- */
 LOCAL_SYM res_T
 step_conductive_ds_process(
   struct path_state* p,
@@ -649,8 +597,6 @@ step_conductive_ds_process(
 {
   res_T res = RES_OK;
   float delta;
-  double delta_m, mu;
-  struct solid_props props = SOLID_PROPS_NULL;
   const float delta_solid = p->ds_delta_solid_param;
 
   ASSERT(p && scn && hit0 && hit1);
@@ -707,29 +653,27 @@ step_conductive_ds_process(
   }
   p->ds_delta = delta;
 
-  /* ------ Replicate sample_next_step_robust enclosure check ------ */
-  {
+  /* ------ Enclosure verification decision (M4: deferred to cascade) ---- */
+  if(S3D_HIT_NONE(&p->ds_hit0) || p->ds_hit0.distance > delta) {
+    /* No hit in forward direction at delta — need batched ENC query at
+     * the projected next position.  Store pos_next for the ENC verify
+     * step; cascade will call step_cnd_ds_step_enc_verify(). */
     double pos_next[3];
-    unsigned enc_id = ENCLOSURE_ID_NULL;
-
-    if(S3D_HIT_NONE(&p->ds_hit0) || p->ds_hit0.distance > delta) {
-      /* No hit in forward direction at delta -- check next position */
-      d3_set(pos_next, p->rwalk.vtx.P);
-      move_pos_3d(pos_next, p->ds_dir0, delta);
-      res = scene_get_enclosure_id_in_closed_boundaries(
-        scn, pos_next, &enc_id);
-      if(res == RES_BAD_OP) { enc_id = ENCLOSURE_ID_NULL; res = RES_OK; }
-      if(res != RES_OK) goto error;
-    } else {
-      /* Hit at forward -- get enclosure from hit primitive */
-      unsigned enc_ids[2] = {ENCLOSURE_ID_NULL, ENCLOSURE_ID_NULL};
-      scene_get_enclosure_ids(scn, p->ds_hit0.prim.prim_id, enc_ids);
-      enc_id = f3_dot(p->ds_dir0, p->ds_hit0.normal) < 0
-             ? enc_ids[0] : enc_ids[1];
-    }
+    d3_set(pos_next, p->rwalk.vtx.P);
+    move_pos_3d(pos_next, p->ds_dir0, delta);
+    d3_set(p->enc_query.query_pos, pos_next);
+    p->phase = PATH_CND_DS_STEP_ENC_VERIFY;
+    p->needs_ray = 0;
+  } else {
+    /* Hit at forward — get enclosure from hit primitive (pure compute) */
+    unsigned enc_ids[2] = {ENCLOSURE_ID_NULL, ENCLOSURE_ID_NULL};
+    unsigned enc_id;
+    scene_get_enclosure_ids(scn, p->ds_hit0.prim.prim_id, enc_ids);
+    enc_id = f3_dot(p->ds_dir0, p->ds_hit0.normal) < 0
+           ? enc_ids[0] : enc_ids[1];
 
     if(enc_id != p->ds_enc_id) {
-      /* Enclosure mismatch -- retry with new direction */
+      /* Enclosure mismatch — retry with new direction (deferred) */
       p->ds_robust_attempt++;
       if(p->ds_robust_attempt >= 100) {
         log_warn(scn->dev,
@@ -738,14 +682,156 @@ step_conductive_ds_process(
         res = RES_BAD_OP;
         goto error;
       }
-      /* Re-emit 2 rays with new random direction */
-      setup_delta_sphere_rays(p, scn);
-      p->phase = PATH_COUPLED_COND_DS_PENDING;
-      goto exit;
+      /* Cascade will enter step_cnd_ds_check_temp which re-emits rays */
+      p->phase = PATH_CND_DS_CHECK_TEMP;
+      p->needs_ray = 0;
+    } else {
+      /* Match — store result for step_advance check and proceed */
+      p->enc_query.resolved_enc_id = enc_id;
+      p->phase = PATH_CND_DS_STEP_ADVANCE;
+      p->needs_ray = 0;
     }
   }
 
-  /* ------ Robust check passed -- proceed with step ------ */
+exit:
+  return res;
+error:
+  p->phase = PATH_DONE;
+  p->active = 0;
+  p->done_reason = -1;
+  goto exit;
+}
+
+/*******************************************************************************
+ * B-4 M4: Delta-sphere conductive fine-grained step functions
+ ******************************************************************************/
+
+/* --- PATH_CND_DS_CHECK_TEMP: finalize init (once) + loop top --------------- */
+LOCAL_SYM res_T
+step_cnd_ds_check_temp(struct path_state* p, struct sdis_scene* scn)
+{
+  res_T res = RES_OK;
+  struct solid_props props = SOLID_PROPS_NULL;
+
+  ASSERT(p && scn);
+
+  /* Finalize initialisation from ENC resolve (runs only once per entry) */
+  if(!p->ds_initialized) {
+    unsigned enc_id = p->enc_query.resolved_enc_id;
+    struct sdis_medium* mdm = NULL;
+
+    res = scene_get_enclosure_medium(
+      scn, scene_get_enclosure(scn, enc_id), &mdm);
+    if(res != RES_OK) goto error;
+
+    /* Must be a solid medium */
+    if(sdis_medium_get_type(mdm) != SDIS_SOLID) {
+      log_err(scn->dev,
+        "wavefront: conductive_path in non-solid medium at "
+        "(%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));
+      res = RES_BAD_OP;
+      goto error;
+    }
+
+    /* Check enclosure consistency */
+    if(enc_id != p->rwalk.enc_id) {
+      log_err(scn->dev,
+        "wavefront: conductive_path enclosure mismatch at "
+        "(%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));
+      res = RES_BAD_OP_IRRECOVERABLE;
+      goto error;
+    }
+
+    p->ds_enc_id = enc_id;
+    p->ds_medium = mdm;
+    d3_set(p->ds_position_start, p->rwalk.vtx.P);
+    solid_get_properties(mdm, &p->rwalk.vtx, &p->ds_props_ref);
+    p->ds_green_power_term = 0;
+    p->ds_initialized = 1;
+    p->ds_robust_attempt = 0;
+  }
+
+  /* --- Each loop iteration: fetch properties, check temperature --- */
+  res = solid_get_properties(p->ds_medium, &p->rwalk.vtx, &props);
+  if(res != RES_OK) goto error;
+  res = check_solid_constant_properties(
+    scn->dev, p->ctx.green_path != NULL, 0, &p->ds_props_ref, &props);
+  if(res != RES_OK) goto error;
+
+  /* Temperature known? */
+  if(SDIS_TEMPERATURE_IS_KNOWN(props.temperature)) {
+    p->T.value += props.temperature;
+    p->T.done = 1;
+    if(p->ctx.heat_path) {
+      heat_path_get_last_vertex(p->ctx.heat_path)->weight = p->T.value;
+    }
+    p->phase = PATH_DONE;
+    p->active = 0;
+    p->done_reason = 2; /* temperature known */
+    goto exit;
+  }
+
+  /* Store delta_solid parameter and reset retry counter */
+  p->ds_delta_solid_param = (float)props.delta;
+  p->ds_robust_attempt = 0;
+
+  /* Emit 2 rays (forward + backward) */
+  setup_delta_sphere_rays(p, scn);
+  p->phase = PATH_CND_DS_STEP_TRACE;
+
+exit:
+  return res;
+error:
+  p->phase = PATH_DONE;
+  p->active = 0;
+  p->done_reason = -1;
+  goto exit;
+}
+
+/* --- PATH_CND_DS_STEP_ENC_VERIFY: set up ENC sub-state at pos_next -------- */
+LOCAL_SYM void
+step_cnd_ds_step_enc_verify(struct path_state* p)
+{
+  ASSERT(p);
+  /* enc_query.query_pos already set by step_conductive_ds_process */
+  p->enc_query.return_state = PATH_CND_DS_STEP_ADVANCE;
+  step_enc_query_emit(p);
+  /* phase = PATH_ENC_QUERY_EMIT, needs_ray = 1 */
+}
+
+/* --- PATH_CND_DS_STEP_ADVANCE: enc check + volumic + time + pos + loop ---- */
+LOCAL_SYM res_T
+step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn)
+{
+  res_T res = RES_OK;
+  struct solid_props props = SOLID_PROPS_NULL;
+  const float delta = p->ds_delta;
+  const float delta_solid = p->ds_delta_solid_param;
+  double delta_m, mu;
+
+  ASSERT(p && scn);
+
+  /* ------ Enclosure verification (handles both direct-hit and ENC sub) --- */
+  /* enc_query.resolved_enc_id is set by:
+   *   - step_conductive_ds_process (direct from hit primitive), or
+   *   - step_enc_query_resolve (from batched ENC sub-state).          */
+  if(p->enc_query.resolved_enc_id != p->ds_enc_id) {
+    /* Enclosure mismatch — retry with new direction */
+    p->ds_robust_attempt++;
+    if(p->ds_robust_attempt >= 100) {
+      log_warn(scn->dev,
+        "wavefront: conductive delta_sphere robust exceeded 100 attempts "
+        "at (%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));
+      res = RES_BAD_OP;
+      goto error;
+    }
+    /* Cascade will call step_cnd_ds_check_temp which re-emits rays */
+    p->phase = PATH_CND_DS_CHECK_TEMP;
+    p->needs_ray = 0;
+    goto exit;
+  }
+
+  /* ------ Robust check passed — proceed with step ------ */
   res = solid_get_properties(p->ds_medium, &p->rwalk.vtx, &props);
   if(res != RES_OK) goto error;
 
@@ -825,11 +911,11 @@ step_conductive_ds_process(
 
   /* Check loop condition: keep walking while no hit */
   if(S3D_HIT_NONE(&p->rwalk.hit_3d)) {
-    /* Still inside solid -- enter next iteration */
-    p->phase = PATH_COUPLED_CONDUCTIVE;
+    /* Still inside solid — continue loop via check_temp */
+    p->phase = PATH_CND_DS_CHECK_TEMP;
     p->needs_ray = 0;
   } else {
-    /* Hit boundary -- register green power term and transition */
+    /* Hit boundary — register green power term and transition */
     if(p->ctx.green_path && p->ds_props_ref.power != SDIS_VOLUMIC_POWER_NONE) {
       green_path_add_power_term(
         p->ctx.green_path, p->ds_medium,
@@ -937,6 +1023,12 @@ step_enc_query_resolve(struct path_state* p, struct sdis_scene* scn)
     /* All 6 directions failed -- fallback to brute-force traversal.
      * This matches the original fallback to scene_get_enclosure_id(). */
     res = scene_get_enclosure_id(scn, p->enc_query.query_pos, &enc_id);
+    /* Swallow RES_BAD_OP: matches scene_get_enclosure_id_in_closed_boundaries
+     * which returns enc_id=NULL on BAD_OP and lets caller decide to retry. */
+    if(res == RES_BAD_OP) {
+      enc_id = ENCLOSURE_ID_NULL;
+      res = RES_OK;
+    }
     if(res != RES_OK) {
       p->enc_query.resolved_enc_id = ENCLOSURE_ID_NULL;
       return res;
@@ -1722,12 +1814,11 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
   case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
   case PATH_CND_INIT_ENC:
   case PATH_CND_DS_STEP_TRACE:
-  case PATH_CND_DS_STEP_ENC_VERIFY:
   case PATH_CND_WOS_CLOSEST:
   case PATH_CND_WOS_FALLBACK_TRACE:
   case PATH_CNV_STARTUP_TRACE:
   case PATH_ENC_QUERY_EMIT:
-    /* B-4 M1: ray-pending, cannot advance without ray */
+    /* B-4: ray-pending, cannot advance without ray */
     break;
 
   /* --- B-4 M1: Enclosure query resolve (compute-only, activated) --- */
@@ -1743,6 +1834,20 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
     break;
   case PATH_BND_SS_REINJECT_ENC:
     res = step_bnd_ss_reinject_enc_result(p, scn);
+    *advanced = 1;
+    break;
+
+  /* --- B-4 M4: delta-sphere conductive (compute-only, activated) --- */
+  case PATH_CND_DS_CHECK_TEMP:
+    res = step_cnd_ds_check_temp(p, scn);
+    *advanced = 1;
+    break;
+  case PATH_CND_DS_STEP_ENC_VERIFY:
+    step_cnd_ds_step_enc_verify(p);
+    *advanced = 1;
+    break;
+  case PATH_CND_DS_STEP_ADVANCE:
+    res = step_cnd_ds_step_advance(p, scn);
     *advanced = 1;
     break;
 
@@ -1762,9 +1867,7 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
   case PATH_BND_EXT_DIFFUSE_RESULT:
   case PATH_BND_EXT_DIFFUSE_SHADOW_RESULT:
   case PATH_BND_EXT_FINALIZE:
-  case PATH_CND_DS_CHECK_TEMP:
   case PATH_CND_DS_STEP_PROCESS:
-  case PATH_CND_DS_STEP_ADVANCE:
   case PATH_CND_WOS_CHECK_TEMP:
   case PATH_CND_WOS_CLOSEST_RESULT:
   case PATH_CND_WOS_FALLBACK_RESULT:
@@ -1818,6 +1921,13 @@ advance_one_step_with_ray(struct path_state* p, struct sdis_scene* scn,
   }
 
   /* PATH_BND_SS_REINJECT_ENC is compute-only (handled in advance_no_ray) */
+
+  /* --- B-4 M4: delta-sphere 2-ray results --- */
+  case PATH_CND_DS_STEP_TRACE:
+    res = step_conductive_ds_process(p, scn, hit0, hit1);
+    break;
+
+  /* --- B-4 future: ray-pending states, not yet activated --- */
   case PATH_BND_SF_REINJECT_SAMPLE:
   case PATH_BND_SF_REINJECT_ENC:
   case PATH_BND_SF_NULLCOLL_RAD_TRACE:
@@ -1826,7 +1936,6 @@ advance_one_step_with_ray(struct path_state* p, struct sdis_scene* scn,
   case PATH_BND_EXT_DIFFUSE_TRACE:
   case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
   case PATH_CND_INIT_ENC:
-  case PATH_CND_DS_STEP_TRACE:
   case PATH_CND_DS_STEP_ENC_VERIFY:
   case PATH_CND_WOS_CLOSEST:
   case PATH_CND_WOS_FALLBACK_TRACE:

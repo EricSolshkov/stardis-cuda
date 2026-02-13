@@ -167,6 +167,25 @@ extern LOCAL_SYM res_T
 step_bnd_ss_reinject_decide(struct path_state* p, struct sdis_scene* scn);
 
 /*******************************************************************************
+ * B-4 M4: Delta-sphere conductive fine-grained state machine
+ ******************************************************************************/
+
+/* PATH_CND_DS_CHECK_TEMP: finalize init (once) + check known temp + emit DS
+ * rays -> PATH_CND_DS_STEP_TRACE */
+extern LOCAL_SYM res_T
+step_cnd_ds_check_temp(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_CND_DS_STEP_ENC_VERIFY: set up ENC sub-state for enclosure verify at
+ * pos_next.  Calls step_enc_query_emit -> PATH_ENC_QUERY_EMIT. */
+extern LOCAL_SYM void
+step_cnd_ds_step_enc_verify(struct path_state* p);
+
+/* PATH_CND_DS_STEP_ADVANCE: check enc result + volumic power + time rewind +
+ * position update + loop condition check */
+extern LOCAL_SYM res_T
+step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn);
+
+/*******************************************************************************
  * Dispatch — advance one path by one step
  ******************************************************************************/
 
