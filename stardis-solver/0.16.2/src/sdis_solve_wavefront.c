@@ -271,10 +271,11 @@ collect_ray_requests(struct wavefront_context* wf)
       rr->range[1]     = p->ray_req.range[1];
       rr->user_id      = (uint32_t)i;
 
-      /* Filter data: for radiative trace we need the filter;
-       * for delta_sphere / convective startup we pass NULL */
-      if(p->phase == PATH_RAD_TRACE_PENDING
-      && !S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
+      /* Filter data: pass filter whenever the step function set up a
+       * valid hit_3d (radiative, reinjection, etc.).  Only phases that
+       * intentionally leave filter_data_storage as HIT_NONE (delta-sphere,
+       * convective startup, enc-query) will get NULL here. */
+      if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
         rr->filter_data = &p->filter_data_storage;
       } else {
         rr->filter_data = NULL;
@@ -297,7 +298,11 @@ collect_ray_requests(struct wavefront_context* wf)
       rr->direction[2] = p->ray_req.direction2[2];
       rr->range[0]     = p->ray_req.range2[0];
       rr->range[1]     = p->ray_req.range2[1];
-      rr->filter_data  = NULL; /* delta_sphere / reinject: no filter */
+      if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
+        rr->filter_data = &p->filter_data_storage;
+      } else {
+        rr->filter_data = NULL;
+      }
       rr->user_id      = (uint32_t)i;
 
       wf->ray_to_path[ray_idx] = (uint32_t)i;
@@ -325,7 +330,11 @@ collect_ray_requests(struct wavefront_context* wf)
         rr->direction[2] = p->locals.bnd_ss.dir_bck[0][2];
         rr->range[0]     = p->ray_req.range[0];
         rr->range[1]     = p->ray_req.range[1];
-        rr->filter_data  = NULL;
+        if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
+          rr->filter_data = &p->filter_data_storage;
+        } else {
+          rr->filter_data = NULL;
+        }
         rr->user_id      = (uint32_t)i;
 
         wf->ray_to_path[ray_idx] = (uint32_t)i;
@@ -345,7 +354,11 @@ collect_ray_requests(struct wavefront_context* wf)
         rr->direction[2] = p->locals.bnd_ss.dir_bck[1][2];
         rr->range[0]     = p->ray_req.range[0];
         rr->range[1]     = p->ray_req.range[1];
-        rr->filter_data  = NULL;
+        if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
+          rr->filter_data = &p->filter_data_storage;
+        } else {
+          rr->filter_data = NULL;
+        }
         rr->user_id      = (uint32_t)i;
 
         wf->ray_to_path[ray_idx] = (uint32_t)i;
@@ -480,7 +493,15 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
       for(;;) {
         int advanced = 0;
         if(p->needs_ray) break;
-        if(p->phase == PATH_DONE || p->phase == PATH_ERROR) break;
+        if(p->phase == PATH_DONE || p->phase == PATH_ERROR) {
+          /* M8: intercept PATH_DONE when sfn_stack_depth > 0. */
+          if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
+            p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+            p->active = 1;
+            continue;
+          }
+          break;
+        }
 
         /* Skip ray-waiting phases */
         if(path_phase_is_ray_pending(p->phase)) break;
@@ -633,6 +654,11 @@ solve_tile_wavefront(
           break;
         }
         if(!advanced) break;
+        /* M8: intercept PATH_DONE when sfn_stack_depth > 0 */
+        if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
+          p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+          p->active = 1;
+        }
         p->steps_taken++;
       }
     }

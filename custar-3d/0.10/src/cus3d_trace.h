@@ -59,6 +59,22 @@ res_T cus3d_trace_ray_single_multi(
     int max_hits,
     struct cus3d_multi_hit_result* result);
 
+/**
+ * Batch trace with Top-K multi-hit results per ray.
+ * Each ray returns up to @p max_hits nearest intersections sorted by distance.
+ * Eliminates single-ray fallback when batch nearest-hit is rejected by filter.
+ *
+ * @param max_hits  Desired count per ray, clamped to CUS3D_MAX_MULTI_HITS.
+ * @param h_results Output array of size rays->count (host memory).
+ */
+res_T cus3d_trace_ray_batch_multi(
+    const struct cus3d_bvh* bvh,
+    const struct cus3d_geom_store* store,
+    struct cus3d_device* dev,
+    const struct cus3d_ray_batch* rays,
+    int max_hits,
+    struct cus3d_multi_hit_result* h_results);
+
 res_T cus3d_ray_batch_create(struct cus3d_ray_batch* batch, size_t max_rays);
 void  cus3d_ray_batch_destroy(struct cus3d_ray_batch* batch);
 

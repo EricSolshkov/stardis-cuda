@@ -631,9 +631,11 @@ s3d_instance_transform
 /*******************************************************************************
  * Batch Ray Tracing API (GPU-accelerated)
  *
- * Batch N rays into a single GPU kernel launch via cus3d_trace_ray_batch,
- * with CPU-side post-processing (UV/normal fixup, filter evaluation).
- * Rays rejected by the filter fall back to the existing Top-K single trace.
+ * Batch N rays into a single GPU kernel launch via cus3d_trace_ray_batch_multi,
+ * returning Top-K candidates per ray.  CPU-side post-processing iterates
+ * candidates (UV/normal fixup, filter evaluation) and accepts the first
+ * passing hit.  Only rays where ALL K candidates are rejected by the filter
+ * fall back to the existing Top-K single trace (rare).
  ******************************************************************************/
 
 /* Per-ray request descriptor for batch tracing */

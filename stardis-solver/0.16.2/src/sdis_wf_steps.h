@@ -206,6 +206,42 @@ extern LOCAL_SYM res_T
 step_bnd_sf_nullcoll_decide(struct path_state* p, struct sdis_scene* scn);
 
 /*******************************************************************************
+ * B-4 M8: PicardN recursive stack state machine
+ ******************************************************************************/
+
+/* PATH_BND_SFN_PROB_DISPATCH: picardN null-collision probability dispatch.
+ * Reuses bnd_sf reinjection data.  h_hat==0 → first entry (compute coeffs),
+ * h_hat>0 → null-collision dispatch (conv/cond/rad). */
+extern LOCAL_SYM res_T
+step_bnd_sfn_prob_dispatch(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_BND_SFN_RAD_TRACE: process radiative sub-path trace hit.
+ * Functionally identical to step_bnd_sf_nullcoll_rad_trace but transitions
+ * to PATH_BND_SFN_RAD_DONE on completion instead of SF_NULLCOLL_DECIDE. */
+extern LOCAL_SYM res_T
+step_bnd_sfn_rad_trace(struct path_state* p, struct sdis_scene* scn,
+                       const struct s3d_hit* hit);
+
+/* PATH_BND_SFN_RAD_DONE: radiative sub-path completed.
+ * Saves rwalk_s/T_s, computes initial h_radi_min check, then starts the
+ * COMPUTE_TEMPERATURE chain or early-accepts. */
+extern LOCAL_SYM res_T
+step_bnd_sfn_rad_done(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_BND_SFN_COMPUTE_Ti: compute i-th temperature sample.
+ * If T.done → use value directly, else push stack and start sub-path. */
+extern LOCAL_SYM res_T
+step_bnd_sfn_compute_Ti(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_BND_SFN_COMPUTE_Ti_RESUME: sub-path returned, pop stack frame. */
+extern LOCAL_SYM res_T
+step_bnd_sfn_compute_Ti_resume(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_BND_SFN_CHECK_PMIN_PMAX: early accept/reject based on h_radi bounds. */
+extern LOCAL_SYM res_T
+step_bnd_sfn_check_pmin_pmax(struct path_state* p, struct sdis_scene* scn);
+
+/*******************************************************************************
  * B-4 M4: Delta-sphere conductive fine-grained state machine
  ******************************************************************************/
 

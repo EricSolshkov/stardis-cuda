@@ -16,11 +16,12 @@
 /*
  * GPU-accelerated batch ray tracing with CPU post-processing.
  *
- * Wraps cus3d_trace_ray_batch (<<<grid, 256>>>) and adds:
+ * Wraps cus3d_trace_ray_batch_multi (<<<grid, 256>>>, Top-K) and adds:
  *   - cus3d_hit_to_s3d_hit conversion
  *   - trace_hit_fixup (UV/normal convention transform)
- *   - CPU-side filter evaluation
- *   - Selective re-trace via s3d_scene_view_trace_ray for rejected rays
+ *   - CPU-side filter evaluation against Top-K candidates
+ *   - Selective re-trace via s3d_scene_view_trace_ray only when all K
+ *     candidates are rejected (rare).
  */
 
 #include "s3d.h"
@@ -37,6 +38,7 @@
 #include <float.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -61,11 +63,21 @@ static double get_time_ms(void)
 /*******************************************************************************
  * Batch trace context
  ******************************************************************************/
+/* Number of Top-K candidates per ray in batch mode.
+ * Must cover: 1 self-hit (#1) + ~2 shared-edge hits (#3) + ~1 boundary
+ * hit (#4) + margin.  K=8 (CUS3D_MAX_MULTI_HITS) provides ample room
+ * and the GPU insertion-sort cost is negligible at K<=8. */
+#define BATCH_TOPK_COUNT CUS3D_MAX_MULTI_HITS
+
+/* Maximum fallback re-trace depth when all K candidates are rejected.
+ * Matches MAX_FALLBACK_DEPTH in s3d_scene_view_trace_ray.cpp. */
+#define BATCH_MAX_FALLBACK_DEPTH 4
+
 struct s3d_batch_trace_context {
-    struct cus3d_ray_batch   gpu_batch;
-    struct cus3d_hit_result* h_results;
-    size_t                   max_rays;
-    int                      initialized;
+    struct cus3d_ray_batch          gpu_batch;
+    struct cus3d_multi_hit_result*  h_multi_results;
+    size_t                          max_rays;
+    int                             initialized;
 };
 
 res_T
@@ -88,9 +100,9 @@ s3d_batch_trace_context_create
         return res;
     }
 
-    ctx->h_results = (struct cus3d_hit_result*)malloc(
-        max_rays * sizeof(struct cus3d_hit_result));
-    if(!ctx->h_results) {
+    ctx->h_multi_results = (struct cus3d_multi_hit_result*)malloc(
+        max_rays * sizeof(struct cus3d_multi_hit_result));
+    if(!ctx->h_multi_results) {
         cus3d_ray_batch_destroy(&ctx->gpu_batch);
         free(ctx);
         return RES_MEM_ERR;
@@ -108,24 +120,51 @@ s3d_batch_trace_context_destroy
 {
     if(!ctx) return;
     cus3d_ray_batch_destroy(&ctx->gpu_batch);
-    free(ctx->h_results);
+    free(ctx->h_multi_results);
     free(ctx);
 }
 
 /*******************************************************************************
- * Core batch trace implementation
+ * Batch trace diagnostics (compile-time toggleable)
+ ******************************************************************************/
+#ifndef BATCH_TRACE_DIAG
+#define BATCH_TRACE_DIAG 1   /* Set to 0 to silence all diagnostics */
+#endif
+
+/* How often (in batch calls) to print a summary line */
+#define DIAG_SUMMARY_INTERVAL 50
+
+/* Max detailed per-ray dumps per batch call (to avoid flooding) */
+#define DIAG_MAX_DETAIL_DUMPS 3
+
+/* Cumulative counters across batch calls (file-scoped) */
+static size_t g_diag_batch_calls       = 0;
+static size_t g_diag_total_rays        = 0;
+static size_t g_diag_total_accepted0   = 0;   /* accepted at candidate[0] */
+static size_t g_diag_total_topk_saved  = 0;   /* accepted at candidate[1..K-1] */
+static size_t g_diag_total_all_reject  = 0;   /* all K rejected → retrace */
+static size_t g_diag_total_miss        = 0;   /* count==0, no candidates at all */
+static size_t g_diag_total_no_filter   = 0;   /* no filter_data → auto-accept */
+static size_t g_diag_total_retrace_ok  = 0;
+static size_t g_diag_total_retrace_miss = 0;
+/* Per-candidate-index acceptance histogram */
+static size_t g_diag_accept_hist[CUS3D_MAX_MULTI_HITS] = {0};
+
+/*******************************************************************************
+ * Core batch trace implementation (Top-K)
  *
  * Flow:
  *   1. AoS→SoA transpose + gpu_buffer upload to cus3d_ray_batch
- *   2. cus3d_trace_ray_batch → cus3d_hit_result[] (nearest hit per ray)
- *   3. CPU post-process: cus3d_hit_to_s3d_hit + trace_hit_fixup + filter
- *   4. Selective re-trace for filter-rejected rays via s3d_scene_view_trace_ray
+ *   2. cus3d_trace_ray_batch_multi → cus3d_multi_hit_result[] (Top-K per ray)
+ *   3. CPU post-process: iterate Top-K candidates per ray, accept first
+ *      that passes filter (cus3d_hit_to_s3d_hit + trace_hit_fixup + filter)
+ *   4. Rare fallback: re-trace only rays where ALL K candidates were rejected
  ******************************************************************************/
 static res_T
 trace_rays_batch_impl
   (struct s3d_scene_view* view,
    struct cus3d_ray_batch* gpu_batch,
-   struct cus3d_hit_result* h_results,
+   struct cus3d_multi_hit_result* h_multi_results,
    const struct s3d_ray_request* requests,
    size_t nrays,
    struct s3d_hit* hits,
@@ -137,9 +176,11 @@ trace_rays_batch_impl
     struct cus3d_device* dev = dev_s3d->gpu;
     res_T res;
     size_t i;
+    int j_hist;
     double t0, t1;
 
-    size_t stat_accepted = 0, stat_rejected = 0;
+    size_t stat_accepted = 0, stat_topk_accepted = 0;
+    size_t stat_rejected = 0;
     size_t stat_retrace_ok = 0, stat_retrace_miss = 0;
 
     uint8_t* needs_retrace = (uint8_t*)calloc(nrays, 1);
@@ -181,69 +222,139 @@ trace_rays_batch_impl
     }
     gpu_batch->count = nrays;
 
-    /* Step 2: GPU batch trace — nearest hit per ray */
-    res = cus3d_trace_ray_batch(bvh, store, dev, gpu_batch, h_results);
+    /* Step 2: GPU batch Top-K trace — up to BATCH_TOPK_COUNT hits per ray */
+    res = cus3d_trace_ray_batch_multi(
+        bvh, store, dev, gpu_batch, BATCH_TOPK_COUNT, h_multi_results);
     if(res != RES_OK) { free(needs_retrace); return res; }
 
     t1 = stats ? get_time_ms() : 0;
     if(stats) stats->batch_time_ms = t1 - t0;
 
-    /* Step 3: CPU post-processing — type conversion + fixup + filter */
+    /* Step 3: CPU post-processing — iterate Top-K candidates per ray */
     t0 = stats ? get_time_ms() : 0;
 
+    size_t diag_miss_count = 0;      /* count==0 rays this batch */
+    size_t diag_no_filter = 0;       /* accepted w/o filter this batch */
+    size_t diag_detail_dumps = 0;    /* per-ray detail dumps emitted */
+    /* Per-candidate-index acceptance this batch */
+    size_t diag_accept_at[CUS3D_MAX_MULTI_HITS] = {0};
+
     for(i = 0; i < nrays; i++) {
-        const struct cus3d_hit_result* gpu_hit = &h_results[i];
+        const struct cus3d_multi_hit_result* multi = &h_multi_results[i];
+        int accepted = 0;
+        int j;
 
-        if(gpu_hit->prim_id < 0) {
+        if(multi->count == 0) {
             hits[i] = S3D_HIT_NULL;
             stat_accepted++;
+            diag_miss_count++;
             continue;
         }
 
-        /* Resolve geometry store (instanced vs direct) */
-        const struct cus3d_geom_store* resolved_store = store;
-        if(gpu_hit->inst_id >= 0) {
-            const struct cus3d_geom_store* cs =
-                cus3d_bvh_get_instance_store(bvh, (unsigned)gpu_hit->inst_id);
-            if(cs) resolved_store = cs;
-        }
+        /* Iterate candidates in ascending distance order */
+        for(j = 0; j < multi->count; j++) {
+            const struct cus3d_hit_result* candidate = &multi->hits[j];
 
-        cus3d_hit_to_s3d_hit(resolved_store, bvh, gpu_hit, &hits[i]);
-
-        const struct geom_entry* ge =
-            cus3d_geom_store_get_entry(resolved_store,
-                                       (uint32_t)gpu_hit->geom_idx);
-        if(!ge) {
-            hits[i] = S3D_HIT_NULL;
-            stat_accepted++;
-            continue;
-        }
-
-        trace_hit_fixup(&hits[i], ge);
-
-        if(requests[i].filter_data != NULL && ge->filter_func != NULL) {
-            int rejected = ge->filter_func(
-                &hits[i],
-                requests[i].origin,
-                requests[i].direction,
-                requests[i].range,
-                requests[i].filter_data,
-                ge->filter_data);
-
-            if(rejected) {
-                needs_retrace[i] = 1;
-                stat_rejected++;
+            if(candidate->prim_id < 0) {
                 continue;
             }
+
+            /* Resolve geometry store (instanced vs direct) */
+            const struct cus3d_geom_store* resolved_store = store;
+            if(candidate->inst_id >= 0) {
+                const struct cus3d_geom_store* cs =
+                    cus3d_bvh_get_instance_store(bvh,
+                                                 (unsigned)candidate->inst_id);
+                if(cs) resolved_store = cs;
+            }
+
+            cus3d_hit_to_s3d_hit(resolved_store, bvh, candidate, &hits[i]);
+
+            const struct geom_entry* ge =
+                cus3d_geom_store_get_entry(resolved_store,
+                                           (uint32_t)candidate->geom_idx);
+            if(!ge) continue;
+
+            trace_hit_fixup(&hits[i], ge);
+
+            /* Evaluate filter if present */
+            if(requests[i].filter_data != NULL && ge->filter_func != NULL) {
+                int rejected = ge->filter_func(
+                    &hits[i],
+                    requests[i].origin,
+                    requests[i].direction,
+                    requests[i].range,
+                    requests[i].filter_data,
+                    ge->filter_data);
+
+                if(rejected)
+                    continue; /* Try next Top-K candidate */
+            } else if(requests[i].filter_data == NULL) {
+                diag_no_filter++;
+            }
+
+            /* This candidate accepted */
+            accepted = 1;
+            diag_accept_at[j]++;
+            if(j == 0)
+                stat_accepted++;
+            else
+                stat_topk_accepted++;
+            break;
         }
 
-        stat_accepted++;
+        if(!accepted) {
+            /* All candidates rejected by filter.
+             * If count < BATCH_TOPK_COUNT the GPU exhausted every
+             * intersection in the BVH — retrace will find the same
+             * (or fewer) candidates and also fail.  Short-circuit. */
+            if(multi->count < BATCH_TOPK_COUNT) {
+                hits[i] = S3D_HIT_NULL;
+                stat_rejected++;
+                /* No retrace needed — BVH is exhausted */
+            } else {
+                /* K slots were full — there may be further intersections
+                 * beyond the K-th candidate.  Retrace can succeed. */
+                needs_retrace[i] = 1;
+                stat_rejected++;
+            }
+
+#ifndef BATCH_TRACE_DIAG
+            /* Dump detailed info for the first few all-rejected rays */
+            if(diag_detail_dumps < DIAG_MAX_DETAIL_DUMPS) {
+                diag_detail_dumps++;
+                fprintf(stderr,
+                    "[BATCH_DIAG] ALL-REJECT ray %zu: "
+                    "org=(%.6g,%.6g,%.6g) dir=(%.6g,%.6g,%.6g) "
+                    "range=[%.6g,%.6g] K=%d has_filter=%d\n",
+                    i,
+                    requests[i].origin[0], requests[i].origin[1],
+                    requests[i].origin[2],
+                    requests[i].direction[0], requests[i].direction[1],
+                    requests[i].direction[2],
+                    requests[i].range[0], requests[i].range[1],
+                    multi->count,
+                    requests[i].filter_data != NULL ? 1 : 0);
+
+                for(j = 0; j < multi->count; j++) {
+                    const struct cus3d_hit_result* c = &multi->hits[j];
+                    fprintf(stderr,
+                        "  candidate[%d]: prim=%d geom=%d inst=%d "
+                        "dist=%.8g normal=(%.4g,%.4g,%.4g) uv=(%.4g,%.4g)\n",
+                        j, c->prim_id, c->geom_idx, c->inst_id,
+                        c->distance,
+                        c->normal[0], c->normal[1], c->normal[2],
+                        c->uv[0], c->uv[1]);
+                }
+            }
+#endif
+        }
     }
 
     t1 = stats ? get_time_ms() : 0;
     if(stats) stats->postprocess_time_ms = t1 - t0;
 
-    /* Step 4: Re-trace rejected rays via Top-K single trace (full filter) */
+    /* Step 4: Re-trace only rays where ALL K candidates were rejected */
     t0 = stats ? get_time_ms() : 0;
 
     for(i = 0; i < nrays; i++) {
@@ -273,11 +384,54 @@ trace_rays_batch_impl
 
     if(stats) {
         stats->total_rays       = nrays;
-        stats->batch_accepted   = stat_accepted;
+        stats->batch_accepted   = stat_accepted + stat_topk_accepted;
         stats->filter_rejected  = stat_rejected;
         stats->retrace_accepted = stat_retrace_ok;
         stats->retrace_missed   = stat_retrace_miss;
     }
+
+#if BATCH_TRACE_DIAG
+    /* Update cumulative counters */
+    g_diag_batch_calls++;
+    g_diag_total_rays       += nrays;
+    g_diag_total_accepted0  += stat_accepted;
+    g_diag_total_topk_saved += stat_topk_accepted;
+    g_diag_total_all_reject += stat_rejected;
+    g_diag_total_miss       += diag_miss_count;
+    g_diag_total_no_filter  += diag_no_filter;
+    g_diag_total_retrace_ok += stat_retrace_ok;
+    g_diag_total_retrace_miss += stat_retrace_miss;
+    for(j_hist = 0; j_hist < CUS3D_MAX_MULTI_HITS; j_hist++)
+        g_diag_accept_hist[j_hist] += diag_accept_at[j_hist];
+
+    /* Periodic summary */
+    if(g_diag_batch_calls % DIAG_SUMMARY_INTERVAL == 0) {
+        double reject_pct = g_diag_total_rays > 0
+            ? 100.0 * (double)g_diag_total_all_reject / (double)g_diag_total_rays
+            : 0.0;
+        double topk_pct = g_diag_total_rays > 0
+            ? 100.0 * (double)g_diag_total_topk_saved / (double)g_diag_total_rays
+            : 0.0;
+        fprintf(stderr,
+            "[BATCH_DIAG] === SUMMARY after %zu calls, %zu total rays ===\n"
+            "  accept@[0]: %zu | topk_saved: %zu (%.1f%%) | "
+            "all_reject: %zu (%.1f%%) | miss: %zu | no_filter: %zu\n"
+            "  retrace_ok: %zu | retrace_miss: %zu\n",
+            g_diag_batch_calls, g_diag_total_rays,
+            g_diag_total_accepted0, g_diag_total_topk_saved, topk_pct,
+            g_diag_total_all_reject, reject_pct,
+            g_diag_total_miss, g_diag_total_no_filter,
+            g_diag_total_retrace_ok, g_diag_total_retrace_miss);
+
+        /* Acceptance histogram */
+        fprintf(stderr, "  accept_hist:");
+        for(j_hist = 0; j_hist < CUS3D_MAX_MULTI_HITS; j_hist++) {
+            if(g_diag_accept_hist[j_hist] > 0)
+                fprintf(stderr, " [%d]=%zu", j_hist, g_diag_accept_hist[j_hist]);
+        }
+        fprintf(stderr, "\n");
+    }
+#endif
 
     free(needs_retrace);
     return RES_OK;
@@ -305,17 +459,18 @@ s3d_scene_view_trace_rays_batch
     res_T res = cus3d_ray_batch_create(&gpu_batch, nrays);
     if(res != RES_OK) return res;
 
-    struct cus3d_hit_result* h_results =
-        (struct cus3d_hit_result*)malloc(nrays * sizeof(struct cus3d_hit_result));
-    if(!h_results) {
+    struct cus3d_multi_hit_result* h_multi_results =
+        (struct cus3d_multi_hit_result*)malloc(
+            nrays * sizeof(struct cus3d_multi_hit_result));
+    if(!h_multi_results) {
         cus3d_ray_batch_destroy(&gpu_batch);
         return RES_MEM_ERR;
     }
 
     res = trace_rays_batch_impl(
-        scnview, &gpu_batch, h_results, requests, nrays, hits, stats);
+        scnview, &gpu_batch, h_multi_results, requests, nrays, hits, stats);
 
-    free(h_results);
+    free(h_multi_results);
     cus3d_ray_batch_destroy(&gpu_batch);
     return res;
 }
@@ -339,6 +494,6 @@ s3d_scene_view_trace_rays_batch_ctx
         return RES_BAD_ARG;
 
     return trace_rays_batch_impl(
-        scnview, &ctx->gpu_batch, ctx->h_results,
+        scnview, &ctx->gpu_batch, ctx->h_multi_results,
         requests, nrays, hits, stats);
 }

@@ -878,6 +878,178 @@ cus3d_trace_ray_batch(
     return RES_OK;
 }
 
+/*******************************************************************************
+ * Batch Top-K multi-hit trace (host-side API)
+ *
+ * Like cus3d_trace_ray_batch but returns up to max_hits candidates per ray
+ * sorted by distance.  Uses the existing topk kernels with full batch
+ * parallelism (one thread per ray), eliminating the need for per-ray
+ * kernel launches when the nearest hit is rejected by a filter.
+ ******************************************************************************/
+res_T
+cus3d_trace_ray_batch_multi(
+    const struct cus3d_bvh* bvh,
+    const struct cus3d_geom_store* store,
+    struct cus3d_device* dev,
+    const struct cus3d_ray_batch* rays,
+    int max_hits,
+    struct cus3d_multi_hit_result* h_results)
+{
+    trace_clear_error();
+
+    if (!bvh || !store || !dev || !rays || !h_results) {
+        trace_set_error("cus3d_trace_ray_batch_multi: NULL argument");
+        return RES_ERR;
+    }
+
+    if (rays->count == 0)
+        return RES_OK;
+
+    if (!bvh->valid && !(bvh->tlas_valid && bvh->tlas_count > 0)) {
+        /* No geometry at all: zero out all results */
+        for (size_t i = 0; i < rays->count; i++)
+            h_results[i].count = 0;
+        return RES_OK;
+    }
+
+    if (max_hits < 1) max_hits = 1;
+    if (max_hits > CUS3D_MAX_MULTI_HITS) max_hits = CUS3D_MAX_MULTI_HITS;
+
+    cudaStream_t s = dev->stream;
+    uint32_t num_rays = (uint32_t)rays->count;
+
+    struct cus3d_multi_hit_result* d_results = NULL;
+    TRACE_CUDA_CHECK(
+        cudaMallocAsync(&d_results,
+                        num_rays * sizeof(struct cus3d_multi_hit_result), s),
+        "alloc d_results (batch_multi)");
+
+    const uint32_t block_size = 256;
+    uint32_t grid_size = (num_rays + block_size - 1) / block_size;
+
+    if (bvh->tlas_valid && bvh->tlas_count > 0) {
+        /* --- Two-level instanced Top-K batch path --- */
+        uint32_t n_inst = (uint32_t)bvh->tlas_count;
+
+        cuBQL::BinaryBVH<float, 3>* h_blas_array =
+            (cuBQL::BinaryBVH<float, 3>*)malloc(
+                n_inst * sizeof(cuBQL::BinaryBVH<float, 3>));
+        struct instance_gpu_data* h_instances =
+            (struct instance_gpu_data*)malloc(
+                n_inst * sizeof(struct instance_gpu_data));
+        if (!h_blas_array || !h_instances) {
+            free(h_blas_array);
+            free(h_instances);
+            cudaFreeAsync(d_results, s);
+            trace_set_error("cus3d_trace_ray_batch_multi: host malloc failed");
+            return RES_ERR;
+        }
+
+        for (uint32_t i = 0; i < n_inst; ++i) {
+            uint32_t orig = bvh->tlas_to_orig[i];
+            const instance_bvh_entry* ie = &bvh->instance_bvhs[orig];
+            h_blas_array[i] = ie->child_bvh;
+            memcpy(h_instances[i].transform, ie->transform, 12 * sizeof(float));
+            memcpy(h_instances[i].inv_transform, ie->inv_transform, 12 * sizeof(float));
+            h_instances[i].child_bvh_idx     = i;
+            h_instances[i].geom_store_offset = ie->child_store_offset;
+            const struct cus3d_geom_store* cs = ie->child_store;
+            h_instances[i].inst_vertices     = cs ? cs->d_vertices.data : NULL;
+            h_instances[i].inst_indices      = cs ? cs->d_indices.data  : NULL;
+            h_instances[i].inst_spheres      = cs ? cs->d_spheres       : NULL;
+            h_instances[i].inst_prim_to_geom = cs ? cs->d_prim_to_geom.data : NULL;
+            h_instances[i].inst_geom_entries = cs ? cs->d_geom_entries   : NULL;
+            h_instances[i].inst_tri_count    = cs ? cs->total_tris       : 0;
+            h_instances[i].inst_total_prims  = cs ? cs->total_prims      : 0;
+        }
+
+        cuBQL::BinaryBVH<float, 3>* d_blas_array = NULL;
+        TRACE_CUDA_CHECK(
+            cudaMallocAsync(&d_blas_array,
+                            n_inst * sizeof(cuBQL::BinaryBVH<float, 3>), s),
+            "alloc d_blas_array (batch_multi)");
+        TRACE_CUDA_CHECK(
+            cudaMemcpyAsync(d_blas_array, h_blas_array,
+                            n_inst * sizeof(cuBQL::BinaryBVH<float, 3>),
+                            cudaMemcpyHostToDevice, s),
+            "upload blas_array (batch_multi)");
+
+        struct instance_gpu_data* d_instances = NULL;
+        TRACE_CUDA_CHECK(
+            cudaMallocAsync(&d_instances,
+                            n_inst * sizeof(struct instance_gpu_data), s),
+            "alloc d_instances (batch_multi)");
+        TRACE_CUDA_CHECK(
+            cudaMemcpyAsync(d_instances, h_instances,
+                            n_inst * sizeof(struct instance_gpu_data),
+                            cudaMemcpyHostToDevice, s),
+            "upload instances (batch_multi)");
+
+        free(h_blas_array);
+        free(h_instances);
+
+        trace_rays_instanced_topk_kernel<<<grid_size, block_size, 0, s>>>(
+            bvh->tlas,
+            d_blas_array,
+            d_instances,
+            n_inst,
+            store->d_vertices.data,
+            store->d_indices.data,
+            store->d_spheres,
+            store->d_prim_to_geom.data,
+            store->d_geom_entries,
+            store->total_tris,
+            rays->d_origins.data,
+            rays->d_directions.data,
+            rays->d_ranges.data,
+            num_rays,
+            max_hits,
+            d_results);
+
+        TRACE_CUDA_CHECK(cudaGetLastError(),
+                         "launch trace_rays_instanced_topk_kernel (batch_multi)");
+        TRACE_CUDA_CHECK(cudaStreamSynchronize(s),
+                         "sync after instanced topk trace (batch_multi)");
+
+        cudaFreeAsync(d_blas_array, s);
+        cudaFreeAsync(d_instances, s);
+
+    } else {
+        /* --- Single-level BLAS-only Top-K batch path --- */
+        trace_rays_topk_kernel<<<grid_size, block_size, 0, s>>>(
+            bvh->bvh,
+            store->d_vertices.data,
+            store->d_indices.data,
+            store->d_spheres,
+            store->d_prim_to_geom.data,
+            store->d_geom_entries,
+            store->total_tris,
+            rays->d_origins.data,
+            rays->d_directions.data,
+            rays->d_ranges.data,
+            num_rays,
+            max_hits,
+            d_results);
+
+        TRACE_CUDA_CHECK(cudaGetLastError(),
+                         "launch trace_rays_topk_kernel (batch_multi)");
+        TRACE_CUDA_CHECK(cudaStreamSynchronize(s),
+                         "sync after topk trace (batch_multi)");
+    }
+
+    TRACE_CUDA_CHECK(
+        cudaMemcpyAsync(h_results, d_results,
+                        num_rays * sizeof(struct cus3d_multi_hit_result),
+                        cudaMemcpyDeviceToHost, s),
+        "download multi hit results (batch_multi)");
+    TRACE_CUDA_CHECK(cudaStreamSynchronize(s),
+                     "sync after batch_multi result download");
+
+    cudaFreeAsync(d_results, s);
+
+    return RES_OK;
+}
+
 res_T
 cus3d_trace_ray_single(
     const struct cus3d_bvh* bvh,

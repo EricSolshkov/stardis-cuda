@@ -62,6 +62,11 @@ struct path_ray_request {
  * (ext_flux) + ~200 B (enc_query) + ~600 B (sfn_stack x 3) ~ 2.2 KB/path.
  * 32K paths x 2.2 KB = 70 MB, well within CPU memory budget.
  ******************************************************************************/
+
+/* Maximum recursion depth for picardN COMPUTE_TEMPERATURE stack.
+ * 3 = up to 3 nested boundary sub-paths.  If the depth is exceeded during
+ * a recursive Ti sampling, the path falls back to synchronous execution. */
+#define MAX_PICARD_DEPTH 3
 struct path_state {
   /* --- Identity --- */
   uint32_t  path_id;                   /* global unique id within the tile   */
@@ -202,6 +207,14 @@ struct path_state {
       /* heat path restart vertex saved before null-collision loop */
       struct sdis_heat_vertex hvtx_saved;
       size_t  ihvtx_radi_begin;       /* radiative sub-path vertex start   */
+
+      /* === PicardN-specific fields (M8) === */
+      int     is_picardn;             /* 1 when in picardN mode            */
+      struct rwalk rwalk_s;            /* radiative endpoint rwalk (SFN)    */
+      struct temperature T_s;          /* radiative endpoint temperature    */
+      struct sdis_heat_vertex hvtx_s;  /* heat vertex at radiative endpoint */
+      size_t  ihvtx_radi_end;          /* vertex index after rad sub-path   */
+      int     coupled_nbranchings_saved; /* saved nbranchings at push       */
     } bnd_sf;
 
     struct {                            /* WoS conductive                  */
@@ -276,7 +289,7 @@ struct path_state {
     double  T_values[6];
     int     T_count;
     double  r, p_conv, p_cond, h_hat;
-  } sfn_stack[3];                      /* MAX_PICARD_DEPTH = 3             */
+  } sfn_stack[MAX_PICARD_DEPTH];        /* recursive COMPUTE_TEMPERATURE    */
   int sfn_stack_depth;
 
   /* --- B-4: Ray type tag --- */

@@ -41,8 +41,10 @@
 
 /* Number of Top-K candidates returned by a single GPU trace.
  * 4 is sufficient for the typical self-intersection-avoidance case
- * (1 self-hit + 1 valid hit), with margin for multi-layer scenes. */
-#define TOPK_COUNT 4
+ * (1 self-hit + 1 valid hit), with margin for multi-layer scenes.
+ * K=8 covers worst-case dense meshes: 1 self-hit + ~2 shared-edge
+ * hits + ~1 boundary enclosure hit + margin. */
+#define TOPK_COUNT CUS3D_MAX_MULTI_HITS
 
 /* Maximum recursive fallback depth when all K candidates are rejected.
  * Prevents infinite recursion in degenerate scenes. */

@@ -116,10 +116,15 @@ endif()
 # When building a DLL, EXPORT_SYM must expand to __declspec(dllexport)
 # during compilation — so the define goes on sdis_obj, not sdis.
 # For test EXEs the dllexport attribute is harmlessly ignored by the linker.
+#
+# When building STATIC, SDIS_STATIC_BUILD is PUBLIC so that consumers
+# (stardis, tests) also see it and get  SDIS_API = extern LOCAL_SYM
+# instead of extern __declspec(dllimport).
 if(BUILD_SHARED_LIBS)
     target_compile_definitions(sdis_obj PRIVATE SDIS_SHARED_BUILD)
     add_library(sdis SHARED)
 else()
+    target_compile_definitions(sdis_obj PUBLIC  SDIS_STATIC_BUILD)
     add_library(sdis STATIC)
 endif()
 
@@ -243,6 +248,12 @@ if(ENABLE_TESTS)
     add_test(NAME test_sdis_b4_m7_external_flux
              COMMAND test_sdis_b4_m7_external_flux)
 
+    add_executable(test_sdis_b4_m8_picardN
+        src/test_sdis_b4_m8_picardN.c)
+    target_link_libraries(test_sdis_b4_m8_picardN PRIVATE sdis_obj)
+    add_test(NAME test_sdis_b4_m8_picardN
+             COMMAND test_sdis_b4_m8_picardN)
+
     # Deploy runtime DLLs (Embree4, TBB, etc.) for all B4 test executables
     if(WIN32 AND COMMAND deploy_runtime_dependencies)
         deploy_runtime_dependencies(test_sdis_b4_m1_enclosure_batch)
@@ -252,6 +263,7 @@ if(ENABLE_TESTS)
         deploy_runtime_dependencies(test_sdis_b4_m6_convective)
         deploy_runtime_dependencies(test_sdis_b4_m5_picard1)
         deploy_runtime_dependencies(test_sdis_b4_m7_external_flux)
+        deploy_runtime_dependencies(test_sdis_b4_m8_picardN)
     endif()
 
 endif()

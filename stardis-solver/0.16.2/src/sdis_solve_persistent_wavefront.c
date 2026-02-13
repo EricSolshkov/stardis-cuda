@@ -359,6 +359,11 @@ advance_path_to_first_ray(struct path_state* p,
       break;
     }
     if(!advanced) break;
+    /* M8: intercept PATH_DONE when sfn_stack_depth > 0 */
+    if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
+      p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+      p->active = 1;
+    }
     p->steps_taken++;
   }
   return RES_OK;
@@ -426,8 +431,16 @@ compact_active_paths(struct wavefront_pool* pool)
     struct path_state* p = &pool->slots[i];
 
     if(p->phase == PATH_DONE || p->phase == PATH_ERROR) {
-      pool->done_indices[pool->done_count++] = (uint32_t)i;
-      continue;
+      /* M8: if sfn_stack_depth > 0, the sub-path finished but the
+       * parent picardN frame still needs to resume.  Re-activate. */
+      if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
+        p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+        p->active = 1;
+        /* Fall through to treat as active path */
+      } else {
+        pool->done_indices[pool->done_count++] = (uint32_t)i;
+        continue;
+      }
     }
     if(!p->active) continue;
 
@@ -490,8 +503,7 @@ pool_collect_ray_requests_compact(struct wavefront_pool* pool)
       rr->range[1]     = p->ray_req.range[1];
       rr->user_id      = i;
 
-      if(p->phase == PATH_RAD_TRACE_PENDING
-      && !S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
+      if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
         rr->filter_data = &p->filter_data_storage;
       } else {
         rr->filter_data = NULL;
@@ -514,7 +526,11 @@ pool_collect_ray_requests_compact(struct wavefront_pool* pool)
       rr->direction[2] = p->ray_req.direction2[2];
       rr->range[0]     = p->ray_req.range2[0];
       rr->range[1]     = p->ray_req.range2[1];
-      rr->filter_data  = NULL;
+      if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
+        rr->filter_data = &p->filter_data_storage;
+      } else {
+        rr->filter_data = NULL;
+      }
       rr->user_id      = i;
 
       pool->ray_to_slot[ray_idx] = i;
@@ -683,8 +699,7 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool)
       rr->range[1]     = p->ray_req.range[1];
       rr->user_id      = i;
 
-      if(p->phase == PATH_RAD_TRACE_PENDING
-      && !S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
+      if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
         rr->filter_data = &p->filter_data_storage;
       } else {
         rr->filter_data = NULL;
@@ -707,7 +722,11 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool)
       rr->direction[2] = p->ray_req.direction2[2];
       rr->range[0]     = p->ray_req.range2[0];
       rr->range[1]     = p->ray_req.range2[1];
-      rr->filter_data  = NULL;
+      if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
+        rr->filter_data = &p->filter_data_storage;
+      } else {
+        rr->filter_data = NULL;
+      }
       rr->user_id      = i;
 
       pool->ray_to_slot[ray_idx] = i;
@@ -876,7 +895,16 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
     for(;;) {
       int advanced = 0;
       if(p->needs_ray) break;
-      if(p->phase == PATH_DONE || p->phase == PATH_ERROR) break;
+      if(p->phase == PATH_DONE || p->phase == PATH_ERROR) {
+        /* M8: intercept PATH_DONE when sfn_stack_depth > 0.
+         * The sub-path finished — resume the parent picardN frame. */
+        if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
+          p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+          p->active = 1;
+          continue;
+        }
+        break;
+      }
       if(path_phase_is_ray_pending(p->phase)) break;
 
       res = advance_one_step_no_ray(p, scn, &advanced);

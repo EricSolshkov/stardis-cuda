@@ -65,12 +65,12 @@ enum path_phase {
 
   /* === B-4: Solid/Solid boundary === */
   PATH_BND_SS_REINJECT_SAMPLE,            /* [R] 4 reinjection rays     [B4-FUTURE] */
-  PATH_BND_SS_REINJECT_ENC,               /* [R] miss -> ENC sub-query  [B4-FUTURE] */
+  PATH_BND_SS_REINJECT_ENC,               /* [C] post-ENC-resolve       [B4-FUTURE] */
   PATH_BND_SS_REINJECT_DECIDE,            /* [C] probability decision   [B4-FUTURE] */
 
   /* === B-4: Solid/Fluid picard1 boundary === */
   PATH_BND_SF_REINJECT_SAMPLE,            /* [R] 2 reinjection rays     [B4-FUTURE] */
-  PATH_BND_SF_REINJECT_ENC,               /* [R] miss -> ENC sub-query  [B4-FUTURE] */
+  PATH_BND_SF_REINJECT_ENC,               /* [C] post-ENC-resolve       [B4-FUTURE] */
   PATH_BND_SF_PROB_DISPATCH,              /* [C] prob dispatch           [B4-FUTURE] */
   PATH_BND_SF_NULLCOLL_RAD_TRACE,         /* [R] null-collision rad ray [B4-FUTURE] */
   PATH_BND_SF_NULLCOLL_DECIDE,            /* [C] accept/reject          [B4-FUTURE] */
@@ -100,7 +100,7 @@ enum path_phase {
   PATH_CND_DS_CHECK_TEMP,                 /* [C] check known temp       [B4-FUTURE] */
   PATH_CND_DS_STEP_TRACE,                 /* [R] 2 step rays (dir0+dir1)[B4-FUTURE] */
   PATH_CND_DS_STEP_PROCESS,               /* [C] process hit0/hit1      [B4-FUTURE] */
-  PATH_CND_DS_STEP_ENC_VERIFY,            /* [R] ENC verify             [B4-FUTURE] */
+  PATH_CND_DS_STEP_ENC_VERIFY,            /* [C] set up ENC sub-query   [B4-FUTURE] */
   PATH_CND_DS_STEP_ADVANCE,               /* [C] pos update + loop      [B4-FUTURE] */
 
   /* --- Walk on Spheres (WoS) conductive --- */
