@@ -21,8 +21,11 @@ trace_hit_fixup
   ASSERT(hit && ge);
 
   if(ge->type == PRIM_TRIANGLE) {
-    float mt_u = hit->uv[0];
-    float mt_v = hit->uv[1];
+    /* Handle GPU ray-triangle intersection returning uv out of range due to
+     * floating-point precision in the Watertight algorithm's division step.
+     * This mirrors CPU hit_setup's CLAMP(u, 0, 1) for Embree results. */
+    float mt_u = CLAMP(hit->uv[0], 0.0f, 1.0f);
+    float mt_v = CLAMP(hit->uv[1], 0.0f, 1.0f);
     float w = 1.0f - mt_u - mt_v;
     if(w < 0.0f) {
       if(mt_u > mt_v) mt_u += w;

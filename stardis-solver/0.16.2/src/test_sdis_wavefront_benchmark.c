@@ -388,32 +388,36 @@ bench_compare_images
    const struct sdis_estimator_buffer* img_wf,
    int* out_pass)
 {
-  size_t width = 0, height = 0;
+  size_t def[2] = {0, 0};
   size_t x, y;
   size_t n_compared = 0, n_compat = 0;
 
-  OK(sdis_estimator_buffer_get_resolution(img_ref, &width, &height));
+  OK(sdis_estimator_buffer_get_definition(img_ref, def));
 
-  for(y = 0; y < height; y++) {
-    for(x = 0; x < width; x++) {
-      double mean_ref = 0, mean_wf = 0;
-      double var_ref = 0, var_wf = 0;
+  for(y = 0; y < def[1]; y++) {
+    for(x = 0; x < def[0]; x++) {
+      const struct sdis_estimator* est_ref = NULL;
+      const struct sdis_estimator* est_wf = NULL;
+      struct sdis_mc mc_ref, mc_wf;
       size_t count_ref = 0, count_wf = 0;
 
-      OK(sdis_estimator_buffer_get_temperature(
-        img_ref, x, y, &mean_ref, &var_ref, &count_ref));
-      OK(sdis_estimator_buffer_get_temperature(
-        img_wf, x, y, &mean_wf, &var_wf, &count_wf));
+      OK(sdis_estimator_buffer_at(img_ref, x, y, &est_ref));
+      OK(sdis_estimator_buffer_at(img_wf,  x, y, &est_wf));
 
-      if(count_ref == 0 || count_wf == 0) continue;
+      if(sdis_estimator_get_realisation_count(est_ref, &count_ref) != RES_OK
+         || count_ref == 0) continue;
+      if(sdis_estimator_get_realisation_count(est_wf, &count_wf) != RES_OK
+         || count_wf == 0) continue;
+      if(sdis_estimator_get_temperature(est_ref, &mc_ref) != RES_OK) continue;
+      if(sdis_estimator_get_temperature(est_wf,  &mc_wf)  != RES_OK) continue;
+
       n_compared++;
 
       /* Statistical compatibility: |mean_ref - mean_wf| < BENCH_TOL_SIGMA * combined SE */
       {
-        double se_ref = (count_ref > 1) ? sqrt(var_ref / (double)count_ref) : 0;
-        double se_wf  = (count_wf > 1)  ? sqrt(var_wf  / (double)count_wf)  : 0;
-        double se_combined = sqrt(se_ref * se_ref + se_wf * se_wf);
-        double diff = fabs(mean_ref - mean_wf);
+        double se_combined = sqrt(mc_ref.SE * mc_ref.SE
+                                  + mc_wf.SE * mc_wf.SE);
+        double diff = fabs(mc_ref.E - mc_wf.E);
 
         if(se_combined < 1e-12 || diff <= BENCH_TOL_SIGMA * se_combined) {
           n_compat++;
@@ -423,7 +427,7 @@ bench_compare_images
               "  pixel (%lu,%lu): ref=%.6f wf=%.6f diff=%.2e se=%.2e "
               "(%.1f sigma)\n",
               (unsigned long)x, (unsigned long)y,
-              mean_ref, mean_wf, diff, se_combined,
+              mc_ref.E, mc_wf.E, diff, se_combined,
               se_combined > 0 ? diff/se_combined : 0);
           }
         }

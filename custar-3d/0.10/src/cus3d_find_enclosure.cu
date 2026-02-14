@@ -235,22 +235,28 @@ enc_closest_point_sphere(
 /*  matching scene_get_enclosure_id_in_closed_boundaries().           */
 /* ------------------------------------------------------------------ */
 
-/* cos(PI/4) = sin(PI/4) = sqrt(2)/2 */
-#define COS_PI4  0.70710678118f
-#define SIN_PI4  0.70710678118f
-
-/* Pre-computed R = Rz(PI/4) · Ry(PI/4) · Rx(PI/4)
- * Matches CPU f33_rotation(PI/4, PI/4, PI/4).  Row-major 3×3. */
+/* Pre-computed rotation matrix matching CPU f33_rotation(PI/4, PI/4, PI/4).
+ * Row-major 3x3.  The CPU rsys f33_rotation(pitch,yaw,roll) stores in
+ * column-major order; here we transpose to row-major for standard M*v.
+ *
+ * CPU column-major frame[9] has:
+ *   frame = { c2c3, c1s3+c3s1s2, s1s3-c1c3s2,   (col 0)
+ *            -c2s3, c1c3-s1s2s3, c1s2s3+c3s1,    (col 1)
+ *             s2,  -c2s1,        c1c2 }           (col 2)
+ * where c1=c2=c3=s1=s2=s3 = sqrt(2)/2 for PI/4.
+ *
+ * Logical matrix M(row,col) = frame[col*3 + row], so row-major is:
+ *   Row i = { frame[0*3+i], frame[1*3+i], frame[2*3+i] }
+ *
+ * Numerical values (verified by test_enc_rot_matrix_consistency):
+ *   Row 0: [  0.5,                -0.5,                 sqrt(2)/2      ]
+ *   Row 1: [  (1+sqrt(2))/2^1.5,  (2-sqrt(2))/2^1.5,  -0.5           ]
+ *   Row 2: [  (2-sqrt(2))/2^1.5,  (1+sqrt(2))/2^1.5,   0.5           ]
+ */
 __device__ static const float ENC_ROT_MATRIX[9] = {
-    /* Row 0: */ COS_PI4 * COS_PI4,
-                COS_PI4 * SIN_PI4 * SIN_PI4 - SIN_PI4 * COS_PI4,
-                COS_PI4 * SIN_PI4 * COS_PI4 + SIN_PI4 * SIN_PI4,
-    /* Row 1: */ SIN_PI4 * COS_PI4,
-                SIN_PI4 * SIN_PI4 * SIN_PI4 + COS_PI4 * COS_PI4,
-                SIN_PI4 * SIN_PI4 * COS_PI4 - COS_PI4 * SIN_PI4,
-    /* Row 2: */ -SIN_PI4,
-                COS_PI4 * SIN_PI4,
-                COS_PI4 * COS_PI4
+    /* Row 0: */  0.5f,               -0.5f,                0.70710678118f,
+    /* Row 1: */  0.85355339059f,      0.14644660941f,     -0.5f,
+    /* Row 2: */  0.14644660941f,      0.85355339059f,      0.5f
 };
 
 /* 6 axis-aligned directions: +X, -X, +Y, -Y, +Z, -Z */
