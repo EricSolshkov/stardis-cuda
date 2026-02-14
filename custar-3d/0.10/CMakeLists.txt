@@ -58,6 +58,9 @@ set(S3D_CPP_SOURCES
     src/s3d_scene_view_closest_point.cpp
     src/s3d_scene_view_batch_closest_point.cpp
 
+    # B-4 M10: Point-in-enclosure GPU query
+    src/s3d_scene_view_find_enclosure.cpp
+
     # CUDA host-side C++
     src/cus3d_device.cpp
     src/cus3d_mem.cpp
@@ -70,6 +73,7 @@ set(S3D_CUDA_SOURCES
     src/cus3d_bvh.cu
     src/cus3d_trace.cu
     src/cus3d_closest_point.cu
+    src/cus3d_find_enclosure.cu
     src/cus3d_math.cu
 )
 

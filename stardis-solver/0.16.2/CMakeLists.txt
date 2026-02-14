@@ -206,11 +206,12 @@ if(ENABLE_TESTS)
     # sdis_obj gives direct access to all symbols (LOCAL_SYM included)
     # without needing WINDOWS_EXPORT_ALL_SYMBOLS on the DLL.
 
-    add_executable(test_sdis_b4_m1_enclosure_batch
-        src/test_sdis_b4_m1_enclosure_batch.c)
-    target_link_libraries(test_sdis_b4_m1_enclosure_batch PRIVATE sdis_obj)
-    add_test(NAME test_sdis_b4_m1_enclosure_batch
-             COMMAND test_sdis_b4_m1_enclosure_batch)
+    # M1 enclosure batch test (disabled: M1 6-ray ENC replaced by M10 BVH locate)
+    # add_executable(test_sdis_b4_m1_enclosure_batch
+    #     src/test_sdis_b4_m1_enclosure_batch.c)
+    # target_link_libraries(test_sdis_b4_m1_enclosure_batch PRIVATE sdis_obj)
+    # add_test(NAME test_sdis_b4_m1_enclosure_batch
+    #          COMMAND test_sdis_b4_m1_enclosure_batch)
 
     add_executable(test_sdis_b4_m2_ray_bucketing
         src/test_sdis_b4_m2_ray_bucketing.c)
@@ -256,7 +257,7 @@ if(ENABLE_TESTS)
 
     # Deploy runtime DLLs (Embree4, TBB, etc.) for all B4 test executables
     if(WIN32 AND COMMAND deploy_runtime_dependencies)
-        deploy_runtime_dependencies(test_sdis_b4_m1_enclosure_batch)
+        # deploy_runtime_dependencies(test_sdis_b4_m1_enclosure_batch)
         deploy_runtime_dependencies(test_sdis_b4_m2_ray_bucketing)
         deploy_runtime_dependencies(test_sdis_b4_m3_solid_solid)
         deploy_runtime_dependencies(test_sdis_b4_m4_delta_sphere)

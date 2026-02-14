@@ -758,6 +758,74 @@ s3d_scene_view_closest_point_batch_ctx
    struct s3d_hit* hits,
    struct s3d_batch_cp_stats* stats);
 
+/******************************************************************************
+ * Phase B-4 M10: Batch Point-in-Enclosure Query
+ *
+ * Replaces the 6-ray enclosure query (M1) with a single BVH closest-
+ * primitive search per query point.  The GPU kernel finds the nearest
+ * surface primitive and determines front/back side via normal dot product.
+ * The solver layer maps (prim_id, side) → enc_id through the scene's
+ * prim_props table.
+ ******************************************************************************/
+
+/* Per-query request descriptor for batch enclosure locate */
+struct s3d_enc_locate_request {
+  float    pos[3];         /* Query position (world space) */
+  uint32_t user_id;        /* Caller-defined tag (for result dispatch) */
+};
+
+/* Per-query result from batch enclosure locate */
+struct s3d_enc_locate_result {
+  int32_t  prim_id;        /* Closest primitive ID; -1 on miss */
+  float    distance;       /* Distance to closest surface */
+  int32_t  side;           /* 0=front, 1=back, -1=degenerate */
+  unsigned enc_id;         /* Resolved enclosure ID ((unsigned)-1 = pending) */
+};
+
+/* Statistics from a batch enclosure locate call */
+struct s3d_batch_enc_stats {
+  size_t  total_queries;        /* Total queries submitted */
+  size_t  resolved;             /* Successfully resolved (prim_id + side) */
+  size_t  degenerate;           /* Degenerate: distance below threshold */
+  size_t  missed;               /* No primitive found (should be very rare) */
+  double  batch_time_ms;        /* GPU batch + upload time */
+  double  postprocess_time_ms;  /* CPU post-processing time */
+};
+
+/* Opaque batch enclosure locate context for buffer reuse across calls */
+struct s3d_batch_enc_context;
+
+/* Batch enclosure locate on N queries. Allocates temporary GPU buffers. */
+S3D_API res_T
+s3d_scene_view_find_enclosure_batch
+  (struct s3d_scene_view* scnview,
+   const struct s3d_enc_locate_request* requests,
+   size_t nqueries,
+   struct s3d_enc_locate_result* results,
+   struct s3d_batch_enc_stats* stats);
+
+/* Create a reusable batch enclosure locate context */
+S3D_API res_T
+s3d_batch_enc_context_create
+  (struct s3d_batch_enc_context** ctx,
+   size_t max_queries);
+
+/* Destroy a batch enclosure locate context */
+S3D_API void
+s3d_batch_enc_context_destroy
+  (struct s3d_batch_enc_context* ctx);
+
+/* Batch enclosure locate using a pre-allocated context.
+ * nqueries must not exceed the context's max_queries capacity. */
+S3D_API res_T
+s3d_scene_view_find_enclosure_batch_ctx
+  (struct s3d_scene_view* scnview,
+   struct s3d_batch_enc_context* ctx,
+   const struct s3d_enc_locate_request* requests,
+   size_t nqueries,
+   struct s3d_enc_locate_result* results,
+   struct s3d_batch_enc_stats* stats);
+
 END_DECLS
 #ifdef __cplusplus
 }

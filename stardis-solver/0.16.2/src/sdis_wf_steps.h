@@ -114,16 +114,22 @@ extern LOCAL_SYM res_T
 step_coupled_radiative_begin(struct path_state* p, struct sdis_scene* scn);
 
 /*******************************************************************************
- * B-4 M1: Enclosure query sub-state machine
+ * B-4 M10: Point-in-enclosure via BVH closest primitive
  ******************************************************************************/
 
-/* Emit 6 rotated axis-aligned rays for enclosure identification */
+/* Submit a point-in-enclosure query via the BVH closest primitive kernel.
+ * Sets enc_locate.query_pos and transitions to PATH_ENC_LOCATE_PENDING.
+ * The wavefront pool will collect these requests into a batch. */
 extern LOCAL_SYM void
-step_enc_query_emit(struct path_state* p);
+step_enc_locate_submit(struct path_state* p,
+                       const double pos[3],
+                       enum path_phase return_state);
 
-/* Resolve 6 hit results into an enclosure id */
+/* Process the result of a batch enc_locate query.
+ * Resolves prim_id + side → enc_id via scene prim_props and transitions
+ * to the saved return_state. */
 extern LOCAL_SYM res_T
-step_enc_query_resolve(struct path_state* p, struct sdis_scene* scn);
+step_enc_locate_result(struct path_state* p, struct sdis_scene* scn);
 
 /*******************************************************************************
  * B-4 M3: Solid/solid reinjection batch state machine
@@ -250,8 +256,8 @@ step_bnd_sfn_check_pmin_pmax(struct path_state* p, struct sdis_scene* scn);
 extern LOCAL_SYM res_T
 step_cnd_ds_check_temp(struct path_state* p, struct sdis_scene* scn);
 
-/* PATH_CND_DS_STEP_ENC_VERIFY: set up ENC sub-state for enclosure verify at
- * pos_next.  Calls step_enc_query_emit -> PATH_ENC_QUERY_EMIT. */
+/* PATH_CND_DS_STEP_ENC_VERIFY: set up enc_locate for enclosure verify at
+ * pos_next.  Calls step_enc_locate_submit -> PATH_ENC_LOCATE_PENDING. */
 extern LOCAL_SYM void
 step_cnd_ds_step_enc_verify(struct path_state* p);
 

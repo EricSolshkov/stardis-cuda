@@ -118,14 +118,14 @@ teardown_test_scene(void)
 /* T4.1: Initial ENC query -> PATH_CND_DS_CHECK_TEMP chain                    */
 /* ========================================================================== */
 static void
-test_init_enc_query_chain(void)
+test_init_enc_locate_chain(void)
 {
   struct path_state p;
 
   printf("  T4.1: init ENC query chain (conductive entry -> ENC -> CHECK_TEMP)...\n");
 
   /* ---- Part A: step_conductive with ds_initialized=0 must dispatch
-   *              to ENC sub-state via step_enc_query_emit ---- */
+   *              to ENC sub-state via step_enc_locate_submit ---- */
   memset(&p, 0, sizeof(p));
   p.active = 1;
   p.ctx.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
@@ -136,21 +136,19 @@ test_init_enc_query_chain(void)
 
   step_conductive(&p, g_scn);
 
-  /* Should have called step_enc_query_emit:
-   *   phase = PATH_ENC_QUERY_EMIT, needs_ray = 1
-   *   enc_query.return_state = PATH_CND_DS_CHECK_TEMP */
-  CHK(p.phase == PATH_ENC_QUERY_EMIT);
-  CHK(p.needs_ray == 1);
-  CHK(p.ray_count_ext == 6);
-  CHK(p.ray_bucket == RAY_BUCKET_ENCLOSURE);
-  CHK(p.enc_query.return_state == PATH_CND_DS_CHECK_TEMP);
+  /* Should have called step_enc_locate_submit:
+   *   phase = PATH_ENC_LOCATE_PENDING, needs_ray = 0
+   *   enc_locate.return_state = PATH_CND_DS_CHECK_TEMP */
+  CHK(p.phase == PATH_ENC_LOCATE_PENDING);
+  CHK(p.needs_ray == 0);
+  CHK(p.enc_locate.return_state == PATH_CND_DS_CHECK_TEMP);
 
   /* Verify query position matches rwalk position */
-  CHK(fabs(p.enc_query.query_pos[0] - 0.5) < 1.e-10);
-  CHK(fabs(p.enc_query.query_pos[1] - 0.5) < 1.e-10);
-  CHK(fabs(p.enc_query.query_pos[2] - 0.5) < 1.e-10);
+  CHK(fabs(p.enc_locate.query_pos[0] - 0.5) < 1.e-10);
+  CHK(fabs(p.enc_locate.query_pos[1] - 0.5) < 1.e-10);
+  CHK(fabs(p.enc_locate.query_pos[2] - 0.5) < 1.e-10);
 
-  printf("    Part A: step_conductive -> PATH_ENC_QUERY_EMIT  PASS\n");
+  printf("    Part A: step_conductive -> PATH_ENC_LOCATE_PENDING  PASS\n");
 
   /* ---- Part B: step_conductive with ds_initialized=1 goes directly
    *              to PATH_CND_DS_CHECK_TEMP ---- */
@@ -267,9 +265,9 @@ test_ds_enc_verify_trigger(void)
   CHK(p.needs_ray == 0);
 
   /* Verify pos_next was computed correctly (P + dir0 * delta) */
-  CHK(fabs(p.enc_query.query_pos[0] - 0.5) < 1.e-6);
-  CHK(fabs(p.enc_query.query_pos[1] - 0.5) < 1.e-6);
-  CHK(fabs(p.enc_query.query_pos[2] - (0.5 + 0.1)) < 1.e-6);
+  CHK(fabs(p.enc_locate.query_pos[0] - 0.5) < 1.e-6);
+  CHK(fabs(p.enc_locate.query_pos[1] - 0.5) < 1.e-6);
+  CHK(fabs(p.enc_locate.query_pos[2] - (0.5 + 0.1)) < 1.e-6);
 
   printf("PASS\n");
 }
@@ -377,7 +375,7 @@ test_ds_enc_verify_skip(void)
 
   /* If match -> STEP_ADVANCE with resolved_enc_id set */
   if(p.phase == PATH_CND_DS_STEP_ADVANCE)
-    CHK(p.enc_query.resolved_enc_id == g_inner_enc);
+    CHK(p.enc_locate.resolved_enc_id == g_inner_enc);
 
   printf("PASS\n");
 }
@@ -445,24 +443,22 @@ test_ds_enc_verify_setup(void)
 
   memset(&p, 0, sizeof(p));
   p.active = 1;
-  p.enc_query.query_pos[0] = 0.6;
-  p.enc_query.query_pos[1] = 0.5;
-  p.enc_query.query_pos[2] = 0.7;
+  p.enc_locate.query_pos[0] = 0.6;
+  p.enc_locate.query_pos[1] = 0.5;
+  p.enc_locate.query_pos[2] = 0.7;
 
   step_cnd_ds_step_enc_verify(&p);
 
   /* Should have set return_state = PATH_CND_DS_STEP_ADVANCE
-   * and called step_enc_query_emit */
-  CHK(p.enc_query.return_state == PATH_CND_DS_STEP_ADVANCE);
-  CHK(p.phase == PATH_ENC_QUERY_EMIT);
-  CHK(p.needs_ray == 1);
-  CHK(p.ray_count_ext == 6);
-  CHK(p.ray_bucket == RAY_BUCKET_ENCLOSURE);
+   * and called step_enc_locate_submit */
+  CHK(p.enc_locate.return_state == PATH_CND_DS_STEP_ADVANCE);
+  CHK(p.phase == PATH_ENC_LOCATE_PENDING);
+  CHK(p.needs_ray == 0);
 
   /* Verify query position preserved */
-  CHK(fabs(p.enc_query.query_pos[0] - 0.6) < 1.e-10);
-  CHK(fabs(p.enc_query.query_pos[1] - 0.5) < 1.e-10);
-  CHK(fabs(p.enc_query.query_pos[2] - 0.7) < 1.e-10);
+  CHK(fabs(p.enc_locate.query_pos[0] - 0.6) < 1.e-10);
+  CHK(fabs(p.enc_locate.query_pos[1] - 0.5) < 1.e-10);
+  CHK(fabs(p.enc_locate.query_pos[2] - 0.7) < 1.e-10);
 
   printf("PASS\n");
 }
@@ -481,14 +477,14 @@ test_ds_advance_loop_continue(void)
   printf("  T4.5b: advance loop (structural -- HIT_NONE -> CHECK_TEMP)... ");
 
   /* After step_cnd_ds_step_advance with:
-   *   - enc_query.resolved_enc_id == ds_enc_id (match)
+   *   - enc_locate.resolved_enc_id == ds_enc_id (match)
    *   - ds_hit0 = HIT_NONE -> rwalk.hit_3d = HIT_NONE
    *   -> should set phase = PATH_CND_DS_CHECK_TEMP (continue loop) */
 
   memset(&p, 0, sizeof(p));
 
   /* Simulate conditions at advance end */
-  p.enc_query.resolved_enc_id = g_inner_enc;
+  p.enc_locate.resolved_enc_id = g_inner_enc;
   p.ds_enc_id = g_inner_enc; /* match */
   p.ds_hit0 = S3D_HIT_NULL;
   p.ds_delta = 0.1f;
@@ -544,13 +540,13 @@ test_ds_advance_enc_mismatch(void)
   memset(&p, 0, sizeof(p));
 
   /* step_cnd_ds_step_advance checks:
-   *   enc_query.resolved_enc_id != ds_enc_id -> retry */
-  p.enc_query.resolved_enc_id = 99999;
+   *   enc_locate.resolved_enc_id != ds_enc_id -> retry */
+  p.enc_locate.resolved_enc_id = 99999;
   p.ds_enc_id = g_inner_enc; /* mismatch */
   p.ds_robust_attempt = 0;
 
   /* Verify mismatch condition */
-  CHK(p.enc_query.resolved_enc_id != p.ds_enc_id);
+  CHK(p.enc_locate.resolved_enc_id != p.ds_enc_id);
 
   /* Under 100 -> retry */
   p.ds_robust_attempt++;
@@ -797,7 +793,7 @@ test_ds_initialized_lifecycle(void)
   /* After step_conductive dispatches ENC -> still 0 */
   step_conductive(&p, g_scn);
   CHK(p.ds_initialized == 0);
-  CHK(p.phase == PATH_ENC_QUERY_EMIT);
+  CHK(p.phase == PATH_ENC_LOCATE_PENDING);
 
   /* step_cnd_ds_check_temp sets ds_initialized = 1, but needs full medium
    * state.  Verify the flag is used correctly at conductive re-entry. */
@@ -829,7 +825,7 @@ main(int argc, char* argv[])
   test_m4_enum_values();
 
   /* T4.1: Init ENC query chain */
-  test_init_enc_query_chain();
+  test_init_enc_locate_chain();
 
   /* T4.2: 2-ray emission */
   test_ds_step_ray_count_and_bucket();

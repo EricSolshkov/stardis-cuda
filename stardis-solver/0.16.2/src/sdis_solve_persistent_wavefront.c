@@ -104,6 +104,20 @@ pool_create(struct wavefront_pool* pool, size_t pool_size)
     return RES_MEM_ERR;
   }
 
+  /* B-4 M10: enc_locate batch buffers */
+  pool->max_enc_locates = pool_size;
+  pool->enc_locate_requests = (struct s3d_enc_locate_request*)malloc(
+    pool_size * sizeof(struct s3d_enc_locate_request));
+  pool->enc_locate_results = (struct s3d_enc_locate_result*)malloc(
+    pool_size * sizeof(struct s3d_enc_locate_result));
+  pool->enc_locate_to_slot = (uint32_t*)malloc(
+    pool_size * sizeof(uint32_t));
+
+  if(!pool->enc_locate_requests || !pool->enc_locate_results
+  || !pool->enc_locate_to_slot) {
+    return RES_MEM_ERR;
+  }
+
   /* Initialise diagnostics */
   pool->diag_min_batch = (size_t)-1; /* updated on first step with rays */
 
@@ -116,6 +130,7 @@ pool_destroy(struct wavefront_pool* pool)
   if(!pool) return;
 
   if(pool->batch_ctx) s3d_batch_trace_context_destroy(pool->batch_ctx);
+  if(pool->enc_batch_ctx) s3d_batch_enc_context_destroy(pool->enc_batch_ctx);
 
   /* Release per-slot RNGs */
   if(pool->slot_rngs) {
@@ -141,6 +156,11 @@ pool_destroy(struct wavefront_pool* pool)
   /* Bucket arrays */
   free(pool->bucket_radiative);
   free(pool->bucket_conductive);
+
+  /* B-4 M10: enc_locate arrays */
+  free(pool->enc_locate_requests);
+  free(pool->enc_locate_results);
+  free(pool->enc_locate_to_slot);
 
   memset(pool, 0, sizeof(*pool));
 }
@@ -516,7 +536,7 @@ pool_collect_ray_requests_compact(struct wavefront_pool* pool)
     }
 
     /* Ray 1 (if 2-ray request: delta_sphere or reinjection) */
-    if(p->ray_req.ray_count >= 2 && p->ray_count_ext != 6) {
+    if(p->ray_req.ray_count >= 2) {
       struct s3d_ray_request* rr = &pool->ray_requests[ray_idx];
       rr->origin[0]    = p->ray_req.origin[0];
       rr->origin[1]    = p->ray_req.origin[1];
@@ -537,42 +557,6 @@ pool_collect_ray_requests_compact(struct wavefront_pool* pool)
       pool->ray_slot_sub[ray_idx] = 1;
       p->ray_req.batch_idx2 = (uint32_t)ray_idx;
       ray_idx++;
-    }
-
-    /* B-4 M1: 6-ray enclosure query */
-    if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT) {
-      int j;
-      /* Overwrite ray 0 with enc direction 0 */
-      {
-        struct s3d_ray_request* rr = &pool->ray_requests[p->ray_req.batch_idx];
-        rr->direction[0] = p->enc_query.directions[0][0];
-        rr->direction[1] = p->enc_query.directions[0][1];
-        rr->direction[2] = p->enc_query.directions[0][2];
-        rr->range[0]     = p->ray_req.range[0];
-        rr->range[1]     = p->ray_req.range[1];
-        rr->filter_data  = NULL;
-      }
-      p->enc_query.batch_indices[0] = p->ray_req.batch_idx;
-
-      /* Emit directions 1..5 */
-      for(j = 1; j < 6; j++) {
-        struct s3d_ray_request* rr = &pool->ray_requests[ray_idx];
-        rr->origin[0]    = p->ray_req.origin[0];
-        rr->origin[1]    = p->ray_req.origin[1];
-        rr->origin[2]    = p->ray_req.origin[2];
-        rr->direction[0] = p->enc_query.directions[j][0];
-        rr->direction[1] = p->enc_query.directions[j][1];
-        rr->direction[2] = p->enc_query.directions[j][2];
-        rr->range[0]     = p->ray_req.range[0];
-        rr->range[1]     = p->ray_req.range[1];
-        rr->filter_data  = NULL;
-        rr->user_id      = i;
-
-        pool->ray_to_slot[ray_idx] = i;
-        pool->ray_slot_sub[ray_idx] = (uint32_t)j;
-        p->enc_query.batch_indices[j] = (uint32_t)ray_idx;
-        ray_idx++;
-      }
     }
   }
 
@@ -678,9 +662,7 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool)
         pool->rays_conductive_ds += (size_t)p->ray_req.ray_count;
     }
     /* B-4 M2: additional per-bucket stats */
-    if(bkt == RAY_BUCKET_ENCLOSURE)
-      pool->rays_enclosure += count_path_rays(p);
-    else if(bkt == RAY_BUCKET_SHADOW)
+    if(bkt == RAY_BUCKET_SHADOW)
       pool->rays_shadow += count_path_rays(p);
     else if(bkt == RAY_BUCKET_STARTUP)
       pool->rays_startup += count_path_rays(p);
@@ -711,7 +693,7 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool)
     }
 
     /* --- Ray 1 (2-ray request: delta_sphere or reinjection) --- */
-    if(p->ray_req.ray_count >= 2 && p->ray_count_ext != 6) {
+    if(p->ray_req.ray_count >= 2) {
       size_t ray_idx = cursor[bkt]++;
       struct s3d_ray_request* rr = &pool->ray_requests[ray_idx];
       rr->origin[0]    = p->ray_req.origin[0];
@@ -733,47 +715,68 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool)
       pool->ray_slot_sub[ray_idx] = 1;
       p->ray_req.batch_idx2 = (uint32_t)ray_idx;
     }
-
-    /* --- B-4 M1: 6-ray enclosure query --- */
-    if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT) {
-      int j;
-      /* Overwrite ray 0 with enc direction 0 */
-      {
-        struct s3d_ray_request* rr =
-          &pool->ray_requests[p->ray_req.batch_idx];
-        rr->direction[0] = p->enc_query.directions[0][0];
-        rr->direction[1] = p->enc_query.directions[0][1];
-        rr->direction[2] = p->enc_query.directions[0][2];
-        rr->range[0]     = p->ray_req.range[0];
-        rr->range[1]     = p->ray_req.range[1];
-        rr->filter_data  = NULL;
-      }
-      p->enc_query.batch_indices[0] = p->ray_req.batch_idx;
-
-      /* Emit directions 1..5 */
-      for(j = 1; j < 6; j++) {
-        size_t ray_idx = cursor[bkt]++;
-        struct s3d_ray_request* rr = &pool->ray_requests[ray_idx];
-        rr->origin[0]    = p->ray_req.origin[0];
-        rr->origin[1]    = p->ray_req.origin[1];
-        rr->origin[2]    = p->ray_req.origin[2];
-        rr->direction[0] = p->enc_query.directions[j][0];
-        rr->direction[1] = p->enc_query.directions[j][1];
-        rr->direction[2] = p->enc_query.directions[j][2];
-        rr->range[0]     = p->ray_req.range[0];
-        rr->range[1]     = p->ray_req.range[1];
-        rr->filter_data  = NULL;
-        rr->user_id      = i;
-
-        pool->ray_to_slot[ray_idx] = i;
-        pool->ray_slot_sub[ray_idx] = (uint32_t)j;
-        p->enc_query.batch_indices[j] = (uint32_t)ray_idx;
-      }
-    }
   }
 
   /* Total ray count = end of last bucket */
   pool->ray_count = pool->bucket_offsets[RAY_BUCKET_COUNT];
+  return RES_OK;
+}
+
+/*******************************************************************************
+ * B-4 M10: Collect enc_locate requests from paths in PATH_ENC_LOCATE_PENDING
+ *
+ * Scans active paths for PATH_ENC_LOCATE_PENDING and fills the
+ * enc_locate_requests array.  The requests are then dispatched as a
+ * single GPU batch via s3d_scene_view_find_enclosure_batch_ctx.
+ ******************************************************************************/
+LOCAL_SYM res_T
+pool_collect_enc_locate_requests(struct wavefront_pool* pool)
+{
+  size_t k, n = 0;
+
+  for(k = 0; k < pool->active_compact; k++) {
+    uint32_t i = pool->active_indices[k];
+    struct path_state* p = &pool->slots[i];
+
+    if(p->phase == PATH_ENC_LOCATE_PENDING) {
+      struct s3d_enc_locate_request* req = &pool->enc_locate_requests[n];
+      req->pos[0] = (float)p->enc_locate.query_pos[0];
+      req->pos[1] = (float)p->enc_locate.query_pos[1];
+      req->pos[2] = (float)p->enc_locate.query_pos[2];
+      req->user_id = i;
+      pool->enc_locate_to_slot[n] = i;
+      p->enc_locate.batch_idx = (uint32_t)n;
+      n++;
+    }
+  }
+
+  pool->enc_locate_count = n;
+  return RES_OK;
+}
+
+/*******************************************************************************
+ * B-4 M10: Distribute enc_locate results back to paths
+ *
+ * For each enc_locate result, write prim_id/side/distance into the path's
+ * enc_locate struct, then transition to PATH_ENC_LOCATE_RESULT so the
+ * cascade loop can resolve enc_id via step_enc_locate_result.
+ ******************************************************************************/
+static res_T
+pool_distribute_enc_locate_results(struct wavefront_pool* pool)
+{
+  size_t k;
+
+  for(k = 0; k < pool->enc_locate_count; k++) {
+    uint32_t slot_id = pool->enc_locate_to_slot[k];
+    struct path_state* p = &pool->slots[slot_id];
+    const struct s3d_enc_locate_result* r = &pool->enc_locate_results[k];
+
+    p->enc_locate.prim_id  = r->prim_id;
+    p->enc_locate.side     = r->side;
+    p->enc_locate.distance = r->distance;
+    p->phase = PATH_ENC_LOCATE_RESULT;
+  }
+
   return RES_OK;
 }
 
@@ -783,20 +786,6 @@ pool_distribute_ray_results(struct wavefront_pool* pool, struct sdis_scene* scn)
   size_t k;
   res_T res = RES_OK;
   size_t bucket_other_n = 0;
-
-  /* ---- Phase 0 (B-4 M1): Pre-deliver ENC 6-ray results ---- */
-  /* Before dispatching any step functions, copy all 6 directional hit
-   * results into enc_query.dir_hits[] for any path in ENC_QUERY_EMIT. */
-  for(k = 0; k < pool->need_ray_count; k++) {
-    uint32_t i = pool->need_ray_indices[k];
-    struct path_state* p = &pool->slots[i];
-    if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6) {
-      int j;
-      for(j = 0; j < 6; j++) {
-        p->enc_query.dir_hits[j] = pool->ray_hits[p->enc_query.batch_indices[j]];
-      }
-    }
-  }
 
   /* ---- Phase 1: Radiative paths (1 ray each) ---- */
   for(k = 0; k < pool->bucket_radiative_n; k++) {
@@ -906,6 +895,8 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
         break;
       }
       if(path_phase_is_ray_pending(p->phase)) break;
+      /* M10: also break on enc_locate-pending phases */
+      if(path_phase_is_enc_locate_pending(p->phase)) break;
 
       res = advance_one_step_no_ray(p, scn, &advanced);
       if(res != RES_OK && res != RES_BAD_OP
@@ -1096,7 +1087,7 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     "  refill_phase: rays=%lu (%.1f%%)  wall=%.3fs\n"
     "  drain_phase:  rays=%lu (%.1f%%)  steps=%lu  wall=%.3fs\n"
     "  batch_size: min=%lu, max=%lu\n"
-    "  ray_buckets: radiative=%lu, step_pair=%lu, enclosure=%lu, "
+    "  ray_buckets: radiative=%lu, step_pair=%lu, "
     "shadow=%lu, startup=%lu\n"
     "  paths: completed=%lu, failed=%lu, truncated=%lu, max_depth=%lu\n"
     "  refills=%lu\n"
@@ -1117,7 +1108,6 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     (unsigned long)pool->diag_max_batch,
     (unsigned long)pool->rays_radiative,
     (unsigned long)pool->rays_conductive_ds,
-    (unsigned long)pool->rays_enclosure,
     (unsigned long)pool->rays_shadow,
     (unsigned long)pool->rays_startup,
     (unsigned long)pool->paths_completed,
@@ -1259,6 +1249,15 @@ solve_camera_persistent_wavefront(
     goto cleanup;
   }
 
+  /* ====== 4b. Create batch enc_locate context (M10) ====== */
+  res = s3d_batch_enc_context_create(&pool.enc_batch_ctx, pool.max_enc_locates);
+  if(res != RES_OK) {
+    log_err(scn->dev,
+      "persistent_wavefront: enc_batch_ctx creation failed for %lu queries -- %s\n",
+      (unsigned long)pool.max_enc_locates, res_to_cstr(res));
+    goto cleanup;
+  }
+
   /* ====== 5. Cache scene params for refill ====== */
   pool.scn          = scn;
   pool.enc_id       = enc_id;
@@ -1325,6 +1324,33 @@ solve_camera_persistent_wavefront(
     time_current(&t_phase1);
     pool.time_distribute_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
+    /* Step D2 (M10): Collect + dispatch + distribute enc_locate batch */
+    time_current(&t_phase0);
+    res = pool_collect_enc_locate_requests(&pool);
+    if(res != RES_OK) goto cleanup;
+
+    if(pool.enc_locate_count > 0) {
+      struct s3d_batch_enc_stats enc_stats;
+      memset(&enc_stats, 0, sizeof(enc_stats));
+
+      res = s3d_scene_view_find_enclosure_batch_ctx(
+        scn->s3d_view, pool.enc_batch_ctx,
+        pool.enc_locate_requests, pool.enc_locate_count,
+        pool.enc_locate_results, &enc_stats);
+      if(res != RES_OK) goto cleanup;
+
+      /* Distribute prim_id + side to paths; enc_id resolution happens
+       * in step_enc_locate_result() during cascade (handles degenerate). */
+      res = pool_distribute_enc_locate_results(&pool);
+      if(res != RES_OK) goto cleanup;
+
+      pool.enc_locates_total += pool.enc_locate_count;
+      pool.enc_locates_resolved += enc_stats.resolved;
+      pool.enc_locates_degenerate += enc_stats.degenerate;
+    }
+    time_current(&t_phase1);
+    pool.time_enc_locate_s += time_elapsed_sec(&t_phase0, &t_phase1);
+
     /* Step E: Cascade non-ray steps (compact) */
     time_current(&t_phase0);
     res = pool_cascade_non_ray_steps_compact(&pool, scn);
@@ -1389,7 +1415,7 @@ solve_camera_persistent_wavefront(
      && pool.active_count > 0)) {
       log_info(scn->dev,
         "persistent_wavefront step %lu: %lu/%lu active, "
-        "%lu rays this step (rad=%lu ds=%lu enc=%lu shd=%lu st=%lu), "
+        "%lu rays this step (rad=%lu ds=%lu shd=%lu st=%lu), "
         "%lu/%lu tasks done, %s\n",
         (unsigned long)pool.total_steps,
         (unsigned long)pool.active_count,
@@ -1397,7 +1423,6 @@ solve_camera_persistent_wavefront(
         (unsigned long)pool.ray_count,
         (unsigned long)pool.bucket_counts[RAY_BUCKET_RADIATIVE],
         (unsigned long)pool.bucket_counts[RAY_BUCKET_STEP_PAIR],
-        (unsigned long)pool.bucket_counts[RAY_BUCKET_ENCLOSURE],
         (unsigned long)pool.bucket_counts[RAY_BUCKET_SHADOW],
         (unsigned long)pool.bucket_counts[RAY_BUCKET_STARTUP],
         (unsigned long)(pool.paths_completed + pool.paths_failed),

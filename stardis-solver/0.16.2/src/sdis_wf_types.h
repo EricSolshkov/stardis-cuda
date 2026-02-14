@@ -120,9 +120,9 @@ enum path_phase {
   PATH_CNV_STARTUP_RESULT,                /* [C] startup result         [B4-FUTURE] */
   PATH_CNV_SAMPLE_LOOP,                   /* [C] null-collision loop    [B4-FUTURE] */
 
-  /* === B-4: Enclosure query sub-state machine === */
-  PATH_ENC_QUERY_EMIT,                    /* [R] emit 6 directional rays[B4-FUTURE] */
-  PATH_ENC_QUERY_RESOLVE,                 /* [C] resolve 6 hits -> enc_id[B4-FUTURE]*/
+  /* === B-4 M10: Point-in-enclosure via BVH closest primitive === */
+  PATH_ENC_LOCATE_PENDING,                /* [E] enc_locate batch pending */
+  PATH_ENC_LOCATE_RESULT,                 /* [C] enc_locate result ready  */
 
   /* === Terminal === */
   PATH_DONE,                               /* path finished              */
@@ -138,7 +138,6 @@ enum path_phase {
 enum ray_bucket_type {
   RAY_BUCKET_RADIATIVE,       /* long-range random direction, range=[e,inf)  */
   RAY_BUCKET_STEP_PAIR,       /* short-range opposing rays (delta-sphere)    */
-  RAY_BUCKET_ENCLOSURE,       /* 6 fixed-direction family, range=[e,inf)     */
   RAY_BUCKET_SHADOW,          /* fixed-distance shadow ray, range=[0,dist]   */
   RAY_BUCKET_STARTUP,         /* single-direction probe ray                  */
   RAY_BUCKET_COUNT
@@ -173,11 +172,21 @@ path_phase_is_ray_pending(enum path_phase ph)
   case PATH_CND_WOS_CLOSEST:
   case PATH_CND_WOS_FALLBACK_TRACE:
   case PATH_CNV_STARTUP_TRACE:
-  case PATH_ENC_QUERY_EMIT:
     return 1;
   default:
     return 0;
   }
+}
+
+/*******************************************************************************
+ * path_phase_is_enc_locate_pending — returns 1 if the path is waiting for a
+ * batch enc_locate result (M10).  These paths participate in the enc_locate
+ * collect/distribute cycle, NOT the ray trace cycle.
+ ******************************************************************************/
+static INLINE int
+path_phase_is_enc_locate_pending(enum path_phase ph)
+{
+  return ph == PATH_ENC_LOCATE_PENDING;
 }
 
 #endif /* SDIS_WF_TYPES_H */

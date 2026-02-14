@@ -270,15 +270,16 @@ struct path_state {
     enum path_phase return_state;      /* resume state after flux done     */
   } ext_flux;
 
-  /* --- B-4: Enclosure query sub-state (M1) --- */
+  /* --- B-4 M10: Point-in-enclosure via BVH closest primitive --- */
   struct {
-    float   directions[6][3];          /* 6 rotated axis directions        */
-    struct s3d_hit dir_hits[6];        /* 6 directional ray results        */
-    uint32_t batch_indices[6];         /* batch array index per direction   */
-    enum path_phase return_state;      /* resume state after ENC done      */
-    unsigned resolved_enc_id;          /* result enclosure id              */
-    double   query_pos[3];            /* position used for query           */
-  } enc_query;
+    double   query_pos[3];            /* position for enclosure locate     */
+    enum path_phase return_state;     /* resume state after locate done    */
+    unsigned resolved_enc_id;         /* result enclosure id               */
+    int32_t  prim_id;                 /* closest prim from GPU kernel      */
+    int32_t  side;                    /* 0=front, 1=back, -1=degenerate    */
+    float    distance;                /* distance to closest surface       */
+    uint32_t batch_idx;               /* index in enc_locate batch         */
+  } enc_locate;
 
   /* --- B-4: PicardN recursive stack --- */
   struct {

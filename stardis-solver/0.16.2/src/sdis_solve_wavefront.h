@@ -69,6 +69,14 @@ struct wavefront_context {
   /* Pre-allocated batch trace context (Phase B-1) */
   struct s3d_batch_trace_context* batch_ctx;
 
+  /* B-4 M10: enc_locate batch buffers */
+  struct s3d_batch_enc_context*  enc_batch_ctx;
+  struct s3d_enc_locate_request* enc_locate_requests;
+  struct s3d_enc_locate_result*  enc_locate_results;
+  uint32_t*                      enc_locate_to_path;
+  size_t                         enc_locate_count;
+  size_t                         max_enc_locates;
+
   /* Per-path RNG array (allocated once) */
   /* (each path stores a non-owning pointer to the shared per-thread RNG) */
 

@@ -132,6 +132,14 @@ struct wavefront_pool {
   /* --- Batch trace context (Phase B-1) --- */
   struct s3d_batch_trace_context* batch_ctx;
 
+  /* --- Batch enc_locate context (Phase B-4 M10) --- */
+  struct s3d_batch_enc_context* enc_batch_ctx;
+  struct s3d_enc_locate_request* enc_locate_requests;
+  struct s3d_enc_locate_result*  enc_locate_results;
+  uint32_t* enc_locate_to_slot;  /* enc_locate index → slot mapping */
+  size_t    enc_locate_count;    /* queries this step */
+  size_t    max_enc_locates;     /* pool_size */
+
   /* --- Drain phase control (M2) --- */
   int                 in_drain_phase;  /* 1 = task_queue exhausted          */
   size_t              drain_step_count;/* steps taken in drain phase        */
@@ -148,7 +156,6 @@ struct wavefront_pool {
   size_t rays_radiative;
   size_t rays_conductive_ds;
   size_t rays_conductive_ds_retry;
-  size_t rays_enclosure;
   size_t rays_shadow;
   size_t rays_startup;
   size_t paths_done_radiative;
@@ -161,6 +168,12 @@ struct wavefront_pool {
   size_t diag_refill_count; /* total refill operations               */
   size_t diag_drain_rays;   /* rays traced during drain phase        */
   size_t diag_refill_rays;  /* rays traced during refill phase       */
+
+  /* M10: enc_locate batch stats (cumulative) */
+  size_t enc_locates_total;  /* total enc_locate queries dispatched   */
+  size_t enc_locates_resolved; /* successfully resolved                */
+  size_t enc_locates_degenerate; /* degenerate fallbacks               */
+  double time_enc_locate_s;  /* cumulative enc_locate batch time      */
 
   /* M3: Per-phase wall-clock timing (seconds) */
   double time_collect_s;    /* cumulative collect_ray_requests time  */
@@ -189,13 +202,15 @@ struct wavefront_pool {
 static INLINE size_t
 count_path_rays(const struct path_state* p)
 {
-  if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT)
-    return 6;
   return (size_t)p->ray_req.ray_count;
 }
 
 extern LOCAL_SYM res_T
 pool_collect_ray_requests_bucketed(struct wavefront_pool* pool);
+
+/* B-4 M10: Collect enc_locate requests from paths in PATH_ENC_LOCATE_PENDING */
+extern LOCAL_SYM res_T
+pool_collect_enc_locate_requests(struct wavefront_pool* pool);
 
 /* ============================================================================
  * Public API

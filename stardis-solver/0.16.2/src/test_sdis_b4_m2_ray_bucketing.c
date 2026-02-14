@@ -134,37 +134,6 @@ configure_path_delta_sphere(struct path_state* p, uint32_t slot_idx)
 }
 
 static void
-configure_path_enclosure(struct path_state* p, uint32_t slot_idx)
-{
-  int j;
-  float dirs[6][3] = {
-    { 1, 0, 0}, {-1, 0, 0},
-    { 0, 1, 0}, { 0,-1, 0},
-    { 0, 0, 1}, { 0, 0,-1}
-  };
-  memset(p, 0, sizeof(*p));
-  p->active = 1;
-  p->needs_ray = 1;
-  p->phase = PATH_ENC_QUERY_EMIT;
-  p->ray_req.origin[0] = (float)slot_idx * 0.1f;
-  p->ray_req.origin[1] = 2.0f;
-  p->ray_req.origin[2] = 0.0f;
-  p->ray_req.direction[0] = dirs[0][0];
-  p->ray_req.direction[1] = dirs[0][1];
-  p->ray_req.direction[2] = dirs[0][2];
-  p->ray_req.range[0] = FLT_MIN;
-  p->ray_req.range[1] = FLT_MAX;
-  p->ray_req.ray_count = 1;
-  p->ray_bucket = RAY_BUCKET_ENCLOSURE;
-  p->ray_count_ext = 6;
-  for(j = 0; j < 6; j++) {
-    p->enc_query.directions[j][0] = dirs[j][0];
-    p->enc_query.directions[j][1] = dirs[j][1];
-    p->enc_query.directions[j][2] = dirs[j][2];
-  }
-}
-
-static void
 configure_path_shadow(struct path_state* p, uint32_t slot_idx)
 {
   memset(p, 0, sizeof(*p));
@@ -208,14 +177,14 @@ configure_path_startup(struct path_state* p, uint32_t slot_idx)
 /* ========================================================================== */
 /* T2.1: Bucket count verification                                            */
 /*                                                                            */
-/* Construct: 20 RAD + 10 DS + 5 ENC = 35 paths                              */
-/* Expected rays: RAD=20, DS=20 (10×2), ENC=30 (5×6) = 70 total             */
+/* Construct: 20 RAD + 10 DS = 30 paths                                      */
+/* Expected rays: RAD=20, DS=20 (10×2) = 40 total                            */
 /* ========================================================================== */
 static void
 test_bucket_counts(void)
 {
   struct wavefront_pool pool;
-  size_t pool_size = 35;
+  size_t pool_size = 30;
   size_t i;
 
   printf("  T2.1: bucket count verification... ");
@@ -228,9 +197,6 @@ test_bucket_counts(void)
   /* Configure 10 delta-sphere */
   for(i = 20; i < 30; i++)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
-  /* Configure 5 enclosure */
-  for(i = 30; i < 35; i++)
-    configure_path_enclosure(&pool.slots[i], (uint32_t)i);
 
   /* Build need_ray_indices manually (compact_active_paths equivalent) */
   pool.need_ray_count = 0;
@@ -240,7 +206,7 @@ test_bucket_counts(void)
       pool.need_ray_indices[pool.need_ray_count++] = (uint32_t)i;
     }
   }
-  CHK(pool.need_ray_count == 35);
+  CHK(pool.need_ray_count == 30);
 
   /* Run bucketed collect */
   pool_collect_ray_requests_bucketed(&pool);
@@ -248,12 +214,11 @@ test_bucket_counts(void)
   /* Verify bucket counts */
   CHK(pool.bucket_counts[RAY_BUCKET_RADIATIVE] == 20);
   CHK(pool.bucket_counts[RAY_BUCKET_STEP_PAIR] == 20);
-  CHK(pool.bucket_counts[RAY_BUCKET_ENCLOSURE] == 30);
   CHK(pool.bucket_counts[RAY_BUCKET_SHADOW]    == 0);
   CHK(pool.bucket_counts[RAY_BUCKET_STARTUP]   == 0);
 
   /* Verify total ray count */
-  CHK(pool.ray_count == 70);
+  CHK(pool.ray_count == 40);
 
   teardown_test_pool(&pool);
   printf("PASS\n");
@@ -268,7 +233,7 @@ static void
 test_bucket_offset_continuity(void)
 {
   struct wavefront_pool pool;
-  size_t pool_size = 35;
+  size_t pool_size = 30;
   size_t i, b;
 
   printf("  T2.2: bucket offset continuity... ");
@@ -280,8 +245,6 @@ test_bucket_offset_continuity(void)
     configure_path_radiative(&pool.slots[i], (uint32_t)i);
   for(i = 20; i < 30; i++)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
-  for(i = 30; i < 35; i++)
-    configure_path_enclosure(&pool.slots[i], (uint32_t)i);
 
   pool.need_ray_count = 0;
   for(i = 0; i < pool_size; i++) {
@@ -319,7 +282,7 @@ static void
 test_ray_to_slot_mapping(void)
 {
   struct wavefront_pool pool;
-  size_t pool_size = 35;
+  size_t pool_size = 30;
   size_t i;
 
   printf("  T2.3: ray_to_slot mapping completeness... ");
@@ -330,8 +293,6 @@ test_ray_to_slot_mapping(void)
     configure_path_radiative(&pool.slots[i], (uint32_t)i);
   for(i = 20; i < 30; i++)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
-  for(i = 30; i < 35; i++)
-    configure_path_enclosure(&pool.slots[i], (uint32_t)i);
 
   pool.need_ray_count = 0;
   for(i = 0; i < pool_size; i++) {
@@ -363,7 +324,7 @@ static void
 test_batch_idx_roundtrip(void)
 {
   struct wavefront_pool pool;
-  size_t pool_size = 35;
+  size_t pool_size = 30;
   size_t i;
 
   printf("  T2.3b: batch_idx roundtrip... ");
@@ -374,8 +335,6 @@ test_batch_idx_roundtrip(void)
     configure_path_radiative(&pool.slots[i], (uint32_t)i);
   for(i = 20; i < 30; i++)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
-  for(i = 30; i < 35; i++)
-    configure_path_enclosure(&pool.slots[i], (uint32_t)i);
 
   pool.need_ray_count = 0;
   for(i = 0; i < pool_size; i++) {
@@ -397,19 +356,10 @@ test_batch_idx_roundtrip(void)
     CHK(pool.ray_slot_sub[p->ray_req.batch_idx] == 0);
 
     /* Ray 1 (delta_sphere) */
-    if(p->ray_req.ray_count >= 2 && p->ray_count_ext != 6) {
+    if(p->ray_req.ray_count >= 2) {
       CHK(p->ray_req.batch_idx2 < (uint32_t)pool.ray_count);
       CHK(pool.ray_to_slot[p->ray_req.batch_idx2] == (uint32_t)i);
       CHK(pool.ray_slot_sub[p->ray_req.batch_idx2] == 1);
-    }
-
-    /* ENC 6 rays */
-    if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT) {
-      int j;
-      for(j = 0; j < 6; j++) {
-        CHK(p->enc_query.batch_indices[j] < (uint32_t)pool.ray_count);
-        CHK(pool.ray_to_slot[p->enc_query.batch_indices[j]] == (uint32_t)i);
-      }
     }
   }
 
@@ -427,7 +377,7 @@ static void
 test_bucket_contiguity(void)
 {
   struct wavefront_pool pool;
-  size_t pool_size = 35;
+  size_t pool_size = 30;
   size_t i, b;
 
   printf("  T2.4b: bucket contiguity... ");
@@ -438,8 +388,6 @@ test_bucket_contiguity(void)
     configure_path_radiative(&pool.slots[i], (uint32_t)i);
   for(i = 20; i < 30; i++)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
-  for(i = 30; i < 35; i++)
-    configure_path_enclosure(&pool.slots[i], (uint32_t)i);
 
   pool.need_ray_count = 0;
   for(i = 0; i < pool_size; i++) {
@@ -466,18 +414,18 @@ test_bucket_contiguity(void)
 }
 
 /* ========================================================================== */
-/* T2.5b: All 5 bucket types present                                          */
+/* T2.5b: All 4 bucket types present                                          */
 /*                                                                            */
-/* Create paths of all 5 types and verify counts.                             */
+/* Create paths of all 4 types and verify counts.                             */
 /* ========================================================================== */
 static void
 test_all_bucket_types(void)
 {
   struct wavefront_pool pool;
-  size_t pool_size = 50;
+  size_t pool_size = 40;
   size_t i;
 
-  printf("  T2.5b: all 5 bucket types... ");
+  printf("  T2.5b: all 4 bucket types... ");
 
   setup_test_pool(&pool, pool_size);
 
@@ -487,10 +435,8 @@ test_all_bucket_types(void)
   for(i = 10; i < 20; i++)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
   for(i = 20; i < 30; i++)
-    configure_path_enclosure(&pool.slots[i], (uint32_t)i);
-  for(i = 30; i < 40; i++)
     configure_path_shadow(&pool.slots[i], (uint32_t)i);
-  for(i = 40; i < 50; i++)
+  for(i = 30; i < 40; i++)
     configure_path_startup(&pool.slots[i], (uint32_t)i);
 
   pool.need_ray_count = 0;
@@ -499,17 +445,16 @@ test_all_bucket_types(void)
     if(p->active && p->needs_ray && p->ray_req.ray_count >= 1)
       pool.need_ray_indices[pool.need_ray_count++] = (uint32_t)i;
   }
-  CHK(pool.need_ray_count == 50);
+  CHK(pool.need_ray_count == 40);
 
   pool_collect_ray_requests_bucketed(&pool);
 
-  /* RAD=10, DS=20, ENC=60, SHADOW=10, STARTUP=10 = 110 total */
+  /* RAD=10, DS=20, SHADOW=10, STARTUP=10 = 50 total */
   CHK(pool.bucket_counts[RAY_BUCKET_RADIATIVE] == 10);
   CHK(pool.bucket_counts[RAY_BUCKET_STEP_PAIR] == 20);
-  CHK(pool.bucket_counts[RAY_BUCKET_ENCLOSURE] == 60);
   CHK(pool.bucket_counts[RAY_BUCKET_SHADOW]    == 10);
   CHK(pool.bucket_counts[RAY_BUCKET_STARTUP]   == 10);
-  CHK(pool.ray_count == 110);
+  CHK(pool.ray_count == 50);
 
   /* Verify contiguity for all buckets */
   {
@@ -580,7 +525,6 @@ test_single_bucket_only(void)
 
   CHK(pool.bucket_counts[RAY_BUCKET_RADIATIVE] == 100);
   CHK(pool.bucket_counts[RAY_BUCKET_STEP_PAIR] == 0);
-  CHK(pool.bucket_counts[RAY_BUCKET_ENCLOSURE] == 0);
   CHK(pool.ray_count == 100);
 
   /* All rays in the radiative bucket range */
@@ -598,7 +542,7 @@ static void
 test_diagnostic_stats(void)
 {
   struct wavefront_pool pool;
-  size_t pool_size = 35;
+  size_t pool_size = 30;
   size_t i;
 
   printf("  T2.8: diagnostic stats... ");
@@ -609,8 +553,6 @@ test_diagnostic_stats(void)
     configure_path_radiative(&pool.slots[i], (uint32_t)i);
   for(i = 20; i < 30; i++)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
-  for(i = 30; i < 35; i++)
-    configure_path_enclosure(&pool.slots[i], (uint32_t)i);
 
   pool.need_ray_count = 0;
   for(i = 0; i < pool_size; i++) {
@@ -622,7 +564,6 @@ test_diagnostic_stats(void)
   /* Reset stats */
   pool.rays_radiative = 0;
   pool.rays_conductive_ds = 0;
-  pool.rays_enclosure = 0;
   pool.rays_shadow = 0;
   pool.rays_startup = 0;
 
@@ -630,7 +571,6 @@ test_diagnostic_stats(void)
 
   CHK(pool.rays_radiative == 20);
   CHK(pool.rays_conductive_ds == 20);
-  CHK(pool.rays_enclosure == 30);
   CHK(pool.rays_shadow == 0);
   CHK(pool.rays_startup == 0);
 

@@ -83,6 +83,20 @@ wf_context_create(struct wavefront_context* wf, size_t total_paths)
   || !wf->ray_slot     || !wf->ray_hits) {
     return RES_MEM_ERR;
   }
+
+  /* B-4 M10: enc_locate batch buffers */
+  wf->max_enc_locates = total_paths;
+  wf->enc_locate_requests = (struct s3d_enc_locate_request*)malloc(
+    total_paths * sizeof(struct s3d_enc_locate_request));
+  wf->enc_locate_results = (struct s3d_enc_locate_result*)malloc(
+    total_paths * sizeof(struct s3d_enc_locate_result));
+  wf->enc_locate_to_path = (uint32_t*)malloc(
+    total_paths * sizeof(uint32_t));
+  if(!wf->enc_locate_requests || !wf->enc_locate_results
+  || !wf->enc_locate_to_path) {
+    return RES_MEM_ERR;
+  }
+
   return RES_OK;
 }
 
@@ -91,11 +105,15 @@ wf_context_destroy(struct wavefront_context* wf)
 {
   if(!wf) return;
   if(wf->batch_ctx)    s3d_batch_trace_context_destroy(wf->batch_ctx);
+  if(wf->enc_batch_ctx) s3d_batch_enc_context_destroy(wf->enc_batch_ctx);
   free(wf->paths);
   free(wf->ray_requests);
   free(wf->ray_to_path);
   free(wf->ray_slot);
   free(wf->ray_hits);
+  free(wf->enc_locate_requests);
+  free(wf->enc_locate_results);
+  free(wf->enc_locate_to_path);
   memset(wf, 0, sizeof(*wf));
 }
 
@@ -288,7 +306,7 @@ collect_ray_requests(struct wavefront_context* wf)
     }
 
     /* Ray 1 (if 2-ray request) */
-    if(p->ray_req.ray_count >= 2 && p->ray_count_ext != 6) {
+    if(p->ray_req.ray_count >= 2) {
       struct s3d_ray_request* rr = &wf->ray_requests[ray_idx];
       rr->origin[0]    = p->ray_req.origin[0];
       rr->origin[1]    = p->ray_req.origin[1];
@@ -368,45 +386,6 @@ collect_ray_requests(struct wavefront_context* wf)
       }
       (void)j;
     }
-
-    /* B-4 M1: 6-ray enclosure query.
-     * Emit all 6 directional rays from enc_query.directions[].
-     * Ray 0 was already emitted above (using direction[0] from ray_req);
-     * we replace it and emit all 6 here for clarity. */
-    if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT) {
-      int j;
-      /* Overwrite ray 0 with enc direction 0 (ray_req.direction may differ) */
-      {
-        struct s3d_ray_request* rr = &wf->ray_requests[p->ray_req.batch_idx];
-        rr->direction[0] = p->enc_query.directions[0][0];
-        rr->direction[1] = p->enc_query.directions[0][1];
-        rr->direction[2] = p->enc_query.directions[0][2];
-        rr->range[0]     = p->ray_req.range[0];
-        rr->range[1]     = p->ray_req.range[1];
-        rr->filter_data  = NULL;
-      }
-      p->enc_query.batch_indices[0] = p->ray_req.batch_idx;
-
-      /* Emit directions 1..5 */
-      for(j = 1; j < 6; j++) {
-        struct s3d_ray_request* rr = &wf->ray_requests[ray_idx];
-        rr->origin[0]    = p->ray_req.origin[0];
-        rr->origin[1]    = p->ray_req.origin[1];
-        rr->origin[2]    = p->ray_req.origin[2];
-        rr->direction[0] = p->enc_query.directions[j][0];
-        rr->direction[1] = p->enc_query.directions[j][1];
-        rr->direction[2] = p->enc_query.directions[j][2];
-        rr->range[0]     = p->ray_req.range[0];
-        rr->range[1]     = p->ray_req.range[1];
-        rr->filter_data  = NULL;
-        rr->user_id      = (uint32_t)i;
-
-        wf->ray_to_path[ray_idx] = (uint32_t)i;
-        wf->ray_slot[ray_idx]    = (uint32_t)j;
-        p->enc_query.batch_indices[j] = (uint32_t)ray_idx;
-        ray_idx++;
-      }
-    }
   }
 
   wf->ray_count = ray_idx;
@@ -420,18 +399,11 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
   size_t r;
   res_T res = RES_OK;
 
-  /* First, deliver ray results to every path that requested rays.
-   * B-4 M1: pre-deliver 6-ray ENC results into enc_query.dir_hits[]. */
+  /* First, deliver ray results to every path that requested rays. */
   for(r = 0; r < wf->ray_count; r++) {
     uint32_t pid = wf->ray_to_path[r];
     uint32_t slot = wf->ray_slot[r];
     struct path_state* p = &wf->paths[pid];
-
-    /* B-4 M1: ENC 6-ray pre-delivery */
-    if(p->phase == PATH_ENC_QUERY_EMIT && slot < 6) {
-      p->enc_query.dir_hits[slot] = wf->ray_hits[r];
-      continue;
-    }
 
     /* B-4 M3: SS 4-ray pre-delivery */
     if(p->phase == PATH_BND_SS_REINJECT_SAMPLE && slot < 4) {
@@ -505,6 +477,8 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
 
         /* Skip ray-waiting phases */
         if(path_phase_is_ray_pending(p->phase)) break;
+        /* Skip enc_locate-waiting phases (M10) */
+        if(path_phase_is_enc_locate_pending(p->phase)) break;
 
         res = advance_one_step_no_ray(p, scn, &advanced);
         if(res != RES_OK && res != RES_BAD_OP
@@ -624,6 +598,10 @@ solve_tile_wavefront(
   res = s3d_batch_trace_context_create(&wf.batch_ctx, wf.max_rays);
   if(res != RES_OK) goto cleanup;
 
+  /* Create batch enc_locate context (M10) */
+  res = s3d_batch_enc_context_create(&wf.enc_batch_ctx, wf.max_enc_locates);
+  if(res != RES_OK) goto cleanup;
+
   /* ====== Initialise all paths ====== */
   res = init_all_paths(&wf, scn, base_rng, enc_id, cam, time_range,
                        tile_org, tile_size, spp, register_paths,
@@ -641,6 +619,7 @@ solve_tile_wavefront(
       while(p->active && !p->needs_ray
           && p->phase != PATH_DONE && p->phase != PATH_ERROR) {
         if(path_phase_is_ray_pending(p->phase)) break;
+        if(path_phase_is_enc_locate_pending(p->phase)) break;
 
         res = advance_one_step_no_ray(p, scn, &advanced);
         if(res != RES_OK && res != RES_BAD_OP
@@ -701,6 +680,79 @@ solve_tile_wavefront(
     res = distribute_and_advance(&wf, scn);
     if(res != RES_OK) 
         goto cleanup;
+
+    /* Step C2 (M10): Batch enc_locate for paths in PATH_ENC_LOCATE_PENDING */
+    {
+      size_t i, n = 0;
+      /* Collect enc_locate requests */
+      for(i = 0; i < wf.total_paths; i++) {
+        struct path_state* p = &wf.paths[i];
+        if(p->active && p->phase == PATH_ENC_LOCATE_PENDING) {
+          struct s3d_enc_locate_request* req = &wf.enc_locate_requests[n];
+          req->pos[0] = (float)p->enc_locate.query_pos[0];
+          req->pos[1] = (float)p->enc_locate.query_pos[1];
+          req->pos[2] = (float)p->enc_locate.query_pos[2];
+          req->user_id = (uint32_t)i;
+          wf.enc_locate_to_path[n] = (uint32_t)i;
+          p->enc_locate.batch_idx = (uint32_t)n;
+          n++;
+        }
+      }
+      wf.enc_locate_count = n;
+
+      if(n > 0) {
+        struct s3d_batch_enc_stats enc_stats;
+        memset(&enc_stats, 0, sizeof(enc_stats));
+
+        res = s3d_scene_view_find_enclosure_batch_ctx(
+          scn->s3d_view, wf.enc_batch_ctx,
+          wf.enc_locate_requests, n,
+          wf.enc_locate_results, &enc_stats);
+        if(res != RES_OK) goto cleanup;
+
+        /* Distribute prim_id + side to paths; enc_id resolution happens
+         * in step_enc_locate_result() during cascade (handles degenerate). */
+        for(i = 0; i < n; i++) {
+          uint32_t pid = wf.enc_locate_to_path[i];
+          struct path_state* p = &wf.paths[pid];
+          struct s3d_enc_locate_result* r = &wf.enc_locate_results[i];
+
+          p->enc_locate.prim_id  = r->prim_id;
+          p->enc_locate.side     = r->side;
+          p->enc_locate.distance = r->distance;
+          p->phase = PATH_ENC_LOCATE_RESULT;
+        }
+
+        /* Cascade non-ray steps for paths that just got enc_locate results */
+        for(i = 0; i < n; i++) {
+          uint32_t pid = wf.enc_locate_to_path[i];
+          struct path_state* p = &wf.paths[pid];
+          while(p->active && !p->needs_ray
+              && p->phase != PATH_DONE && p->phase != PATH_ERROR) {
+            int advanced = 0;
+            if(path_phase_is_ray_pending(p->phase)) break;
+            if(path_phase_is_enc_locate_pending(p->phase)) break;
+            res = advance_one_step_no_ray(p, scn, &advanced);
+            if(res != RES_OK && res != RES_BAD_OP
+            && res != RES_BAD_OP_IRRECOVERABLE) goto cleanup;
+            if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
+              p->phase = PATH_DONE;
+              p->active = 0;
+              p->done_reason = -1;
+              wf.paths_failed++;
+              res = RES_OK;
+              break;
+            }
+            if(!advanced) break;
+            if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
+              p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+              p->active = 1;
+            }
+            p->steps_taken++;
+          }
+        }
+      }
+    }
 
     /* Step D: Update active count */
     update_active_count(&wf);

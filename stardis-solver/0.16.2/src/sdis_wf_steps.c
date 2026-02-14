@@ -503,12 +503,9 @@ step_conductive(struct path_state* p, struct sdis_scene* scn)
 
   /* Initialization: first entry dispatches ENC sub-state */
   if(!p->ds_initialized) {
-    /* Emit 6-direction ENC query from current position.
-     * After resolve, PATH_CND_DS_CHECK_TEMP finalises init. */
-    d3_set(p->enc_query.query_pos, p->rwalk.vtx.P);
-    p->enc_query.return_state = PATH_CND_DS_CHECK_TEMP;
-    step_enc_query_emit(p);
-    /* phase = PATH_ENC_QUERY_EMIT, needs_ray = 1 */
+    /* Emit BVH enc_locate query from current position.
+     * After result, PATH_CND_DS_CHECK_TEMP finalises init. */
+    step_enc_locate_submit(p, p->rwalk.vtx.P, PATH_CND_DS_CHECK_TEMP);
     goto exit;
   }
 
@@ -605,7 +602,7 @@ step_conductive_ds_process(
     double pos_next[3];
     d3_set(pos_next, p->rwalk.vtx.P);
     move_pos_3d(pos_next, p->ds_dir0, delta);
-    d3_set(p->enc_query.query_pos, pos_next);
+    d3_set(p->enc_locate.query_pos, pos_next);
     p->phase = PATH_CND_DS_STEP_ENC_VERIFY;
     p->needs_ray = 0;
   } else {
@@ -631,7 +628,7 @@ step_conductive_ds_process(
       p->needs_ray = 0;
     } else {
       /* Match — store result for step_advance check and proceed */
-      p->enc_query.resolved_enc_id = enc_id;
+      p->enc_locate.resolved_enc_id = enc_id;
       p->phase = PATH_CND_DS_STEP_ADVANCE;
       p->needs_ray = 0;
     }
@@ -661,7 +658,7 @@ step_cnd_ds_check_temp(struct path_state* p, struct sdis_scene* scn)
 
   /* Finalize initialisation from ENC resolve (runs only once per entry) */
   if(!p->ds_initialized) {
-    unsigned enc_id = p->enc_query.resolved_enc_id;
+    unsigned enc_id = p->enc_locate.resolved_enc_id;
     struct sdis_medium* mdm = NULL;
 
     res = scene_get_enclosure_medium(
@@ -737,10 +734,8 @@ LOCAL_SYM void
 step_cnd_ds_step_enc_verify(struct path_state* p)
 {
   ASSERT(p);
-  /* enc_query.query_pos already set by step_conductive_ds_process */
-  p->enc_query.return_state = PATH_CND_DS_STEP_ADVANCE;
-  step_enc_query_emit(p);
-  /* phase = PATH_ENC_QUERY_EMIT, needs_ray = 1 */
+  /* enc_locate.query_pos already set by step_conductive_ds_process */
+  step_enc_locate_submit(p, p->enc_locate.query_pos, PATH_CND_DS_STEP_ADVANCE);
 }
 
 /* --- PATH_CND_DS_STEP_ADVANCE: enc check + volumic + time + pos + loop ---- */
@@ -756,10 +751,10 @@ step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn)
   ASSERT(p && scn);
 
   /* ------ Enclosure verification (handles both direct-hit and ENC sub) --- */
-  /* enc_query.resolved_enc_id is set by:
+  /* enc_locate.resolved_enc_id is set by:
    *   - step_conductive_ds_process (direct from hit primitive), or
-   *   - step_enc_query_resolve (from batched ENC sub-state).          */
-  if(p->enc_query.resolved_enc_id != p->ds_enc_id) {
+   *   - step_enc_locate_result (from batched BVH locate).             */
+  if(p->enc_locate.resolved_enc_id != p->ds_enc_id) {
     /* Enclosure mismatch — retry with new direction */
     p->ds_robust_attempt++;
     if(p->ds_robust_attempt >= 100) {
@@ -882,105 +877,62 @@ error:
 }
 
 /*******************************************************************************
- * B-4 M1: Enclosure query sub-state machine
+ * B-4 M10: Point-in-enclosure via BVH closest primitive
  ******************************************************************************/
 
-/* Emit 6 rotated axis-aligned rays for enclosure identification.
- * Mirrors sdis_scene_Xd.h:scene_get_enclosure_id_in_closed_boundaries_3d.
- * The rotation by PI/4 around each axis avoids alignment with mesh edges. */
+/* Submit a point-in-enclosure query.  Sets up enc_locate fields and
+ * transitions to PATH_ENC_LOCATE_PENDING.  The wavefront pool will
+ * collect these requests into a batch before the next GPU dispatch. */
 LOCAL_SYM void
-step_enc_query_emit(struct path_state* p)
+step_enc_locate_submit(struct path_state* p,
+                       const double pos[3],
+                       enum path_phase return_state)
 {
-  float dirs[6][3] = {
-    { 1, 0, 0}, {-1, 0, 0},
-    { 0, 1, 0}, { 0,-1, 0},
-    { 0, 0, 1}, { 0, 0,-1}
-  };
-  float frame[9];
-  float pos[3];
-  int i;
+  ASSERT(p && pos);
 
-  ASSERT(p);
+  p->enc_locate.query_pos[0] = pos[0];
+  p->enc_locate.query_pos[1] = pos[1];
+  p->enc_locate.query_pos[2] = pos[2];
+  p->enc_locate.return_state = return_state;
+  p->enc_locate.resolved_enc_id = ENCLOSURE_ID_NULL;
+  p->enc_locate.prim_id = -1;
+  p->enc_locate.side = -1;
+  p->enc_locate.distance = -1.0f;
+  p->enc_locate.batch_idx = (uint32_t)-1;
 
-  /* Build rotation frame identical to the original function */
-  f33_rotation(frame, (float)PI/4, (float)PI/4, (float)PI/4);
-
-  /* Rotate all 6 directions */
-  for(i = 0; i < 6; i++) {
-    f33_mulf3(dirs[i], frame, dirs[i]);
-    p->enc_query.directions[i][0] = dirs[i][0];
-    p->enc_query.directions[i][1] = dirs[i][1];
-    p->enc_query.directions[i][2] = dirs[i][2];
-  }
-
-  /* Set ray origin from query position */
-  pos[0] = (float)p->enc_query.query_pos[0];
-  pos[1] = (float)p->enc_query.query_pos[1];
-  pos[2] = (float)p->enc_query.query_pos[2];
-  p->ray_req.origin[0] = pos[0];
-  p->ray_req.origin[1] = pos[1];
-  p->ray_req.origin[2] = pos[2];
-
-  /* Range: same as original [FLT_MIN, FLT_MAX] */
-  p->ray_req.range[0] = FLT_MIN;
-  p->ray_req.range[1] = FLT_MAX;
-
-  /* Signal 6-ray extended request */
-  p->ray_req.ray_count = 1; /* base count for collect compatibility */
-  p->ray_count_ext = 6;
-  p->ray_bucket = RAY_BUCKET_ENCLOSURE;
-  p->needs_ray = 1;
-  p->phase = PATH_ENC_QUERY_EMIT;
+  p->needs_ray = 0;  /* NOT a ray request — enc_locate has its own batch */
+  p->phase = PATH_ENC_LOCATE_PENDING;
 }
 
-/* Resolve 6 directional hit results into an enclosure id.
- * Mirrors the original FOR_EACH(idir, 0, 6) loop + fallback logic. */
+/* Process the result of a batch enc_locate query.
+ * At this point enc_locate.prim_id and enc_locate.side have been filled
+ * by pool_distribute_enc_locate_results().  Resolve to enc_id. */
 LOCAL_SYM res_T
-step_enc_query_resolve(struct path_state* p, struct sdis_scene* scn)
+step_enc_locate_result(struct path_state* p, struct sdis_scene* scn)
 {
-  int i;
   unsigned enc_id = ENCLOSURE_ID_NULL;
-  res_T res = RES_OK;
-
   ASSERT(p && scn);
 
-  for(i = 0; i < 6; i++) {
-    const struct s3d_hit* hit = &p->enc_query.dir_hits[i];
-    float N[3];
-    float cos_N_dir;
-
-    if(S3D_HIT_NONE(hit)) continue;
-
-    f3_normalize(N, hit->normal);
-    cos_N_dir = f3_dot(N, p->enc_query.directions[i]);
-
-    /* Same thresholds as original: distance > 1e-6, |cos| > 0.01 */
-    if(hit->distance > 1.e-6f && fabsf(cos_N_dir) > 1.e-2f) {
-      unsigned enc_ids[2];
-      scene_get_enclosure_ids(scn, hit->prim.prim_id, enc_ids);
-      enc_id = cos_N_dir < 0 ? enc_ids[0] : enc_ids[1];
-      break; /* First valid hit determines enclosure */
-    }
-  }
-
-  if(i >= 6) {
-    /* All 6 directions failed -- fallback to brute-force traversal.
-     * This matches the original fallback to scene_get_enclosure_id(). */
-    res = scene_get_enclosure_id(scn, p->enc_query.query_pos, &enc_id);
-    /* Swallow RES_BAD_OP: matches scene_get_enclosure_id_in_closed_boundaries
-     * which returns enc_id=NULL on BAD_OP and lets caller decide to retry. */
+  if(p->enc_locate.prim_id >= 0 && p->enc_locate.side >= 0) {
+    /* Valid result: resolve prim_id + side → enc_id via prim_props */
+    unsigned enc_ids[2];
+    scene_get_enclosure_ids(scn, (unsigned)p->enc_locate.prim_id, enc_ids);
+    enc_id = enc_ids[p->enc_locate.side]; /* side 0=front, 1=back */
+  } else if(p->enc_locate.prim_id >= 0 && p->enc_locate.side < 0) {
+    /* Degenerate: point is ON a surface (distance < threshold).
+     * Fallback to brute-force scene_get_enclosure_id(). */
+    res_T res = scene_get_enclosure_id(scn, p->enc_locate.query_pos, &enc_id);
     if(res == RES_BAD_OP) {
       enc_id = ENCLOSURE_ID_NULL;
-      res = RES_OK;
-    }
-    if(res != RES_OK) {
-      p->enc_query.resolved_enc_id = ENCLOSURE_ID_NULL;
+    } else if(res != RES_OK) {
+      p->enc_locate.resolved_enc_id = ENCLOSURE_ID_NULL;
       return res;
     }
   }
+  /* else: prim_id < 0 → miss, enc_id stays ENCLOSURE_ID_NULL */
 
-  p->enc_query.resolved_enc_id = enc_id;
-  p->phase = p->enc_query.return_state;
+  p->enc_locate.resolved_enc_id = enc_id;
+  p->phase = p->enc_locate.return_state;
   return RES_OK;
 }
 
@@ -1438,10 +1390,8 @@ step_bnd_ss_reinject_process(
     d3_set(pos, p->rwalk.vtx.P);
     move_pos_3d(pos, p->locals.bnd_ss.reinject_dir_frt,
                 p->locals.bnd_ss.reinject_dst_frt);
-    d3_set(p->enc_query.query_pos, pos);
-    p->enc_query.return_state = PATH_BND_SS_REINJECT_ENC;
     p->locals.bnd_ss.enc_side = 0; /* front */
-    step_enc_query_emit(p);
+    step_enc_locate_submit(p, pos, PATH_BND_SS_REINJECT_ENC);
     return RES_OK;
   }
 
@@ -1452,10 +1402,8 @@ step_bnd_ss_reinject_process(
     d3_set(pos, p->rwalk.vtx.P);
     move_pos_3d(pos, p->locals.bnd_ss.reinject_dir_bck,
                 p->locals.bnd_ss.reinject_dst_bck);
-    d3_set(p->enc_query.query_pos, pos);
-    p->enc_query.return_state = PATH_BND_SS_REINJECT_ENC;
     p->locals.bnd_ss.enc_side = 1; /* back */
-    step_enc_query_emit(p);
+    step_enc_locate_submit(p, pos, PATH_BND_SS_REINJECT_ENC);
     return RES_OK;
   }
 
@@ -1481,7 +1429,7 @@ step_bnd_ss_reinject_enc_result(struct path_state* p, struct sdis_scene* scn)
 
   ASSERT(p && scn);
 
-  enc_id = p->enc_query.resolved_enc_id;
+  enc_id = p->enc_locate.resolved_enc_id;
 
   if(p->locals.bnd_ss.enc_side == 0) {
     /* Front side verification */
@@ -1499,10 +1447,8 @@ step_bnd_ss_reinject_enc_result(struct path_state* p, struct sdis_scene* scn)
       d3_set(pos, p->rwalk.vtx.P);
       move_pos_3d(pos, p->locals.bnd_ss.reinject_dir_bck,
                   p->locals.bnd_ss.reinject_dst_bck);
-      d3_set(p->enc_query.query_pos, pos);
-      p->enc_query.return_state = PATH_BND_SS_REINJECT_ENC;
       p->locals.bnd_ss.enc_side = 1; /* back */
-      step_enc_query_emit(p);
+      step_enc_locate_submit(p, pos, PATH_BND_SS_REINJECT_ENC);
       return RES_OK;
     }
   } else {
@@ -1982,9 +1928,7 @@ step_bnd_sf_reinject_process(
     d3_set(pos, p->rwalk.vtx.P);
     move_pos_3d(pos, p->locals.bnd_sf.chosen_dir,
                 p->locals.bnd_sf.chosen_dst);
-    d3_set(p->enc_query.query_pos, pos);
-    p->enc_query.return_state = PATH_BND_SF_REINJECT_ENC;
-    step_enc_query_emit(p);
+    step_enc_locate_submit(p, pos, PATH_BND_SF_REINJECT_ENC);
     return RES_OK;
   }
 
@@ -2010,21 +1954,21 @@ step_bnd_sf_reinject_enc_result(struct path_state* p, struct sdis_scene* scn)
   res_T res = RES_OK;
 
   ASSERT(p && scn);
-  enc_id = p->enc_query.resolved_enc_id;
+  enc_id = p->enc_locate.resolved_enc_id;
 
   if(enc_id != p->locals.bnd_sf.solid_enc_id) {
     /* Reinjection endpoint not in solid enclosure — retry */
     p->locals.bnd_sf.retry_count++;
-    // log_warn(scn->dev,
-    //   "M5_SF_ENC_RETRY retry=%d path=%u prim=%u pos=%g,%g,%g solid_enc=%u enc_resolved=%u dir=%g,%g,%g dst=%g\n",
-    //   p->locals.bnd_sf.retry_count, p->path_id,
-    //   p->rwalk.hit_3d.prim.prim_id,
-    //   SPLIT3(p->rwalk.vtx.P),
-    //   p->locals.bnd_sf.solid_enc_id, enc_id,
-    //   (double)p->locals.bnd_sf.chosen_dir[0],
-    //   (double)p->locals.bnd_sf.chosen_dir[1],
-    //   (double)p->locals.bnd_sf.chosen_dir[2],
-    //   (double)p->locals.bnd_sf.chosen_dst);
+     log_warn(scn->dev,
+       "M5_SF_ENC_RETRY retry=%d path=%u prim=%u pos=%g,%g,%g solid_enc=%u enc_resolved=%u dir=%g,%g,%g dst=%g\n",
+       p->locals.bnd_sf.retry_count, p->path_id,
+       p->rwalk.hit_3d.prim.prim_id,
+       SPLIT3(p->rwalk.vtx.P),
+       p->locals.bnd_sf.solid_enc_id, enc_id,
+       (double)p->locals.bnd_sf.chosen_dir[0],
+       (double)p->locals.bnd_sf.chosen_dir[1],
+       (double)p->locals.bnd_sf.chosen_dir[2],
+       (double)p->locals.bnd_sf.chosen_dst);
     if(p->locals.bnd_sf.retry_count >= 10) {
       log_warn(scn->dev,
         "M5_SF_ENC_FAIL path=%u px=%u,%u spp=%u steps=%zu prim=%u pos=%g,%g,%g solid_enc=%u enc_resolved=%u dir=%g,%g,%g dst=%g\n",
@@ -4512,13 +4456,16 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
   case PATH_CND_WOS_CLOSEST:
   case PATH_CND_WOS_FALLBACK_TRACE:
   case PATH_CNV_STARTUP_TRACE:
-  case PATH_ENC_QUERY_EMIT:
     /* B-4: ray-pending, cannot advance without ray */
     break;
 
-  /* --- B-4 M1: Enclosure query resolve (compute-only, activated) --- */
-  case PATH_ENC_QUERY_RESOLVE:
-    res = step_enc_query_resolve(p, scn);
+  /* B-4 M10: enc_locate-pending — cannot advance without enc_locate result */
+  case PATH_ENC_LOCATE_PENDING:
+    break;
+
+  /* --- B-4 M10: Enclosure locate result (compute-only, activated) --- */
+  case PATH_ENC_LOCATE_RESULT:
+    res = step_enc_locate_result(p, scn);
     *advanced = 1;
     break;
 
@@ -4715,13 +4662,6 @@ advance_one_step_with_ray(struct path_state* p, struct sdis_scene* scn,
     break;
   /* NOTE: PATH_CND_DS_STEP_ENC_VERIFY is compute-only (already handled by
    * advance_one_step_no_ray).  It must NOT appear here. */
-
-  /* --- B-4 M1: Enclosure query -- receive 6 ray results --- */
-  case PATH_ENC_QUERY_EMIT:
-    /* 6 hits already pre-delivered to enc_query.dir_hits[] by distribute.
-     * Transition to resolve phase (will be cascaded immediately). */
-    p->phase = PATH_ENC_QUERY_RESOLVE;
-    break;
 
   /* --- B-4 M6: Convective startup ray result --- */
   case PATH_CNV_STARTUP_TRACE:
