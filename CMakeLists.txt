@@ -118,8 +118,9 @@ load_module("rsys/0.15" "rsys v0.15 - Base runtime system" "REQUIRED")
 # Layer 2: Geometry & Sampling (4/11)
 # --------------------------------------------------------------------
 message(STATUS "")
-message(STATUS "--- Layer 2: Geometry & Sampling (3/11) ---")
+message(STATUS "--- Layer 2: Geometry & Sampling (4/11) ---")
 load_module("star-2d/0.7" "star-2d v0.7 (s2d) - 2D geometry" "REQUIRED")
+load_module("star-3dut/0.4" "star-3dut v0.4 (s3dut) - 3D utility meshes" "REQUIRED")
 # custar-3d replaces star-3d: standalone s3d target with cuBQL GPU backend
 load_module("custar-3d/0.10" "custar-3d v0.10 (s3d) - GPU-accelerated 3D (replaces star-3d)" "REQUIRED")
 load_module("star-sp/0.15" "star-sp v0.15 (ssp) - Sampling + Random123" "REQUIRED")

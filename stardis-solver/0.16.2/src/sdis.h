@@ -1675,6 +1675,20 @@ sdis_solve_probe
    const struct sdis_solve_probe_args* args,
    struct sdis_estimator** estimator);
 
+/* Wavefront (breadth-first) variant of sdis_solve_probe.
+ *
+ * Semantically identical to sdis_solve_probe — same input args / output
+ * estimator — but the Monte-Carlo realisations are advanced in lockstep
+ * using the wavefront execution model (batch ray-tracing).
+ *
+ * Intended for GPU acceleration and for validating wavefront / depth-first
+ * numerical equivalence. */
+SDIS_API res_T
+sdis_solve_wavefront_probe
+  (struct sdis_scene* scn,
+   const struct sdis_solve_probe_args* args,
+   struct sdis_estimator** estimator);
+
 SDIS_API res_T
 sdis_solve_probe_boundary
   (struct sdis_scene* scn,

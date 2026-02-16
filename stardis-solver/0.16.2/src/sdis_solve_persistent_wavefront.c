@@ -715,6 +715,33 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool)
       pool->ray_slot_sub[ray_idx] = 1;
       p->ray_req.batch_idx2 = (uint32_t)ray_idx;
     }
+
+    /* --- B-4 M1-v2: Rays 2..5 for 6-ray enclosure query --- */
+    if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT) {
+      int j;
+      /* Record batch indices for ray 0 and ray 1 (already emitted) */
+      p->enc_query.batch_indices[0] = p->ray_req.batch_idx;
+      p->enc_query.batch_indices[1] = p->ray_req.batch_idx2;
+
+      for(j = 2; j < 6; j++) {
+        size_t ray_idx = cursor[bkt]++;
+        struct s3d_ray_request* rr = &pool->ray_requests[ray_idx];
+        rr->origin[0]    = p->ray_req.origin[0];
+        rr->origin[1]    = p->ray_req.origin[1];
+        rr->origin[2]    = p->ray_req.origin[2];
+        rr->direction[0] = p->enc_query.directions[j][0];
+        rr->direction[1] = p->enc_query.directions[j][1];
+        rr->direction[2] = p->enc_query.directions[j][2];
+        rr->range[0]     = p->ray_req.range[0];
+        rr->range[1]     = p->ray_req.range[1];
+        rr->filter_data  = NULL;  /* no self-intersection filter */
+        rr->user_id      = i;
+
+        pool->ray_to_slot[ray_idx] = i;
+        pool->ray_slot_sub[ray_idx] = (uint32_t)j;
+        p->enc_query.batch_indices[j] = (uint32_t)ray_idx;
+      }
+    }
   }
 
   /* Total ray count = end of last bucket */
@@ -846,6 +873,19 @@ pool_distribute_ray_results(struct wavefront_pool* pool, struct sdis_scene* scn)
         const struct s3d_hit* h1 = NULL;
         if(p->ray_req.ray_count >= 2)
           h1 = &pool->ray_hits[p->ray_req.batch_idx2];
+
+        /* B-4 M1-v2: Pre-deliver 6-ray enc_query hits before advance */
+        if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6) {
+          int j;
+          for(j = 0; j < 6; j++) {
+            p->enc_query.dir_hits[j] =
+              pool->ray_hits[p->enc_query.batch_indices[j]];
+          }
+        }
+        /* B-4 M1-v2: Pre-deliver fallback enc_query hit */
+        if(p->phase == PATH_ENC_QUERY_FB_EMIT) {
+          p->enc_query.fb_hit = pool->ray_hits[p->ray_req.batch_idx];
+        }
 
         p->needs_ray = 0;
         res = advance_one_step_with_ray(p, scn, h0, h1);

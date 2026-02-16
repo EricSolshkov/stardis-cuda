@@ -17,7 +17,7 @@
 #include "test_s3dut_utils.h"
 
 #include <rsys/double3.h>
-#include <rsys/math.h>
+#include <rsys/rsys_math.h>
 
 int
 main(int argc, char** argv)

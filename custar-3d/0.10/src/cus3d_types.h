@@ -47,7 +47,7 @@ struct cus3d_hit_result {
  * K=8 provides ample margin: typical self-intersection avoidance
  * needs only 2 candidates, and each slot is ~40 bytes.
  */
-#define CUS3D_MAX_MULTI_HITS 8
+#define CUS3D_MAX_MULTI_HITS 2
 
 /**
  * Result of a Top-K multi-hit trace.

@@ -124,6 +124,10 @@ enum path_phase {
   PATH_ENC_LOCATE_PENDING,                /* [E] enc_locate batch pending */
   PATH_ENC_LOCATE_RESULT,                 /* [C] enc_locate result ready  */
 
+  /* === B-4 M1-v2: 6-ray enclosure query (replaces M10 at call sites) === */
+  PATH_ENC_QUERY_EMIT,                    /* [R] 6 axis-aligned rays pending */
+  PATH_ENC_QUERY_FB_EMIT,                 /* [R] 1 fallback ray pending      */
+
   /* === Terminal === */
   PATH_DONE,                               /* path finished              */
   PATH_ERROR,                              /* error termination          */
@@ -140,6 +144,7 @@ enum ray_bucket_type {
   RAY_BUCKET_STEP_PAIR,       /* short-range opposing rays (delta-sphere)    */
   RAY_BUCKET_SHADOW,          /* fixed-distance shadow ray, range=[0,dist]   */
   RAY_BUCKET_STARTUP,         /* single-direction probe ray                  */
+  RAY_BUCKET_ENCLOSURE,       /* 6-ray axis-aligned enclosure query          */
   RAY_BUCKET_COUNT
 };
 
@@ -172,6 +177,9 @@ path_phase_is_ray_pending(enum path_phase ph)
   case PATH_CND_WOS_CLOSEST:
   case PATH_CND_WOS_FALLBACK_TRACE:
   case PATH_CNV_STARTUP_TRACE:
+  /* B-4 M1-v2 enclosure query */
+  case PATH_ENC_QUERY_EMIT:
+  case PATH_ENC_QUERY_FB_EMIT:
     return 1;
   default:
     return 0;

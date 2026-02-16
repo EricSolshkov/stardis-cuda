@@ -132,6 +132,34 @@ extern LOCAL_SYM res_T
 step_enc_locate_result(struct path_state* p, struct sdis_scene* scn);
 
 /*******************************************************************************
+ * B-4 M1-v2: 6-ray enclosure query (replaces M10 at call sites)
+ *
+ * Emits 6 axis-aligned rays (PI/4 rotated) to determine the enclosure
+ * containing a query point.  First valid hit resolves the enclosure ID.
+ * If all 6 miss, a single fallback random-direction ray is emitted as
+ * a batched operation (avoids synchronous brute-force).
+ ******************************************************************************/
+
+/* Submit: build 6 PI/4-rotated axis-aligned directions + set up ray request.
+ * Transitions to PATH_ENC_QUERY_EMIT (ray-pending). */
+extern LOCAL_SYM void
+step_enc_query_emit(struct path_state* p,
+                    const double pos[3],
+                    enum path_phase return_state);
+
+/* Resolve: process 6 hit results, pick first valid.
+ * Called from advance_one_step_with_ray when phase==PATH_ENC_QUERY_EMIT.
+ * If resolved → return_state; if all invalid → PATH_ENC_QUERY_FB_EMIT. */
+extern LOCAL_SYM res_T
+step_enc_query_resolve(struct path_state* p, struct sdis_scene* scn);
+
+/* Fallback resolve: process 1 fallback hit result.
+ * Called from advance_one_step_with_ray when phase==PATH_ENC_QUERY_FB_EMIT.
+ * If resolved → return_state; if still invalid → synchronous fallback. */
+extern LOCAL_SYM res_T
+step_enc_query_fb_resolve(struct path_state* p, struct sdis_scene* scn);
+
+/*******************************************************************************
  * B-4 M3: Solid/solid reinjection batch state machine
  ******************************************************************************/
 

@@ -503,9 +503,9 @@ step_conductive(struct path_state* p, struct sdis_scene* scn)
 
   /* Initialization: first entry dispatches ENC sub-state */
   if(!p->ds_initialized) {
-    /* Emit BVH enc_locate query from current position.
+    /* Emit 6-ray enc_query from current position.
      * After result, PATH_CND_DS_CHECK_TEMP finalises init. */
-    step_enc_locate_submit(p, p->rwalk.vtx.P, PATH_CND_DS_CHECK_TEMP);
+    step_enc_query_emit(p, p->rwalk.vtx.P, PATH_CND_DS_CHECK_TEMP);
     goto exit;
   }
 
@@ -602,7 +602,7 @@ step_conductive_ds_process(
     double pos_next[3];
     d3_set(pos_next, p->rwalk.vtx.P);
     move_pos_3d(pos_next, p->ds_dir0, delta);
-    d3_set(p->enc_locate.query_pos, pos_next);
+    d3_set(p->enc_query.query_pos, pos_next);
     p->phase = PATH_CND_DS_STEP_ENC_VERIFY;
     p->needs_ray = 0;
   } else {
@@ -628,7 +628,7 @@ step_conductive_ds_process(
       p->needs_ray = 0;
     } else {
       /* Match — store result for step_advance check and proceed */
-      p->enc_locate.resolved_enc_id = enc_id;
+      p->enc_query.resolved_enc_id = enc_id;
       p->phase = PATH_CND_DS_STEP_ADVANCE;
       p->needs_ray = 0;
     }
@@ -658,7 +658,7 @@ step_cnd_ds_check_temp(struct path_state* p, struct sdis_scene* scn)
 
   /* Finalize initialisation from ENC resolve (runs only once per entry) */
   if(!p->ds_initialized) {
-    unsigned enc_id = p->enc_locate.resolved_enc_id;
+    unsigned enc_id = p->enc_query.resolved_enc_id;
     struct sdis_medium* mdm = NULL;
 
     res = scene_get_enclosure_medium(
@@ -674,13 +674,27 @@ step_cnd_ds_check_temp(struct path_state* p, struct sdis_scene* scn)
       goto error;
     }
 
-    /* Check enclosure consistency */
+    /* The M1 enc_query (6-ray batched GPU trace) is the authoritative
+     * enclosure source within the wavefront pipeline, mirroring CPU's
+     * scene_get_enclosure_id_in_closed_boundaries at conductive entry.
+     * The initial rwalk.enc_id was set by the entry-level brute-force
+     * scene_get_enclosure_id, which may disagree at degenerate positions
+     * (e.g. exact centre of a same-material sphere) because it uses a
+     * different tracing algorithm.  When the medium is identical, adopt
+     * the enc_query result to keep the pipeline self-consistent. */
     if(enc_id != p->rwalk.enc_id) {
-      log_err(scn->dev,
-        "wavefront: conductive_path enclosure mismatch at "
-        "(%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));
-      res = RES_BAD_OP_IRRECOVERABLE;
-      goto error;
+      struct sdis_medium* mdm_init = NULL;
+      res_T rr = scene_get_enclosure_medium(
+        scn, scene_get_enclosure(scn, p->rwalk.enc_id), &mdm_init);
+      if(rr == RES_OK && mdm_init == mdm) {
+        p->rwalk.enc_id = enc_id;
+      } else {
+        log_err(scn->dev,
+          "wavefront: conductive_path enclosure mismatch at "
+          "(%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));
+        res = RES_BAD_OP_IRRECOVERABLE;
+        goto error;
+      }
     }
 
     p->ds_enc_id = enc_id;
@@ -712,9 +726,11 @@ step_cnd_ds_check_temp(struct path_state* p, struct sdis_scene* scn)
     goto exit;
   }
 
-  /* Store delta_solid parameter and reset retry counter */
+  /* Store delta_solid parameter (retry counter NOT reset here — it is
+   * reset in step_cnd_ds_step_advance after the enclosure check passes.
+   * Resetting here would defeat the 100-retry limit because enc-mismatch
+   * retries also transition to CHECK_TEMP.) */
   p->ds_delta_solid_param = (float)props.delta;
-  p->ds_robust_attempt = 0;
 
   /* Emit 2 rays (forward + backward) */
   setup_delta_sphere_rays(p, scn);
@@ -734,8 +750,8 @@ LOCAL_SYM void
 step_cnd_ds_step_enc_verify(struct path_state* p)
 {
   ASSERT(p);
-  /* enc_locate.query_pos already set by step_conductive_ds_process */
-  step_enc_locate_submit(p, p->enc_locate.query_pos, PATH_CND_DS_STEP_ADVANCE);
+  /* enc_query.query_pos already set by step_conductive_ds_process */
+  step_enc_query_emit(p, p->enc_query.query_pos, PATH_CND_DS_STEP_ADVANCE);
 }
 
 /* --- PATH_CND_DS_STEP_ADVANCE: enc check + volumic + time + pos + loop ---- */
@@ -751,10 +767,10 @@ step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn)
   ASSERT(p && scn);
 
   /* ------ Enclosure verification (handles both direct-hit and ENC sub) --- */
-  /* enc_locate.resolved_enc_id is set by:
+  /* enc_query.resolved_enc_id is set by:
    *   - step_conductive_ds_process (direct from hit primitive), or
-   *   - step_enc_locate_result (from batched BVH locate).             */
-  if(p->enc_locate.resolved_enc_id != p->ds_enc_id) {
+   *   - step_enc_query_resolve (from batched 6-ray query).            */
+  if(p->enc_query.resolved_enc_id != p->ds_enc_id) {
     /* Enclosure mismatch — retry with new direction */
     p->ds_robust_attempt++;
     if(p->ds_robust_attempt >= 100) {
@@ -771,6 +787,7 @@ step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn)
   }
 
   /* ------ Robust check passed — proceed with step ------ */
+  p->ds_robust_attempt = 0;  /* reset only on successful enc match */
   res = solid_get_properties(p->ds_medium, &p->rwalk.vtx, &props);
   if(res != RES_OK) goto error;
 
@@ -933,6 +950,193 @@ step_enc_locate_result(struct path_state* p, struct sdis_scene* scn)
 
   p->enc_locate.resolved_enc_id = enc_id;
   p->phase = p->enc_locate.return_state;
+  return RES_OK;
+}
+
+/*******************************************************************************
+ * B-4 M1-v2: 6-ray enclosure query (replaces M10 at call sites)
+ *
+ * Replicates scene_get_enclosure_id_in_closed_boundaries_3d logic:
+ *   - 6 axis-aligned directions rotated by PI/4 around each axis
+ *   - First valid hit (distance > 1e-6, |cos(N,dir)| > 1e-2) resolves
+ *     enc_id via scene_get_enclosure_ids + dot-product side selection
+ *   - If all 6 fail → fallback 1 random-direction ray (batched)
+ *   - If fallback also fails → synchronous scene_get_enclosure_id (last resort)
+ ******************************************************************************/
+
+/* --- step_enc_query_emit: build 6 PI/4-rotated dirs + prepare ray request -- */
+LOCAL_SYM void
+step_enc_query_emit(struct path_state* p,
+                    const double pos[3],
+                    enum path_phase return_state)
+{
+  float frame[9];
+  static const float base_dirs[6][3] = {
+    { 1, 0, 0}, {-1, 0, 0},
+    { 0, 1, 0}, { 0,-1, 0},
+    { 0, 0, 1}, { 0, 0,-1}
+  };
+  int i;
+
+  ASSERT(p && pos);
+
+  p->enc_query.query_pos[0] = pos[0];
+  p->enc_query.query_pos[1] = pos[1];
+  p->enc_query.query_pos[2] = pos[2];
+  p->enc_query.return_state = return_state;
+  p->enc_query.resolved_enc_id = ENCLOSURE_ID_NULL;
+
+  /* Build PI/4 rotation matrix (same as CPU reference) */
+  f33_rotation(frame, (float)PI/4, (float)PI/4, (float)PI/4);
+
+  for(i = 0; i < 6; i++) {
+    float d[3];
+    d[0] = base_dirs[i][0]; d[1] = base_dirs[i][1]; d[2] = base_dirs[i][2];
+    f33_mulf3(p->enc_query.directions[i], frame, d);
+    p->enc_query.dir_hits[i] = S3D_HIT_NULL;
+    p->enc_query.batch_indices[i] = (uint32_t)-1;
+  }
+
+  /* Setup ray request: first 2 rays go through standard ray_req,
+   * remaining 4 are emitted by collect via enc_query.directions[]. */
+  {
+    float P[3];
+    P[0] = (float)pos[0]; P[1] = (float)pos[1]; P[2] = (float)pos[2];
+
+    p->ray_req.origin[0] = P[0];
+    p->ray_req.origin[1] = P[1];
+    p->ray_req.origin[2] = P[2];
+    p->ray_req.direction[0] = p->enc_query.directions[0][0];
+    p->ray_req.direction[1] = p->enc_query.directions[0][1];
+    p->ray_req.direction[2] = p->enc_query.directions[0][2];
+    p->ray_req.range[0] = FLT_MIN;
+    p->ray_req.range[1] = FLT_MAX;
+    p->ray_req.direction2[0] = p->enc_query.directions[1][0];
+    p->ray_req.direction2[1] = p->enc_query.directions[1][1];
+    p->ray_req.direction2[2] = p->enc_query.directions[1][2];
+    p->ray_req.range2[0] = FLT_MIN;
+    p->ray_req.range2[1] = FLT_MAX;
+    p->ray_req.ray_count = 2;
+  }
+
+  /* No self-intersection filter for enclosure query */
+  p->filter_data_storage = HIT_FILTER_DATA_NULL;
+
+  p->ray_count_ext = 6;
+  p->ray_bucket = RAY_BUCKET_ENCLOSURE;
+  p->needs_ray = 1;
+  p->phase = PATH_ENC_QUERY_EMIT;
+}
+
+/* --- step_enc_query_resolve: check 6 hits, pick first valid --------------- */
+LOCAL_SYM res_T
+step_enc_query_resolve(struct path_state* p, struct sdis_scene* scn)
+{
+  unsigned enc_id = ENCLOSURE_ID_NULL;
+  int idir;
+
+  ASSERT(p && scn);
+
+  for(idir = 0; idir < 6; idir++) {
+    const struct s3d_hit* hit = &p->enc_query.dir_hits[idir];
+    float N[3], cos_N_dir;
+
+    if(S3D_HIT_NONE(hit)) continue;
+
+    /* Distance must be > 1e-6 (not touching surface) */
+    if(hit->distance <= 1.e-6f) continue;
+
+    f3_normalize(N, hit->normal);
+    cos_N_dir = f3_dot(N, p->enc_query.directions[idir]);
+
+    /* Not roughly orthogonal */
+    if(absf(cos_N_dir) <= 1.e-2f) continue;
+
+    /* Valid hit — resolve enclosure from primitive */
+    {
+      unsigned enc_ids[2];
+      scene_get_enclosure_ids(scn, hit->prim.prim_id, enc_ids);
+      enc_id = cos_N_dir < 0 ? enc_ids[0] : enc_ids[1];
+    }
+    break; /* First valid hit is sufficient */
+  }
+
+  if(idir < 6) {
+    /* Resolved from primary 6 rays */
+    p->enc_query.resolved_enc_id = enc_id;
+    p->phase = p->enc_query.return_state;
+    p->needs_ray = 0;
+    return RES_OK;
+  }
+
+  /* All 6 failed → emit 1 fallback ray with a different random direction.
+   * Use a simple diagonal direction that avoids axis alignment. */
+  {
+    float P[3];
+    static const float fb_dir[3] = {0.57735027f, 0.57735027f, 0.57735027f};
+    P[0] = (float)p->enc_query.query_pos[0];
+    P[1] = (float)p->enc_query.query_pos[1];
+    P[2] = (float)p->enc_query.query_pos[2];
+
+    p->enc_query.fb_direction[0] = fb_dir[0];
+    p->enc_query.fb_direction[1] = fb_dir[1];
+    p->enc_query.fb_direction[2] = fb_dir[2];
+    p->enc_query.fb_hit = S3D_HIT_NULL;
+    p->enc_query.fb_batch_idx = (uint32_t)-1;
+
+    p->ray_req.origin[0] = P[0];
+    p->ray_req.origin[1] = P[1];
+    p->ray_req.origin[2] = P[2];
+    p->ray_req.direction[0] = fb_dir[0];
+    p->ray_req.direction[1] = fb_dir[1];
+    p->ray_req.direction[2] = fb_dir[2];
+    p->ray_req.range[0] = FLT_MIN;
+    p->ray_req.range[1] = FLT_MAX;
+    p->ray_req.ray_count = 1;
+
+    p->filter_data_storage = HIT_FILTER_DATA_NULL;
+
+    p->ray_count_ext = 1;
+    p->ray_bucket = RAY_BUCKET_ENCLOSURE;
+    p->needs_ray = 1;
+    p->phase = PATH_ENC_QUERY_FB_EMIT;
+  }
+  return RES_OK;
+}
+
+/* --- step_enc_query_fb_resolve: check 1 fallback hit --------------------- */
+LOCAL_SYM res_T
+step_enc_query_fb_resolve(struct path_state* p, struct sdis_scene* scn)
+{
+  unsigned enc_id = ENCLOSURE_ID_NULL;
+  const struct s3d_hit* hit;
+
+  ASSERT(p && scn);
+
+  hit = &p->enc_query.fb_hit;
+
+  if(!S3D_HIT_NONE(hit) && hit->distance > 1.e-6f) {
+    float N[3], cos_N_dir;
+    f3_normalize(N, hit->normal);
+    cos_N_dir = f3_dot(N, p->enc_query.fb_direction);
+
+    if(absf(cos_N_dir) > 1.e-2f) {
+      unsigned enc_ids[2];
+      scene_get_enclosure_ids(scn, hit->prim.prim_id, enc_ids);
+      enc_id = cos_N_dir < 0 ? enc_ids[0] : enc_ids[1];
+    }
+  }
+
+  if(enc_id == ENCLOSURE_ID_NULL) {
+    /* Last resort: synchronous brute-force (extremely rare) */
+    res_T res = scene_get_enclosure_id(scn, p->enc_query.query_pos, &enc_id);
+    if(res == RES_BAD_OP) enc_id = ENCLOSURE_ID_NULL;
+    else if(res != RES_OK) return res;
+  }
+
+  p->enc_query.resolved_enc_id = enc_id;
+  p->phase = p->enc_query.return_state;
+  p->needs_ray = 0;
   return RES_OK;
 }
 
@@ -1391,7 +1595,7 @@ step_bnd_ss_reinject_process(
     move_pos_3d(pos, p->locals.bnd_ss.reinject_dir_frt,
                 p->locals.bnd_ss.reinject_dst_frt);
     p->locals.bnd_ss.enc_side = 0; /* front */
-    step_enc_locate_submit(p, pos, PATH_BND_SS_REINJECT_ENC);
+    step_enc_query_emit(p, pos, PATH_BND_SS_REINJECT_ENC);
     return RES_OK;
   }
 
@@ -1403,7 +1607,7 @@ step_bnd_ss_reinject_process(
     move_pos_3d(pos, p->locals.bnd_ss.reinject_dir_bck,
                 p->locals.bnd_ss.reinject_dst_bck);
     p->locals.bnd_ss.enc_side = 1; /* back */
-    step_enc_locate_submit(p, pos, PATH_BND_SS_REINJECT_ENC);
+    step_enc_query_emit(p, pos, PATH_BND_SS_REINJECT_ENC);
     return RES_OK;
   }
 
@@ -1429,7 +1633,7 @@ step_bnd_ss_reinject_enc_result(struct path_state* p, struct sdis_scene* scn)
 
   ASSERT(p && scn);
 
-  enc_id = p->enc_locate.resolved_enc_id;
+  enc_id = p->enc_query.resolved_enc_id;
 
   if(p->locals.bnd_ss.enc_side == 0) {
     /* Front side verification */
@@ -1448,7 +1652,7 @@ step_bnd_ss_reinject_enc_result(struct path_state* p, struct sdis_scene* scn)
       move_pos_3d(pos, p->locals.bnd_ss.reinject_dir_bck,
                   p->locals.bnd_ss.reinject_dst_bck);
       p->locals.bnd_ss.enc_side = 1; /* back */
-      step_enc_locate_submit(p, pos, PATH_BND_SS_REINJECT_ENC);
+      step_enc_query_emit(p, pos, PATH_BND_SS_REINJECT_ENC);
       return RES_OK;
     }
   } else {
@@ -1522,34 +1726,58 @@ step_bnd_ss_reinject_decide(struct path_state* p, struct sdis_scene* scn)
 
   ASSERT(p && scn);
 
-  /* Compute probability (mirrors solid_solid_boundary_path_3d) */
-  if(p->locals.bnd_ss.tcr == 0) {
-    /* No thermal contact resistance */
-    const double tmp_frt =
-        p->locals.bnd_ss.lambda_frt / p->locals.bnd_ss.reinject_dst_frt;
-    const double tmp_bck =
-        p->locals.bnd_ss.lambda_bck / p->locals.bnd_ss.reinject_dst_bck;
-    proba = tmp_frt / (tmp_frt + tmp_bck);
-  } else {
-    const double delta_frt =
-        p->locals.bnd_ss.reinject_dst_frt / sqrt(3.0);
-    const double delta_bck =
-        p->locals.bnd_ss.reinject_dst_bck / sqrt(3.0);
-    const double tmp_frt = p->locals.bnd_ss.lambda_frt / delta_frt;
-    const double tmp_bck = p->locals.bnd_ss.lambda_bck / delta_bck;
-    const double tmp_tcr =
-        p->locals.bnd_ss.tcr * tmp_frt * tmp_bck;
-    switch(p->rwalk.hit_side) {
-    case SDIS_BACK:
-      proba = tmp_frt / (tmp_frt + tmp_bck + tmp_tcr);
-      break;
-    case SDIS_FRONT:
-      proba = (tmp_frt + tmp_tcr) / (tmp_frt + tmp_bck + tmp_tcr);
-      break;
-    default:
-      FATAL("wavefront M3: unreachable hit_side\n");
-      proba = 0.5; /* suppress warning */
-      break;
+  /* Compute probability (mirrors solid_solid_boundary_path_3d).
+   *
+   * Guard against NaN: when one side is invalid (reinject_dst == 0 or
+   * lambda == 0), the ratio lambda/dst produces 0/0 = NaN which poisons
+   * the probability and causes the wrong side to be chosen.
+   * Short-circuit to the valid side in such cases. */
+  {
+    const int frt_ok = p->locals.bnd_ss.reinject_dst_frt > 0
+                    && p->locals.bnd_ss.lambda_frt > 0;
+    const int bck_ok = p->locals.bnd_ss.reinject_dst_bck > 0
+                    && p->locals.bnd_ss.lambda_bck > 0;
+
+    if(frt_ok && bck_ok) {
+      /* Both sides physically valid — normal probability */
+      if(p->locals.bnd_ss.tcr == 0) {
+        const double tmp_frt =
+            p->locals.bnd_ss.lambda_frt / p->locals.bnd_ss.reinject_dst_frt;
+        const double tmp_bck =
+            p->locals.bnd_ss.lambda_bck / p->locals.bnd_ss.reinject_dst_bck;
+        proba = tmp_frt / (tmp_frt + tmp_bck);
+      } else {
+        const double delta_frt =
+            p->locals.bnd_ss.reinject_dst_frt / sqrt(3.0);
+        const double delta_bck =
+            p->locals.bnd_ss.reinject_dst_bck / sqrt(3.0);
+        const double tmp_frt = p->locals.bnd_ss.lambda_frt / delta_frt;
+        const double tmp_bck = p->locals.bnd_ss.lambda_bck / delta_bck;
+        const double tmp_tcr =
+            p->locals.bnd_ss.tcr * tmp_frt * tmp_bck;
+        switch(p->rwalk.hit_side) {
+        case SDIS_BACK:
+          proba = tmp_frt / (tmp_frt + tmp_bck + tmp_tcr);
+          break;
+        case SDIS_FRONT:
+          proba = (tmp_frt + tmp_tcr) / (tmp_frt + tmp_bck + tmp_tcr);
+          break;
+        default:
+          FATAL("wavefront M3: unreachable hit_side\n");
+          proba = 0.5;
+          break;
+        }
+      }
+    } else if(frt_ok) {
+      proba = 1.0; /* only front is valid */
+    } else if(bck_ok) {
+      proba = 0.0; /* only back is valid */
+    } else {
+      /* Neither side has lambda > 0 AND dst > 0.
+       * Force the side that at least has dst > 0
+       * (probability step will pass through solid_reinjection
+       * which will fail gracefully if lambda is truly 0). */
+      proba = p->locals.bnd_ss.reinject_dst_frt > 0 ? 1.0 : 0.0;
     }
   }
 
@@ -1928,7 +2156,7 @@ step_bnd_sf_reinject_process(
     d3_set(pos, p->rwalk.vtx.P);
     move_pos_3d(pos, p->locals.bnd_sf.chosen_dir,
                 p->locals.bnd_sf.chosen_dst);
-    step_enc_locate_submit(p, pos, PATH_BND_SF_REINJECT_ENC);
+    step_enc_query_emit(p, pos, PATH_BND_SF_REINJECT_ENC);
     return RES_OK;
   }
 
@@ -1954,12 +2182,12 @@ step_bnd_sf_reinject_enc_result(struct path_state* p, struct sdis_scene* scn)
   res_T res = RES_OK;
 
   ASSERT(p && scn);
-  enc_id = p->enc_locate.resolved_enc_id;
+  enc_id = p->enc_query.resolved_enc_id;
 
   if(enc_id != p->locals.bnd_sf.solid_enc_id) {
     /* Reinjection endpoint not in solid enclosure — retry */
     p->locals.bnd_sf.retry_count++;
-     log_warn(scn->dev,
+     /*log_warn(scn->dev,
        "M5_SF_ENC_RETRY retry=%d path=%u prim=%u pos=%g,%g,%g solid_enc=%u enc_resolved=%u dir=%g,%g,%g dst=%g\n",
        p->locals.bnd_sf.retry_count, p->path_id,
        p->rwalk.hit_3d.prim.prim_id,
@@ -1968,9 +2196,9 @@ step_bnd_sf_reinject_enc_result(struct path_state* p, struct sdis_scene* scn)
        (double)p->locals.bnd_sf.chosen_dir[0],
        (double)p->locals.bnd_sf.chosen_dir[1],
        (double)p->locals.bnd_sf.chosen_dir[2],
-       (double)p->locals.bnd_sf.chosen_dst);
+       (double)p->locals.bnd_sf.chosen_dst);*/
     if(p->locals.bnd_sf.retry_count >= 10) {
-      log_warn(scn->dev,
+      /*log_warn(scn->dev,
         "M5_SF_ENC_FAIL path=%u px=%u,%u spp=%u steps=%zu prim=%u pos=%g,%g,%g solid_enc=%u enc_resolved=%u dir=%g,%g,%g dst=%g\n",
         p->path_id, p->pixel_x, p->pixel_y,
         p->realisation_idx, p->steps_taken,
@@ -1979,7 +2207,7 @@ step_bnd_sf_reinject_enc_result(struct path_state* p, struct sdis_scene* scn)
         (double)p->locals.bnd_sf.chosen_dir[0],
         (double)p->locals.bnd_sf.chosen_dir[1],
         (double)p->locals.bnd_sf.chosen_dir[2],
-        (double)p->locals.bnd_sf.chosen_dst);
+        (double)p->locals.bnd_sf.chosen_dst);*/
       p->phase = PATH_DONE;
       p->active = 0;
       p->done_reason = -1;
@@ -2253,6 +2481,11 @@ step_bnd_sf_nullcoll_rad_trace(
 
     /* Store radiative direction for Tref retrieval */
     d3_set_f3(p->rwalk.dir, p->locals.bnd_sf.rad_sub_direction);
+
+    /* Clear stale hit — matches CPU set_limit_radiative_temperature which
+     * ASSERTs SXD_HIT_NONE and sets hit_side = SDIS_SIDE_NULL__. */
+    p->rwalk.hit_3d = S3D_HIT_NULL;
+    p->rwalk.hit_side = SDIS_SIDE_NULL__;
 
     p->phase = PATH_BND_SF_NULLCOLL_DECIDE;
     p->needs_ray = 0;
@@ -2855,6 +3088,11 @@ step_bnd_sfn_rad_trace(struct path_state* p, struct sdis_scene* scn,
     p->T.done = 1;
     d3_set_f3(p->rwalk.dir, p->locals.bnd_sf.rad_sub_direction);
 
+    /* Clear stale hit — matches CPU set_limit_radiative_temperature which
+     * ASSERTs SXD_HIT_NONE and sets hit_side = SDIS_SIDE_NULL__. */
+    p->rwalk.hit_3d = S3D_HIT_NULL;
+    p->rwalk.hit_side = SDIS_SIDE_NULL__;
+
     p->phase = PATH_BND_SFN_RAD_DONE;
     p->needs_ray = 0;
     goto exit;
@@ -3055,22 +3293,23 @@ step_bnd_sfn_rad_done(struct path_state* p, struct sdis_scene* scn)
     goto exit;
   }
 
-  /* Initialize outermost sfn_stack frame for COMPUTE_TEMPERATURE chain */
-  if(p->sfn_stack_depth != 0) {
-    FATAL("wavefront M8: sfn_stack_depth != 0 at SFN_RAD_DONE\n");
-  }
+  /* Initialize sfn_stack frame for COMPUTE_TEMPERATURE chain.
+   * For the outermost M8 sfn_stack_depth == 0.  For nested M8
+   * (picard_order >= 3) it may be > 0 because the outer M8's
+   * COMPUTE_Ti already pushed a frame. */
   {
-    /* Save parameters into the stack frame at depth 0 */
-    p->sfn_stack[0].return_state = PATH_BND_POST_ROBIN_CHECK;
-    p->sfn_stack[0].partial_temperature = 0;
-    p->sfn_stack[0].rwalk_saved = p->rwalk;
-    p->sfn_stack[0].T_saved = p->T;
-    p->sfn_stack[0].T_count = 0;
-    p->sfn_stack[0].r = p->locals.bnd_sf.r;
-    p->sfn_stack[0].p_conv = p->locals.bnd_sf.p_conv;
-    p->sfn_stack[0].p_cond = p->locals.bnd_sf.p_cond;
-    p->sfn_stack[0].h_hat = p->locals.bnd_sf.h_hat;
-    memset(p->sfn_stack[0].T_values, 0, sizeof(p->sfn_stack[0].T_values));
+    int d = p->sfn_stack_depth;
+    ASSERT(d >= 0 && d < MAX_PICARD_DEPTH);
+    p->sfn_stack[d].return_state = PATH_BND_POST_ROBIN_CHECK;
+    p->sfn_stack[d].partial_temperature = 0;
+    p->sfn_stack[d].rwalk_saved = p->rwalk;
+    p->sfn_stack[d].T_saved = p->T;
+    p->sfn_stack[d].T_count = 0;
+    p->sfn_stack[d].r = p->locals.bnd_sf.r;
+    p->sfn_stack[d].p_conv = p->locals.bnd_sf.p_conv;
+    p->sfn_stack[d].p_cond = p->locals.bnd_sf.p_cond;
+    p->sfn_stack[d].h_hat = p->locals.bnd_sf.h_hat;
+    memset(p->sfn_stack[d].T_values, 0, sizeof(p->sfn_stack[d].T_values));
   }
 
   /* Start COMPUTE_TEMPERATURE for T0 */
@@ -3183,6 +3422,7 @@ step_bnd_sfn_compute_Ti(struct path_state* p, struct sdis_scene* scn)
     if(res != RES_OK) goto error;
   }
 
+  p->sfn_stack[p->sfn_stack_depth].bnd_sf_backup = p->locals.bnd_sf;
   p->sfn_stack_depth++;
 
   /* Mark that the sub-path will return to SFN_COMPUTE_Ti_RESUME */
@@ -3228,6 +3468,9 @@ step_bnd_sfn_compute_Ti_resume(struct path_state* p, struct sdis_scene* scn)
 
   /* Pop stack frame */
   p->sfn_stack_depth--;
+
+  /* Restore bnd_sf locals (inner picard1 may have overwritten the union) */
+  p->locals.bnd_sf = p->sfn_stack[p->sfn_stack_depth].bnd_sf_backup;
 
   /* Record the computed temperature */
   i = p->sfn_stack[p->sfn_stack_depth].T_count;
@@ -4295,15 +4538,24 @@ step_bnd_dispatch(struct path_state* p, struct sdis_scene* scn)
     /* solid/solid → M3 batched reinjection */
     res = step_bnd_ss_reinject_sample(p, scn);
   } else if(p->ctx.nbranchings == p->ctx.max_branchings) {
-    /* solid/fluid picard1 → M5 batched state machine */
+    /* solid/fluid picard1 → M5 batched state machine.
+     * Reset h_hat so that step_bnd_sf_prob_dispatch re-computes transfer
+     * coefficients and calls handle_net_flux for EVERY boundary visit
+     * (not just the first one). Without this, h_hat retains its non-zero
+     * value from a previous visit and the init block (which includes the
+     * handle_net_flux call) is skipped entirely. */
+    p->locals.bnd_sf.is_picardn = 0;
+    p->locals.bnd_sf.h_hat = 0;
     res = step_bnd_sf_reinject_sample(p, scn);
   } else {
     /* solid/fluid picardN → M8 batched state machine.
      * Reuse M5 SF reinjection setup but mark as picardN so that
-     * reinject_enc_result routes to SFN_PROB_DISPATCH. */
+     * reinject_enc_result routes to SFN_PROB_DISPATCH.
+     * NOTE: sfn_stack_depth is NOT reset here; for picard_order >= 3 this
+     * function may be entered from a COMPUTE_Ti sub-path of an outer M8,
+     * so the stack must nest properly. */
     p->locals.bnd_sf.is_picardn = 1;
     p->locals.bnd_sf.h_hat = 0;        /* force init in sfn_prob_dispatch  */
-    p->sfn_stack_depth = 0;             /* clear any stale stack state      */
     res = step_bnd_sf_reinject_sample(p, scn);
   }
 
@@ -4323,6 +4575,17 @@ step_bnd_post_robin_check(struct path_state* p, struct sdis_scene* scn)
   res_T res = RES_OK;
 
   ASSERT(p && scn);
+
+  /* Unconditional T.done check — mirrors CPU boundary_path_Xd.h line 88:
+   *   "if(T->done) goto exit;"
+   * This catches radiative miss-accept paths (T.done=1, T.func still
+   * boundary_path_3d) that must NOT re-enter PATH_BND_DISPATCH. */
+  if(p->T.done) {
+    p->phase = PATH_DONE;
+    p->active = 0;
+    p->done_reason = 2; /* temperature known */
+    goto exit;
+  }
 
   /* Robin post-check: if next path is convective or conductive, check
    * whether the medium temperature is already known from the boundary.
@@ -4666,6 +4929,18 @@ advance_one_step_with_ray(struct path_state* p, struct sdis_scene* scn,
   /* --- B-4 M6: Convective startup ray result --- */
   case PATH_CNV_STARTUP_TRACE:
     res = step_cnv_startup_result(p, scn, hit0);
+    break;
+
+  /* --- B-4 M1-v2: 6-ray enclosure query results ---
+   * 6 hits already pre-delivered to enc_query.dir_hits[] by distribute. */
+  case PATH_ENC_QUERY_EMIT:
+    res = step_enc_query_resolve(p, scn);
+    break;
+
+  /* --- B-4 M1-v2: Fallback 1-ray result ---
+   * 1 hit pre-delivered to enc_query.fb_hit by distribute. */
+  case PATH_ENC_QUERY_FB_EMIT:
+    res = step_enc_query_fb_resolve(p, scn);
     break;
 
   default:

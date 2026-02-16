@@ -176,7 +176,7 @@ struct path_state {
       uint32_t batch_idx_bck0, batch_idx_bck1;
     } bnd_ss;
 
-    struct {                            /* solid/fluid picard1/N           */
+    struct path_bnd_sf_locals {         /* solid/fluid picard1/N           */
       double  p_conv, p_cond, p_radi;
       double  h_hat, h_conv, h_cond;
       double  h_radi_hat;              /* radiative coeff upper bound      */
@@ -281,6 +281,20 @@ struct path_state {
     uint32_t batch_idx;               /* index in enc_locate batch         */
   } enc_locate;
 
+  /* --- B-4 M1-v2: 6-ray enclosure query (replaces M10 at call sites) --- */
+  struct {
+    double   query_pos[3];            /* query position                    */
+    enum path_phase return_state;     /* resume state after resolve done   */
+    unsigned resolved_enc_id;         /* result enclosure id               */
+    float    directions[6][3];        /* PI/4 rotated axis-aligned dirs    */
+    struct s3d_hit dir_hits[6];       /* hit results for 6 rays            */
+    uint32_t batch_indices[6];        /* batch indices for each ray        */
+    /* Fallback ray (when all 6 primary rays invalid) */
+    float    fb_direction[3];         /* fallback ray direction            */
+    struct s3d_hit fb_hit;            /* fallback ray hit result           */
+    uint32_t fb_batch_idx;            /* fallback ray batch index          */
+  } enc_query;
+
   /* --- B-4: PicardN recursive stack --- */
   struct {
     enum path_phase return_state;
@@ -290,6 +304,7 @@ struct path_state {
     double  T_values[6];
     int     T_count;
     double  r, p_conv, p_cond, h_hat;
+    struct path_bnd_sf_locals bnd_sf_backup;
   } sfn_stack[MAX_PICARD_DEPTH];        /* recursive COMPUTE_TEMPERATURE    */
   int sfn_stack_depth;
 

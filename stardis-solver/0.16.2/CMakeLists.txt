@@ -285,6 +285,104 @@ if(ENABLE_TESTS)
              COMMAND test_sdis_wavefront_benchmark)
     set_tests_properties(test_sdis_wavefront_benchmark PROPERTIES TIMEOUT 1200)
 
+    # ---- P0 wavefront numerical correctness tests ----
+    # Links sdis_obj (OBJECT lib) for LOCAL_SYM access, same as B-4 tests.
+    set(WF_P0_TESTS
+        test_sdis_wf_a1_flux
+        test_sdis_wf_a2_volumic
+        test_sdis_wf_b2_boundary
+        test_sdis_wf_c1_condrad
+        test_sdis_wf_d1_convection)
+
+    foreach(p0test ${WF_P0_TESTS})
+        add_executable(${p0test} src/${p0test}.c)
+        target_link_libraries(${p0test} PRIVATE sdis_obj)
+        add_test(NAME ${p0test} COMMAND ${p0test})
+        set_tests_properties(${p0test} PROPERTIES
+            TIMEOUT 300
+            LABELS "wf;p0;numerical")
+    endforeach()
+
+    # ---- P1 wavefront numerical correctness tests ----
+    # Same pattern as P0: links sdis_obj (OBJECT lib) for LOCAL_SYM access.
+    set(WF_P1_TESTS
+        test_sdis_wf_a3_contact_resistance
+        test_sdis_wf_a6_volumic_power4
+        test_sdis_wf_c3_picard_multi
+        test_sdis_wf_d2_convection_nonuniform
+        test_sdis_wf_f1_external_flux
+        test_sdis_wf_f2_diffuse_radiance)
+
+    foreach(p1test ${WF_P1_TESTS})
+        add_executable(${p1test} src/${p1test}.c)
+        target_link_libraries(${p1test} PRIVATE sdis_obj)
+        add_test(NAME ${p1test} COMMAND ${p1test})
+        set_tests_properties(${p1test} PROPERTIES
+            TIMEOUT 600
+            LABELS "wf;p1;numerical")
+    endforeach()
+
+    # ---- P2 wavefront numerical correctness tests ----
+    # Basic tests: link sdis_obj only (box geometry from test_sdis_utils.h)
+    set(WF_P2_TESTS_BASIC
+        test_sdis_wf_e1_unsteady
+        test_sdis_wf_e2_unsteady_1d)
+
+    foreach(p2test ${WF_P2_TESTS_BASIC})
+        add_executable(${p2test} src/${p2test}.c)
+        target_link_libraries(${p2test} PRIVATE sdis_obj)
+        add_test(NAME ${p2test} COMMAND ${p2test})
+        set_tests_properties(${p2test} PROPERTIES
+            TIMEOUT 600
+            LABELS "wf;p2;numerical")
+    endforeach()
+
+    # S3DUT tests: link sdis_obj + s3dut (supershape / sphere geometry)
+    set(WF_P2_TESTS_S3DUT
+        test_sdis_wf_e3_unsteady_analytic
+        test_sdis_wf_g1_robustness
+        test_sdis_wf_a7_solve_probe3)
+
+    foreach(p2test ${WF_P2_TESTS_S3DUT})
+        add_executable(${p2test} src/${p2test}.c)
+        target_link_libraries(${p2test} PRIVATE sdis_obj s3dut)
+        add_test(NAME ${p2test} COMMAND ${p2test})
+        set_tests_properties(${p2test} PROPERTIES
+            TIMEOUT 600
+            LABELS "wf;p2;numerical")
+    endforeach()
+
+    # ---- P3 wavefront numerical correctness tests ----
+    # Basic tests (box geometry, no s3dut): link sdis_obj only
+    set(WF_P3_TESTS_BASIC
+        test_sdis_wf_e5_unsteady_atm
+        test_sdis_wf_c4_flux2
+        test_sdis_wf_b3_boundary_flux
+        test_sdis_wf_i3_enclosure_limit
+        test_sdis_wf_i1_volumic_power2)
+
+    foreach(p3test ${WF_P3_TESTS_BASIC})
+        add_executable(${p3test} src/${p3test}.c)
+        target_link_libraries(${p3test} PRIVATE sdis_obj)
+        add_test(NAME ${p3test} COMMAND ${p3test})
+        set_tests_properties(${p3test} PROPERTIES
+            TIMEOUT 600
+            LABELS "wf;p3;numerical")
+    endforeach()
+
+    # S3DUT tests (supershape geometry): link sdis_obj + s3dut
+    set(WF_P3_TESTS_S3DUT
+        test_sdis_wf_b5_probe_list)
+
+    foreach(p3test ${WF_P3_TESTS_S3DUT})
+        add_executable(${p3test} src/${p3test}.c)
+        target_link_libraries(${p3test} PRIVATE sdis_obj s3dut)
+        add_test(NAME ${p3test} COMMAND ${p3test})
+        set_tests_properties(${p3test} PROPERTIES
+            TIMEOUT 600
+            LABELS "wf;p3;numerical")
+    endforeach()
+
     # Deploy runtime DLLs (Embree4, TBB, etc.) for all B4 test executables
     if(WIN32 AND COMMAND deploy_runtime_dependencies)
         # deploy_runtime_dependencies(test_sdis_b4_m1_enclosure_batch)
@@ -299,6 +397,24 @@ if(ENABLE_TESTS)
         deploy_runtime_dependencies(test_sdis_b4_e2e)
         deploy_runtime_dependencies(test_sdis_b4_integration)
         deploy_runtime_dependencies(test_sdis_wavefront_benchmark)
+        foreach(p0test ${WF_P0_TESTS})
+            deploy_runtime_dependencies(${p0test})
+        endforeach()
+        foreach(p1test ${WF_P1_TESTS})
+            deploy_runtime_dependencies(${p1test})
+        endforeach()
+        foreach(p2test ${WF_P2_TESTS_BASIC})
+            deploy_runtime_dependencies(${p2test})
+        endforeach()
+        foreach(p2test ${WF_P2_TESTS_S3DUT})
+            deploy_runtime_dependencies(${p2test})
+        endforeach()
+        foreach(p3test ${WF_P3_TESTS_BASIC})
+            deploy_runtime_dependencies(${p3test})
+        endforeach()
+        foreach(p3test ${WF_P3_TESTS_S3DUT})
+            deploy_runtime_dependencies(${p3test})
+        endforeach()
     endif()
 
 endif()

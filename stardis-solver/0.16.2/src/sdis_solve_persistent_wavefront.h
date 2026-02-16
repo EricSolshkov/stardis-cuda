@@ -202,6 +202,9 @@ struct wavefront_pool {
 static INLINE size_t
 count_path_rays(const struct path_state* p)
 {
+  /* B-4 M1-v2: 6-ray enc_query uses ray_count_ext for extra rays */
+  if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6)
+    return 6;
   return (size_t)p->ray_req.ray_count;
 }
 

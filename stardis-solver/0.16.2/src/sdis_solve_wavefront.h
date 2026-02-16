@@ -39,6 +39,7 @@
 #include "sdis_wf_state.h"  /* struct path_ray_request, struct path_state  */
 
 #include "sdis.h"
+#include "sdis_misc.h"  /* struct accum (for probe-mode output) */
 #include "sdis_tile.h"
 
 #include <star/s3d.h>
@@ -123,5 +124,23 @@ solve_tile_wavefront
 /* Internal (LOCAL_SYM) — exposed so that unit tests can call it directly. */
 extern LOCAL_SYM res_T
 collect_ray_requests(struct wavefront_context* wf);
+
+/*******************************************************************************
+ * Probe-mode wavefront solver
+ *
+ * Wavefront variant of sdis_solve_probe: all realisations originate from the
+ * same spatial position and advance in lockstep with batched ray-tracing.
+ ******************************************************************************/
+extern LOCAL_SYM res_T
+solve_wavefront_probe
+  (struct sdis_scene* scn,
+   struct ssp_rng*    base_rng,
+   const unsigned     enc_id,
+   const double       position[3],
+   const double       time_range[2],
+   const size_t       nrealisations,
+   const size_t       picard_order,
+   const enum sdis_diffusion_algorithm diff_algo,
+   struct accum*      out_acc_temp);
 
 #endif /* SDIS_SOLVE_WAVEFRONT_H */

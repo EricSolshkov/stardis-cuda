@@ -128,7 +128,7 @@ s3d_batch_trace_context_destroy
  * Batch trace diagnostics (compile-time toggleable)
  ******************************************************************************/
 #ifndef BATCH_TRACE_DIAG
-#define BATCH_TRACE_DIAG 1   /* Set to 0 to silence all diagnostics */
+#define BATCH_TRACE_DIAG 0   /* Set to 0 to silence all diagnostics */
 #endif
 
 /* How often (in batch calls) to print a summary line */
@@ -319,7 +319,7 @@ trace_rays_batch_impl
                 stat_rejected++;
             }
 
-#ifndef BATCH_TRACE_DIAG
+#if BATCH_TRACE_DIAG
             /* Dump detailed info for the first few all-rejected rays */
             if(diag_detail_dumps < DIAG_MAX_DETAIL_DUMPS) {
                 diag_detail_dumps++;

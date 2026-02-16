@@ -386,6 +386,35 @@ collect_ray_requests(struct wavefront_context* wf)
       }
       (void)j;
     }
+
+    /* B-4 M1-v2: 6-ray enclosure query.
+     * ray_req holds first 2 dirs; we emit remaining 4 from enc_query. */
+    if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT) {
+      int j;
+      /* Store batch indices for ray 0 and ray 1 (already emitted) */
+      p->enc_query.batch_indices[0] = p->ray_req.batch_idx;
+      p->enc_query.batch_indices[1] = p->ray_req.batch_idx2;
+
+      /* Emit rays 2..5 */
+      for(j = 2; j < 6; j++) {
+        struct s3d_ray_request* rr = &wf->ray_requests[ray_idx];
+        rr->origin[0]    = p->ray_req.origin[0];
+        rr->origin[1]    = p->ray_req.origin[1];
+        rr->origin[2]    = p->ray_req.origin[2];
+        rr->direction[0] = p->enc_query.directions[j][0];
+        rr->direction[1] = p->enc_query.directions[j][1];
+        rr->direction[2] = p->enc_query.directions[j][2];
+        rr->range[0]     = p->ray_req.range[0];
+        rr->range[1]     = p->ray_req.range[1];
+        rr->filter_data  = NULL;  /* no self-intersection filter */
+        rr->user_id      = (uint32_t)i;
+
+        wf->ray_to_path[ray_idx] = (uint32_t)i;
+        wf->ray_slot[ray_idx]    = (uint32_t)j;
+        p->enc_query.batch_indices[j] = (uint32_t)ray_idx;
+        ray_idx++;
+      }
+    }
   }
 
   wf->ray_count = ray_idx;
@@ -413,6 +442,18 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
       case 2: p->locals.bnd_ss.ray_bck[0] = wf->ray_hits[r]; break;
       case 3: p->locals.bnd_ss.ray_bck[1] = wf->ray_hits[r]; break;
       }
+      continue;
+    }
+
+    /* B-4 M1-v2: 6-ray enc_query pre-delivery */
+    if(p->phase == PATH_ENC_QUERY_EMIT && slot < 6) {
+      p->enc_query.dir_hits[slot] = wf->ray_hits[r];
+      continue;
+    }
+
+    /* B-4 M1-v2: 1-ray enc_query fallback pre-delivery */
+    if(p->phase == PATH_ENC_QUERY_FB_EMIT && slot == 0) {
+      p->enc_query.fb_hit = wf->ray_hits[r];
       continue;
     }
 
@@ -806,3 +847,470 @@ cleanup:
   return res;
 }
 #endif /* SDIS_SOLVE_WAVEFRONT_SKIP_PUBLIC_API */
+
+/*******************************************************************************
+ * Probe-mode wavefront: init_paths_from_probe
+ *
+ * Initialise all paths from a single spatial position (probe mode).
+ * Each path corresponds to one MC realisation at the given position.
+ * No camera ray is involved — rwalk.vtx.P is set directly from `position`.
+ ******************************************************************************/
+static res_T
+init_paths_from_probe(
+  struct wavefront_context* wf,
+  struct sdis_scene*        scn,
+  struct ssp_rng*           base_rng,
+  const unsigned            enc_id,
+  const double              position[3],
+  const double              time_range[2],
+  const size_t              nrealisations,
+  const size_t              picard_order,
+  const enum sdis_diffusion_algorithm diff_algo)
+{
+  size_t i;
+  const struct enclosure* enc = NULL;
+  struct sdis_medium* mdm = NULL;
+  enum sdis_medium_type mdm_type;
+  res_T rr;
+  ASSERT(wf && scn && base_rng && position && time_range);
+
+  /* Resolve medium type from enclosure (SOLID or FLUID) */
+  enc = scene_get_enclosure(scn, enc_id);
+  rr = scene_get_enclosure_medium(scn, enc, &mdm);
+  if(rr != RES_OK) return rr;
+  mdm_type = sdis_medium_get_type(mdm);
+
+  for(i = 0; i < nrealisations; i++) {
+    struct path_state* p = &wf->paths[i];
+
+    /* Identity */
+    p->path_id = (uint32_t)i;
+    p->pixel_x = 0;   /* probe mode: virtual pixel (0,0) */
+    p->pixel_y = 0;
+    p->realisation_idx = (uint32_t)i;
+    p->ipix_image[0] = 0;
+    p->ipix_image[1] = 0;
+
+    /* Share per-thread RNG */
+    p->rng = base_rng;
+
+    /* Sample time (same RNG call order as depth-first solve_one_probe) */
+    {
+      double time = sample_time(p->rng, time_range);
+
+      /* Directly set probe position — no camera_ray */
+      p->rwalk = RWALK_NULL;
+      d3_set(p->rwalk.vtx.P, position);
+      p->rwalk.vtx.time = time;
+      p->rwalk.hit_3d = S3D_HIT_NULL;
+      p->rwalk.hit_side = SDIS_SIDE_NULL__;
+      p->rwalk.enc_id = enc_id;
+    }
+
+    /* Initialise rwalk_context (matches init_all_paths exactly) */
+    p->ctx = RWALK_CONTEXT_NULL;
+    p->ctx.heat_path   = NULL;
+    p->ctx.green_path  = NULL;
+    p->ctx.Tmin   = scn->tmin;
+    p->ctx.Tmin2  = scn->tmin * scn->tmin;
+    p->ctx.Tmin3  = scn->tmin * scn->tmin * scn->tmin;
+    p->ctx.That   = scn->tmax;
+    p->ctx.That2  = scn->tmax * scn->tmax;
+    p->ctx.That3  = scn->tmax * scn->tmax * scn->tmax;
+    p->ctx.max_branchings = picard_order - 1;
+    /* Probe paths start directly at COUPLED_CONDUCTIVE/CONVECTIVE,
+     * bypassing step_boundary's coupled_nbranchings sentinel logic.
+     * In depth-first, sample_coupled_path does nbranchings = SIZE_MAX + 1 = 0
+     * at entry.  We replicate that here. */
+    p->ctx.nbranchings    = 0;
+    p->ctx.irealisation   = i;
+    p->ctx.diff_algo      = diff_algo;
+
+    /* Temperature accumulator — set T.func based on medium type.
+     * This mirrors probe_realisation_Xd.h: SOLID -> conductive_path,
+     * FLUID -> convective_path. */
+    p->T = TEMPERATURE_NULL;
+    if(mdm_type == SDIS_SOLID) {
+      p->T.func = conductive_path_3d;
+    } else {
+      p->T.func = convective_path_3d;
+    }
+
+    /* Probe has no camera ray direction — zero the radiative state */
+    memset(p->rad_direction, 0, sizeof(p->rad_direction));
+    p->rad_bounce_count = 0;
+    p->rad_retry_count  = 0;
+
+    /* Lifecycle — start at conductive/convective state, NOT PATH_INIT
+     * (PATH_INIT always emits a radiative trace which is wrong for
+     * probe mode where the path starts inside the volume). */
+    if(mdm_type == SDIS_SOLID) {
+      p->phase = PATH_COUPLED_CONDUCTIVE;
+    } else {
+      p->phase = PATH_COUPLED_CONVECTIVE;
+    }
+    p->active  = 1;
+    p->needs_ray = 0;
+
+    /* Zero scratch areas (same as init_all_paths) */
+    p->ds_delta_solid = 0;
+    p->ds_initialized = 0;
+    p->ds_enc_id = ENCLOSURE_ID_NULL;
+    p->ds_medium = NULL;
+    p->ds_props_ref = SOLID_PROPS_NULL;
+    p->ds_green_power_term = 0;
+    memset(p->ds_position_start, 0, sizeof(p->ds_position_start));
+    p->ds_robust_attempt = 0;
+    p->ds_delta = 0;
+    p->ds_delta_solid_param = 0;
+    p->bnd_reinject_distance = 0;
+    p->bnd_solid_enc_id = ENCLOSURE_ID_NULL;
+    p->bnd_retry_count = 0;
+    /* Probe mode: nbranchings already set to 0 above, so sync the
+     * coupled_nbranchings to 0 (not -1 sentinel) to match. */
+    p->coupled_nbranchings = 0;
+    p->steps_taken = 0;
+    p->done_reason = 0;
+  }
+
+  wf->active_count = nrealisations;
+  return RES_OK;
+}
+
+/*******************************************************************************
+ * Probe-mode wavefront: collect_results_probe
+ *
+ * Aggregate completed paths into a temperature accumulator (sum/sum2/count).
+ * This replaces collect_results() which writes to tile pixels.
+ ******************************************************************************/
+static res_T
+collect_results_probe(
+  struct wavefront_context* wf,
+  struct accum*             acc_temp)
+{
+  size_t i;
+  ASSERT(wf && acc_temp);
+
+  *acc_temp = ACCUM_NULL;
+
+  for(i = 0; i < wf->total_paths; i++) {
+    const struct path_state* p = &wf->paths[i];
+    ASSERT(!p->active); /* all paths should be done */
+
+    if(p->T.done) {
+      acc_temp->sum  += p->T.value;
+      acc_temp->sum2 += p->T.value * p->T.value;
+      acc_temp->count += 1;
+    }
+
+    /* Classify path termination for statistics */
+    switch(p->done_reason) {
+    case 1:  wf->paths_done_radiative++;   break;
+    case 2:  wf->paths_done_temperature++; break;
+    case 3:  wf->paths_done_boundary++;    break;
+    case 4:  wf->paths_done_temperature++; break;
+    case -1: wf->paths_failed++;           break;
+    default: break;
+    }
+  }
+
+  return RES_OK;
+}
+
+/*******************************************************************************
+ * Probe-mode wavefront: solve_wavefront_probe
+ *
+ * Wavefront main loop for probe mode.  Identical to solve_tile_wavefront
+ * except:
+ *   - paths are initialised from a single position (init_paths_from_probe)
+ *   - results are collected into an accumulator (collect_results_probe)
+ *   - no camera, no tile, no pixel grid
+ ******************************************************************************/
+LOCAL_SYM res_T
+solve_wavefront_probe(
+  struct sdis_scene*                   scn,
+  struct ssp_rng*                      base_rng,
+  const unsigned                       enc_id,
+  const double                         position[3],
+  const double                         time_range[2],
+  const size_t                         nrealisations,
+  const size_t                         picard_order,
+  const enum sdis_diffusion_algorithm  diff_algo,
+  struct accum*                        out_acc_temp)
+{
+  struct wavefront_context wf;
+  const size_t total_paths = nrealisations;
+  res_T res = RES_OK;
+  struct time t_start, t_end, t_elapsed;
+
+  ASSERT(scn && base_rng && position && time_range && nrealisations > 0);
+  ASSERT(out_acc_temp);
+
+  /* ====== Allocate wavefront context ====== */
+  res = wf_context_create(&wf, total_paths);
+  if(res != RES_OK) goto cleanup;
+
+  /* Create batch trace context (pre-allocated GPU buffers) */
+  res = s3d_batch_trace_context_create(&wf.batch_ctx, wf.max_rays);
+  if(res != RES_OK) goto cleanup;
+
+  /* Create batch enc_locate context (M10) */
+  res = s3d_batch_enc_context_create(&wf.enc_batch_ctx, wf.max_enc_locates);
+  if(res != RES_OK) goto cleanup;
+
+  /* ====== Initialise all paths from probe position ====== */
+  res = init_paths_from_probe(&wf, scn, base_rng, enc_id,
+                              position, time_range, nrealisations,
+                              picard_order, diff_algo);
+  if(res != RES_OK) goto cleanup;
+
+  /* ====== Initial step: advance all paths from PATH_INIT ====== */
+  {
+    size_t i;
+    for(i = 0; i < wf.total_paths; i++) {
+      int advanced = 0;
+      struct path_state* p = &wf.paths[i];
+
+      while(p->active && !p->needs_ray
+          && p->phase != PATH_DONE && p->phase != PATH_ERROR) {
+        if(path_phase_is_ray_pending(p->phase)) break;
+        if(path_phase_is_enc_locate_pending(p->phase)) break;
+
+        res = advance_one_step_no_ray(p, scn, &advanced);
+        if(res != RES_OK && res != RES_BAD_OP
+        && res != RES_BAD_OP_IRRECOVERABLE)
+            goto cleanup;
+        if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
+          p->phase = PATH_DONE;
+          p->active = 0;
+          p->done_reason = -1;
+          res = RES_OK;
+          break;
+        }
+        if(!advanced) break;
+        if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
+          p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+          p->active = 1;
+        }
+        p->steps_taken++;
+      }
+    }
+  }
+
+  /* ====== Wavefront main loop ====== */
+  time_current(&t_start);
+  while(wf.active_count > 0) {
+    wf.total_steps++;
+
+    /* Step A: Collect ray requests from all active paths */
+    wf.ray_count = 0;
+    res = collect_ray_requests(&wf);
+    if(res != RES_OK) goto cleanup;
+
+    /* Step B: Batch trace */
+    if(wf.ray_count > 0) {
+      struct s3d_batch_trace_stats stats;
+      memset(&stats, 0, sizeof(stats));
+
+      res = s3d_scene_view_trace_rays_batch_ctx(
+        scn->s3d_view,
+        wf.batch_ctx,
+        wf.ray_requests,
+        wf.ray_count,
+        wf.ray_hits,
+        &stats);
+      if(res != RES_OK) goto cleanup;
+
+      wf.total_rays_traced += wf.ray_count;
+    }
+
+    /* Step C: Distribute results + advance paths */
+    res = distribute_and_advance(&wf, scn);
+    if(res != RES_OK) goto cleanup;
+
+    /* Step C2 (M10): Batch enc_locate */
+    {
+      size_t i, n = 0;
+      for(i = 0; i < wf.total_paths; i++) {
+        struct path_state* p = &wf.paths[i];
+        if(p->active && p->phase == PATH_ENC_LOCATE_PENDING) {
+          struct s3d_enc_locate_request* req = &wf.enc_locate_requests[n];
+          req->pos[0] = (float)p->enc_locate.query_pos[0];
+          req->pos[1] = (float)p->enc_locate.query_pos[1];
+          req->pos[2] = (float)p->enc_locate.query_pos[2];
+          req->user_id = (uint32_t)i;
+          wf.enc_locate_to_path[n] = (uint32_t)i;
+          p->enc_locate.batch_idx = (uint32_t)n;
+          n++;
+        }
+      }
+      wf.enc_locate_count = n;
+
+      if(n > 0) {
+        struct s3d_batch_enc_stats enc_stats;
+        memset(&enc_stats, 0, sizeof(enc_stats));
+
+        res = s3d_scene_view_find_enclosure_batch_ctx(
+          scn->s3d_view, wf.enc_batch_ctx,
+          wf.enc_locate_requests, n,
+          wf.enc_locate_results, &enc_stats);
+        if(res != RES_OK) goto cleanup;
+
+        for(i = 0; i < n; i++) {
+          uint32_t pid = wf.enc_locate_to_path[i];
+          struct path_state* p = &wf.paths[pid];
+          struct s3d_enc_locate_result* r = &wf.enc_locate_results[i];
+
+          p->enc_locate.prim_id  = r->prim_id;
+          p->enc_locate.side     = r->side;
+          p->enc_locate.distance = r->distance;
+          p->phase = PATH_ENC_LOCATE_RESULT;
+        }
+
+        for(i = 0; i < n; i++) {
+          uint32_t pid = wf.enc_locate_to_path[i];
+          struct path_state* p = &wf.paths[pid];
+          while(p->active && !p->needs_ray
+              && p->phase != PATH_DONE && p->phase != PATH_ERROR) {
+            int advanced = 0;
+            if(path_phase_is_ray_pending(p->phase)) break;
+            if(path_phase_is_enc_locate_pending(p->phase)) break;
+            res = advance_one_step_no_ray(p, scn, &advanced);
+            if(res != RES_OK && res != RES_BAD_OP
+            && res != RES_BAD_OP_IRRECOVERABLE) goto cleanup;
+            if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
+              p->phase = PATH_DONE;
+              p->active = 0;
+              p->done_reason = -1;
+              wf.paths_failed++;
+              res = RES_OK;
+              break;
+            }
+            if(!advanced) break;
+            if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
+              p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+              p->active = 1;
+            }
+            p->steps_taken++;
+          }
+        }
+      }
+    }
+
+    /* Step D: Update active count */
+    update_active_count(&wf);
+
+    /* Safety: prevent infinite loops */
+    if(wf.total_steps > total_paths * 1000) {
+      log_err(scn->dev,
+        "wavefront probe: exceeded maximum step count (%lu). "
+        "%lu paths still active.\n",
+        (unsigned long)wf.total_steps,
+        (unsigned long)wf.active_count);
+      res = RES_BAD_OP;
+      goto cleanup;
+    }
+  }
+
+  /* ====== Collect results into accumulator ====== */
+  res = collect_results_probe(&wf, out_acc_temp);
+
+  /* ====== Summary logging ====== */
+  time_current(&t_end);
+  time_sub(&t_elapsed, &t_end, &t_start);
+  {
+    char time_str[128];
+    time_dump(&t_elapsed, TIME_ALL, NULL, time_str, sizeof(time_str));
+    log_info(scn->dev,
+      "wavefront probe: nrealisations=%lu  "
+      "elapsed=%s  steps=%lu  rays=%lu  "
+      "(rad=%lu cond_ds=%lu ds_retry=%lu)  "
+      "done: rad=%lu temp=%lu bnd=%lu fail=%lu  "
+      "max_depth=%lu\n",
+      (unsigned long)nrealisations,
+      time_str,
+      (unsigned long)wf.total_steps,
+      (unsigned long)wf.total_rays_traced,
+      (unsigned long)wf.rays_radiative,
+      (unsigned long)wf.rays_conductive_ds,
+      (unsigned long)wf.rays_conductive_ds_retry,
+      (unsigned long)wf.paths_done_radiative,
+      (unsigned long)wf.paths_done_temperature,
+      (unsigned long)wf.paths_done_boundary,
+      (unsigned long)wf.paths_failed,
+      (unsigned long)wf.max_wavefront_depth);
+  }
+
+cleanup:
+  wf_context_destroy(&wf);
+  return res;
+}
+
+/*******************************************************************************
+ * Public API: sdis_solve_wavefront_probe
+ *
+ * Public entry point matching sdis_solve_probe semantics exactly.
+ * Delegates to solve_wavefront_probe() after scene validation, enclosure
+ * lookup, RNG creation, and estimator setup.
+ ******************************************************************************/
+res_T
+sdis_solve_wavefront_probe(
+  struct sdis_scene*                   scn,
+  const struct sdis_solve_probe_args*  args,
+  struct sdis_estimator**              out_estimator)
+{
+  struct ssp_rng* rng = NULL;
+  struct sdis_estimator* estimator = NULL;
+  unsigned enc_id = ENCLOSURE_ID_NULL;
+  struct accum acc_temp = ACCUM_NULL;
+  res_T res = RES_OK;
+
+  if(!scn || !args || !out_estimator) return RES_BAD_ARG;
+  if(args->nrealisations == 0) return RES_BAD_ARG;
+
+  *out_estimator = NULL;
+
+  /* Retrieve enclosure at probe position (one-time brute-force lookup,
+   * same as CPU solve_probe entry).  The authoritative enc_id for the
+   * conductive path is established later by the M1 6-ray enc_query
+   * (step_enc_query_emit/resolve) during the first wavefront iteration,
+   * which mirrors CPU's scene_get_enclosure_id_in_closed_boundaries. */
+  res = scene_get_enclosure_id(scn, args->position, &enc_id);
+  if(res != RES_OK) goto error;
+
+  /* Create RNG */
+  if(args->rng_state) {
+    rng = args->rng_state;
+  } else {
+    res = ssp_rng_create(NULL, args->rng_type, &rng);
+    if(res != RES_OK) goto error;
+  }
+
+  /* Create estimator */
+  res = estimator_create(scn->dev, SDIS_ESTIMATOR_TEMPERATURE, &estimator);
+  if(res != RES_OK) goto error;
+
+  /* Run wavefront probe solver */
+  res = solve_wavefront_probe(
+    scn, rng, enc_id,
+    args->position, args->time_range,
+    args->nrealisations,
+    args->picard_order,
+    args->diff_algo,
+    &acc_temp);
+  if(res != RES_OK) goto error;
+
+  /* Setup estimator from accumulator */
+  estimator_setup_realisations_count(estimator,
+    args->nrealisations, acc_temp.count);
+  estimator_setup_temperature(estimator, acc_temp.sum, acc_temp.sum2);
+
+  *out_estimator = estimator;
+  goto exit;
+
+error:
+  if(estimator) { sdis_estimator_ref_put(estimator); estimator = NULL; }
+exit:
+  if(rng && !args->rng_state) ssp_rng_ref_put(rng);
+  return res;
+}
