@@ -36,6 +36,22 @@
 
 #include <omp.h>
 #include <stdlib.h> /* getenv */
+#include <stdio.h>  /* pixel trace */
+
+/* Per-path temperature trace for CPU solver (set STARDIS_PIXEL_TRACE_CPU=cpu_trace.csv) */
+static FILE* s_cpu_trace_fp = NULL;
+static int   s_cpu_trace_checked = 0;
+static FILE* cpu_pixel_trace_file(void) {
+  if(!s_cpu_trace_checked) {
+    const char* path = getenv("STARDIS_PIXEL_TRACE_CPU");
+    if(path && path[0]) s_cpu_trace_fp = fopen(path, "w");
+    if(s_cpu_trace_fp)
+      fprintf(s_cpu_trace_fp,
+        "px,py,spp,T_value,T_done,res\n");
+    s_cpu_trace_checked = 1;
+  }
+  return s_cpu_trace_fp;
+}
 
 /*******************************************************************************
  * Helper function
@@ -174,6 +190,16 @@ solve_pixel
 
     /* Stop time registration */
     time_sub(&t0, time_current(&t1), &t0);
+
+    /* Per-path temperature trace */
+    { FILE* tf = cpu_pixel_trace_file();
+      if(tf) {
+        fprintf(tf, "%lu,%lu,%lu,%.17g,%d,%d\n",
+          (unsigned long)ipix[0], (unsigned long)ipix[1],
+          (unsigned long)irealisation,
+          w, (int)(res_simul == RES_OK), (int)res_simul);
+      }
+    }
 
     if(res_simul == RES_OK) {
       /* Update pixel accumulators */
@@ -763,6 +789,9 @@ persistent_wf_done:
   }
 
 exit:
+  /* Flush and close CPU pixel trace file */
+  if(s_cpu_trace_fp) { fclose(s_cpu_trace_fp); s_cpu_trace_fp = NULL; s_cpu_trace_checked = 0; }
+
   free_rendered_tiles(&tiles);
   if(per_thread_rng)release_per_thread_rng(scn->dev, per_thread_rng);
   if(progress) free_process_progress(scn->dev, progress);

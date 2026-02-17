@@ -101,6 +101,10 @@ struct wavefront_pool {
   /* --- Per-slot RNG (independent streams) --- */
   struct ssp_rng**    slot_rngs;
 
+  /* --- Per-path CBRNG thin wrapper storage (allocated by adapter) --- */
+  struct ssp_rng*     thin_rng_storage;  /* contiguous array [pool_size]   */
+  uint64_t            global_seed;       /* user-controlled seed for CBRNG */
+
   /* --- Stream Compaction indices (M2.5) --- */
   uint32_t*           active_indices;  /* compact array of active slot ids  */
   size_t              active_compact;  /* length of active_indices          */

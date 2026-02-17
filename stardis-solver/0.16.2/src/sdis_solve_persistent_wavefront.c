@@ -28,6 +28,8 @@
  */
 
 #include "sdis_solve_persistent_wavefront.h"
+#include "sdis_wf_rng.h"
+#include "sdis_wf_rng_adapter.h"
 #include "sdis.h"
 #include "sdis_brdf.h"
 #include "sdis_c.h"
@@ -53,6 +55,22 @@
 #include <float.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>  /* pixel trace */
+
+/* Per-path temperature trace (set STARDIS_PIXEL_TRACE=gpu_trace.csv) */
+static FILE* s_pixel_trace_fp = NULL;
+static int   s_pixel_trace_checked = 0;
+static FILE* pixel_trace_file(void) {
+  if(!s_pixel_trace_checked) {
+    const char* path = getenv("STARDIS_PIXEL_TRACE");
+    if(path && path[0]) s_pixel_trace_fp = fopen(path, "w");
+    if(s_pixel_trace_fp)
+      fprintf(s_pixel_trace_fp,
+        "path_id,px,py,spp,T_value,T_done,done_reason,steps,phase\n");
+    s_pixel_trace_checked = 1;
+  }
+  return s_pixel_trace_fp;
+}
 
 /*******************************************************************************
  * Step functions are now in sdis_wf_steps.c with LOCAL_SYM linkage.
@@ -133,13 +151,18 @@ pool_destroy(struct wavefront_pool* pool)
   if(pool->enc_batch_ctx) s3d_batch_enc_context_destroy(pool->enc_batch_ctx);
 
   /* Release per-slot RNGs */
-  if(pool->slot_rngs) {
+  if(pool->thin_rng_storage) {
+    /* Per-path CBRNG mode: thin wrappers own no heap state, free array */
+    wf_rng_destroy_thin_ssp_rngs(pool->thin_rng_storage);
+    pool->thin_rng_storage = NULL;
+  } else if(pool->slot_rngs) {
+    /* Legacy round-robin mode: release ref-counted shared RNGs */
     size_t i;
     for(i = 0; i < pool->pool_size; i++) {
       if(pool->slot_rngs[i]) SSP(rng_ref_put(pool->slot_rngs[i]));
     }
-    free(pool->slot_rngs);
   }
+  free(pool->slot_rngs);
 
   free(pool->task_queue);
   free(pool->slots);
@@ -262,7 +285,8 @@ init_single_path(
   const double pix_sz[2],
   const size_t picard_order,
   const enum sdis_diffusion_algorithm diff_algo,
-  uint32_t path_id)
+  uint32_t path_id,
+  uint64_t global_seed)
 {
   double samp[2];
   double ray_pos[3], ray_dir[3];
@@ -280,8 +304,17 @@ init_single_path(
   p->ipix_image[0] = task->ipix_image[0];
   p->ipix_image[1] = task->ipix_image[1];
 
-  /* Use per-slot RNG */
+  /* Use per-slot RNG (thin wrapper pointing to p->rng_state) */
   p->rng = rng;
+
+  /* Seed per-path CBRNG with (pixel_x, pixel_y, spp_idx, global_seed).
+   * The thin ssp_rng wrapper's state already points to &p->rng_state,
+   * so all ssp_rng_canonical(p->rng) calls will use this seeded state. */
+  wf_rng_seed(&p->rng_state,
+              (uint32_t)task->ipix_image[0],
+              (uint32_t)task->ipix_image[1],
+              task->spp_idx,
+              global_seed);
 
   /* Sample time (same RNG call order as solve_pixel) */
   time = sample_time(p->rng, time_range);
@@ -408,7 +441,7 @@ fill_pool(struct wavefront_pool* pool)
       pool->scn, pool->enc_id, pool->cam,
       pool->time_range, pool->pix_sz,
       pool->picard_order, pool->diff_algo,
-      pool->next_path_id++);
+      pool->next_path_id++, pool->global_seed);
     if(res != RES_OK) return res;
 
     /* Advance past PATH_INIT to first ray request */
@@ -450,7 +483,8 @@ compact_active_paths(struct wavefront_pool* pool)
   for(i = 0; i < pool->pool_size; i++) {
     struct path_state* p = &pool->slots[i];
 
-    if(p->phase == PATH_DONE || p->phase == PATH_ERROR) {
+    if(p->phase == PATH_DONE || p->phase == PATH_ERROR
+    || p->phase == PATH_HARVESTED) {
       /* M8: if sfn_stack_depth > 0, the sub-path finished but the
        * parent picardN frame still needs to resume.  Re-activate. */
       if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
@@ -976,7 +1010,9 @@ harvest_completed_paths(
     uint32_t i = pool->done_indices[k];
     struct path_state* p = &pool->slots[i];
 
-    /* Skip if already harvested (active==0 AND phase reset) */
+    /* Skip if already harvested */
+    if(p->phase == PATH_HARVESTED)
+      continue;
     if(!p->active && p->phase != PATH_DONE && p->phase != PATH_ERROR)
       continue;
 
@@ -990,6 +1026,18 @@ harvest_completed_paths(
         estimator->temperature.count += 1;
         estimator->realisation_time.count += 1;
         estimator->nrealisations += 1;
+      }
+    }
+
+    /* Per-path temperature trace */
+    { FILE* tf = pixel_trace_file();
+      if(tf) {
+        fprintf(tf, "%u,%u,%u,%u,%.17g,%d,%d,%lu,%d\n",
+          (unsigned)p->path_id,
+          (unsigned)p->ipix_image[0], (unsigned)p->ipix_image[1],
+          (unsigned)p->realisation_idx,
+          p->T.value, (int)p->T.done, p->done_reason,
+          (unsigned long)p->steps_taken, (int)p->phase);
       }
     }
 
@@ -1008,11 +1056,12 @@ harvest_completed_paths(
     default: break;
     }
 
-    /* Mark slot as harvestable for refill.
-     * We set active=0 (done by step functions) and clear phase so that
-     * refill_pool can identify available slots. */
+    /* Mark slot as harvested -- prevents re-accumulation if refill
+     * cannot replace this slot (task queue exhausted).  The new
+     * PATH_HARVESTED state is a terminal state distinct from PATH_DONE
+     * that compact_active_paths and refill_pool recognise. */
     p->active = 0;
-    /* phase stays PATH_DONE until refill overwrites with a new task */
+    p->phase  = PATH_HARVESTED;
   }
 
   return RES_OK;
@@ -1041,7 +1090,8 @@ refill_pool(struct wavefront_pool* pool, size_t* out_refill_count)
 
     /* Only refill slots that have been harvested */
     if(p->active) continue;
-    if(p->phase != PATH_DONE && p->phase != PATH_ERROR) continue;
+    if(p->phase != PATH_DONE && p->phase != PATH_ERROR
+    && p->phase != PATH_HARVESTED) continue;
     if(pool->task_next >= pool->task_count) break;
 
     {
@@ -1052,7 +1102,7 @@ refill_pool(struct wavefront_pool* pool, size_t* out_refill_count)
         pool->scn, pool->enc_id, pool->cam,
         pool->time_range, pool->pix_sz,
         pool->picard_order, pool->diff_algo,
-        pool->next_path_id++);
+        pool->next_path_id++, pool->global_seed);
       if(res != RES_OK) return res;
 
       /* Advance past PATH_INIT */
@@ -1265,10 +1315,46 @@ solve_camera_persistent_wavefront(
     goto cleanup;
   }
 
-  /* ====== 2. Assign per-slot RNGs (round-robin from per_thread_rng) ====== */
-  for(i = 0; i < pool.pool_size; i++) {
-    pool.slot_rngs[i] = per_thread_rng[i % nthreads];
-    SSP(rng_ref_get(pool.slot_rngs[i]));
+  /* ====== 2. Create per-path CBRNG thin wrappers ====== */
+  /* Each slot gets its own ssp_rng whose desc.get delegates to wf_rng_get()
+   * on the embedded path_state.rng_state.  This eliminates the round-robin
+   * RNG sharing that caused 32x32-pixel block noise patterns. */
+  {
+    struct ssp_rng* thin_storage = NULL;
+    /* Build array of wf_rng pointers (one per slot) for the C++ adapter */
+    struct wf_rng** rng_ptrs = (struct wf_rng**)malloc(
+        pool.pool_size * sizeof(struct wf_rng*));
+    if(!rng_ptrs) {
+      res = RES_MEM_ERR;
+      log_err(scn->dev,
+        "persistent_wavefront: rng_ptrs alloc failed\n");
+      goto cleanup;
+    }
+    { size_t ri;
+      for(ri = 0; ri < pool.pool_size; ri++)
+        rng_ptrs[ri] = &pool.slots[ri].rng_state;
+    }
+    res = wf_rng_create_thin_ssp_rngs(pool.pool_size, rng_ptrs,
+                                       pool.slot_rngs, &thin_storage);
+    free(rng_ptrs);
+    if(res != RES_OK) {
+      log_err(scn->dev,
+        "persistent_wavefront: wf_rng thin wrapper creation failed -- %s\n",
+        res_to_cstr(res));
+      goto cleanup;
+    }
+    pool.thin_rng_storage = thin_storage;
+  }
+
+  /* Store global seed for per-path CBRNG seeding.
+   * Derived from the first per_thread_rng to ensure deterministic
+   * behaviour for a given input seed (user's -s parameter). */
+  {
+    double r0 = ssp_rng_canonical(per_thread_rng[0]);
+    double r1 = ssp_rng_canonical(per_thread_rng[0]);
+    uint32_t hi = (uint32_t)(r0 * 4294967296.0);  /* [0, 2^32) */
+    uint32_t lo = (uint32_t)(r1 * 4294967296.0);  /* [0, 2^32) */
+    pool.global_seed = ((uint64_t)hi << 32) | (uint64_t)lo;
   }
 
   /* ====== 3. Generate task queue ====== */
@@ -1523,6 +1609,9 @@ solve_camera_persistent_wavefront(
   log_drain_phase_report(scn->dev, &pool);
 
 cleanup:
+  /* Flush and close pixel trace file */
+  if(s_pixel_trace_fp) { fclose(s_pixel_trace_fp); s_pixel_trace_fp = NULL; s_pixel_trace_checked = 0; }
+
   pool_destroy(&pool);
   return res;
 }

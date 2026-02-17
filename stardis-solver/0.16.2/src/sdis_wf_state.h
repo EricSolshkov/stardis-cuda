@@ -24,6 +24,7 @@
 #define SDIS_WF_STATE_H
 
 #include "sdis_wf_types.h"  /* enum path_phase, enum ray_bucket_type        */
+#include "sdis_wf_rng.h"   /* struct wf_rng, per-path CBRNG                */
 #include "sdis_heat_path.h" /* struct rwalk, rwalk_context, temperature      */
 #include "sdis_medium_c.h"  /* struct solid_props                            */
 #include "sdis_scene_c.h"   /* struct hit_filter_data                        */
@@ -129,6 +130,9 @@ struct path_state {
 
   /* --- RNG (shared per-thread, non-owning pointer) --- */
   struct ssp_rng* rng;
+
+  /* --- Per-path CBRNG state (inline, keyed by pixel+spp+seed) --- */
+  struct wf_rng   rng_state;
 
   /* --- Image-space pixel coords (in image plane) --- */
   size_t  ipix_image[2];

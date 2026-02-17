@@ -9,8 +9,13 @@ cmake_minimum_required(VERSION 3.25)
 project(stardis-solver
     VERSION 0.16.2
     DESCRIPTION "stardis-solver: Monte Carlo radiation transfer solver"
-    LANGUAGES C
+    LANGUAGES C CXX
 )
+
+# C++ standard required for sdis_wf_rng_adapter.cpp (uses ssp_rng_c.h which
+# includes <random>, Random123/conventional/Engine.hpp)
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ============================================================================
 # Load Helper Functions
@@ -65,6 +70,7 @@ set(SDIS_SOURCES
     src/sdis_solve_wavefront.c
     src/sdis_wf_steps.c
     src/sdis_solve_persistent_wavefront.c
+    src/sdis_wf_rng_adapter.cpp
     src/sdis_source.c
     src/sdis_tile.c
 )
@@ -80,6 +86,7 @@ target_include_directories(sdis_obj
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
         $<INSTALL_INTERFACE:include>
+        ${RANDOM123_INCLUDE_DIR}
 )
 
 # ============================================================================

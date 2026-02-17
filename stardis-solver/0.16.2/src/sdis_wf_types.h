@@ -130,6 +130,7 @@ enum path_phase {
 
   /* === Terminal === */
   PATH_DONE,                               /* path finished              */
+  PATH_HARVESTED,                          /* done + result accumulated   */
   PATH_ERROR,                              /* error termination          */
 
   PATH_PHASE_COUNT                         /* total state count          */
