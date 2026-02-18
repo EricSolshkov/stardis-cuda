@@ -138,6 +138,7 @@ pool_create(struct wavefront_pool* pool, size_t pool_size)
 
   /* Initialise diagnostics */
   pool->diag_min_batch = (size_t)-1; /* updated on first step with rays */
+  pool->trace_batch_size_min = (size_t)-1;
 
   return RES_OK;
 }
@@ -957,6 +958,9 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
 
     for(;;) {
       int advanced = 0;
+      enum path_phase phase_before;
+      struct time t_step0, t_step1;
+
       if(p->needs_ray) break;
       if(p->phase == PATH_DONE || p->phase == PATH_ERROR) {
         /* M8: intercept PATH_DONE when sfn_stack_depth > 0.
@@ -972,7 +976,19 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
       /* M10: also break on enc_locate-pending phases */
       if(path_phase_is_enc_locate_pending(p->phase)) break;
 
+      pool->cascade_total_iterations++;
+      phase_before = p->phase;
+      time_current(&t_step0);
+
       res = advance_one_step_no_ray(p, scn, &advanced);
+
+      time_current(&t_step1);
+      if((int)phase_before >= 0 && (int)phase_before < PATH_PHASE_COUNT) {
+        pool->cascade_phase_count[(int)phase_before]++;
+        pool->cascade_phase_time[(int)phase_before]
+          += time_elapsed_sec(&t_step0, &t_step1);
+      }
+
       if(res != RES_OK && res != RES_BAD_OP
       && res != RES_BAD_OP_IRRECOVERABLE) return res;
       if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
@@ -984,6 +1000,7 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
         break;
       }
       if(!advanced) break;
+      pool->cascade_total_advances++;
       p->steps_taken++;
     }
   }
@@ -1211,6 +1228,87 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     pool->time_distribute_s,
     pool->time_cascade_s,
     pool->time_harvest_s);
+
+  /* --- Experiment 3: Cascade per-phase top-N hotspots --- */
+  if(pool->cascade_total_advances > 0) {
+    /* Collect phase indices sorted by time (simple selection of top 10) */
+    int top[10];
+    int ti, tj;
+    int used[PATH_PHASE_COUNT];
+    memset(used, 0, sizeof(used));
+
+    for(ti = 0; ti < 10; ti++) {
+      int best = -1;
+      double best_t = 0;
+      for(tj = 0; tj < PATH_PHASE_COUNT; tj++) {
+        if(used[tj]) continue;
+        if(pool->cascade_phase_time[tj] > best_t) {
+          best_t = pool->cascade_phase_time[tj];
+          best = tj;
+        }
+      }
+      top[ti] = best;
+      if(best >= 0) used[best] = 1;
+    }
+
+    log_info(dev,
+      "cascade profiling: total_iterations=%lu  total_advances=%lu\n",
+      (unsigned long)pool->cascade_total_iterations,
+      (unsigned long)pool->cascade_total_advances);
+
+    for(ti = 0; ti < 10; ti++) {
+      int ph = top[ti];
+      if(ph < 0 || pool->cascade_phase_count[ph] == 0) break;
+      log_info(dev,
+        "  cascade phase[%2d]: count=%10lu  time=%8.3fs  avg=%.3fus  "
+        "(%.1f%% of cascade)\n",
+        ph,
+        (unsigned long)pool->cascade_phase_count[ph],
+        pool->cascade_phase_time[ph],
+        pool->cascade_phase_time[ph] * 1e6
+          / (double)pool->cascade_phase_count[ph],
+        pool->cascade_phase_time[ph] * 100.0 / pool->time_cascade_s);
+    }
+  }
+
+  /* --- Experiment 7+8: Batch trace per-call summary --- */
+  if(pool->trace_call_count > 0) {
+    double avg_batch = (double)pool->trace_batch_size_sum
+                     / (double)pool->trace_call_count;
+    double avg_batch_ms = pool->trace_batch_time_ms_sum
+                        / (double)pool->trace_call_count;
+    double avg_post_ms  = pool->trace_post_time_ms_sum
+                        / (double)pool->trace_call_count;
+    double total_trace_ms = pool->trace_batch_time_ms_sum
+                          + pool->trace_post_time_ms_sum
+                          + pool->trace_retrace_time_ms_sum;
+    double gpu_pct  = pool->trace_batch_time_ms_sum * 100.0 / total_trace_ms;
+    double post_pct = pool->trace_post_time_ms_sum * 100.0 / total_trace_ms;
+    double rtrc_pct = pool->trace_retrace_time_ms_sum * 100.0 / total_trace_ms;
+    double throughput = (double)pool->total_rays_traced
+                      / (pool->trace_batch_time_ms_sum * 1e-3) / 1e6;
+
+    log_info(dev,
+      "batch trace profiling: calls=%lu  avg_batch=%.0f  "
+      "min=%lu  max=%lu\n"
+      "  gpu_kernel+upload: total=%.1fms (%.1f%%)  avg=%.2fms/call\n"
+      "  cpu_postprocess:   total=%.1fms (%.1f%%)  avg=%.2fms/call\n"
+      "  fallback_retrace:  total=%.1fms (%.1f%%)  "
+      "accepted=%lu  missed=%lu  rejected=%lu\n"
+      "  gpu_throughput: %.1f Mrays/s  (kernel+upload only)\n",
+      (unsigned long)pool->trace_call_count,
+      avg_batch,
+      (unsigned long)(pool->trace_batch_size_min == (size_t)-1
+                      ? 0 : pool->trace_batch_size_min),
+      (unsigned long)pool->trace_batch_size_max,
+      pool->trace_batch_time_ms_sum, gpu_pct, avg_batch_ms,
+      pool->trace_post_time_ms_sum, post_pct, avg_post_ms,
+      pool->trace_retrace_time_ms_sum, rtrc_pct,
+      (unsigned long)pool->trace_retrace_accepted_sum,
+      (unsigned long)pool->trace_retrace_missed_sum,
+      (unsigned long)pool->trace_filter_rejected_sum,
+      throughput);
+  }
 }
 
 /*******************************************************************************
@@ -1439,6 +1537,20 @@ solve_camera_persistent_wavefront(
       if(res != RES_OK) goto cleanup;
 
       pool.total_rays_traced += pool.ray_count;
+
+      /* Experiment 7+8: accumulate per-call batch trace stats */
+      pool.trace_call_count++;
+      pool.trace_batch_size_sum += pool.ray_count;
+      if(pool.ray_count < pool.trace_batch_size_min)
+        pool.trace_batch_size_min = pool.ray_count;
+      if(pool.ray_count > pool.trace_batch_size_max)
+        pool.trace_batch_size_max = pool.ray_count;
+      pool.trace_batch_time_ms_sum   += stats.batch_time_ms;
+      pool.trace_post_time_ms_sum    += stats.postprocess_time_ms;
+      pool.trace_retrace_time_ms_sum += stats.retrace_time_ms;
+      pool.trace_retrace_accepted_sum += stats.retrace_accepted;
+      pool.trace_retrace_missed_sum   += stats.retrace_missed;
+      pool.trace_filter_rejected_sum  += stats.filter_rejected;
     }
     time_current(&t_phase1);
     pool.time_trace_s += time_elapsed_sec(&t_phase0, &t_phase1);

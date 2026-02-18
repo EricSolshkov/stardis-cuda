@@ -192,6 +192,27 @@ struct wavefront_pool {
   /* M3: Wavefront width tracking */
   size_t diag_total_active; /* sum of active_count across all steps  */
   size_t paths_truncated;   /* paths force-terminated in drain (M3.5)*/
+
+  /* === Experiment 3: Cascade per-phase profiling === */
+  size_t cascade_phase_count[PATH_PHASE_COUNT]; /* dispatch count per phase */
+  double cascade_phase_time[PATH_PHASE_COUNT];  /* cumulative seconds/phase */
+  size_t cascade_total_advances;                /* total advance_one_step calls */
+  size_t cascade_total_iterations;              /* total inner-loop iterations  */
+
+  /* === Experiment 7: Batch trace per-call timing === */
+  double trace_batch_time_ms_sum;    /* sum of batch_time_ms   */
+  double trace_post_time_ms_sum;     /* sum of postprocess_time_ms */
+  double trace_retrace_time_ms_sum;  /* sum of retrace_time_ms */
+  size_t trace_call_count;           /* number of batch trace calls */
+  size_t trace_batch_size_sum;       /* sum of nrays across calls  */
+  size_t trace_batch_size_min;       /* smallest single-call nrays */
+  size_t trace_batch_size_max;       /* largest single-call nrays  */
+
+  /* === Experiment 8: cudaStreamSynchronize breakdown (from stats) === */
+  /* Populated from s3d_batch_trace_stats per call */
+  size_t trace_retrace_accepted_sum;
+  size_t trace_retrace_missed_sum;
+  size_t trace_filter_rejected_sum;
 };
 
 /*******************************************************************************

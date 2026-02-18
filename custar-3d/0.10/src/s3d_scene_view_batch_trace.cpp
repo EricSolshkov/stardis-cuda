@@ -39,6 +39,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <assert.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -454,6 +455,12 @@ s3d_scene_view_trace_rays_batch
         return RES_OK;
     if(!(scnview->mask & S3D_TRACE))
         return RES_BAD_ARG;
+    if(nrays == 1) {
+        fprintf(stderr,
+            "[BATCH_TRACE] ABORT: batch size == 1 in "
+            "s3d_scene_view_trace_rays_batch — inefficient GPU launch!\n");
+        abort();
+    }
 
     struct cus3d_ray_batch gpu_batch;
     res_T res = cus3d_ray_batch_create(&gpu_batch, nrays);
@@ -492,6 +499,12 @@ s3d_scene_view_trace_rays_batch_ctx
         return RES_BAD_ARG;
     if(nrays > ctx->max_rays)
         return RES_BAD_ARG;
+    if(nrays == 1) {
+        fprintf(stderr,
+            "[BATCH_TRACE] ABORT: batch size == 1 in "
+            "s3d_scene_view_trace_rays_batch_ctx — inefficient GPU launch!\n");
+        abort();
+    }
 
     return trace_rays_batch_impl(
         scnview, &ctx->gpu_batch, ctx->h_multi_results,
