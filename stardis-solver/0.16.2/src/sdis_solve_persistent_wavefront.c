@@ -922,15 +922,23 @@ pool_distribute_ray_results(struct wavefront_pool* pool, struct sdis_scene* scn)
           p->enc_query.fb_hit = pool->ray_hits[p->ray_req.batch_idx];
         }
 
-        p->needs_ray = 0;
-        res = advance_one_step_with_ray(p, scn, h0, h1);
-        if(res != RES_OK && res != RES_BAD_OP
-        && res != RES_BAD_OP_IRRECOVERABLE) return res;
-        if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
-          mark_path_failed(p, pool);
-          res = RES_OK;
+        {
+          enum path_phase phase_before = p->phase;
+          p->needs_ray = 0;
+          res = advance_one_step_with_ray(p, scn, h0, h1);
+          if(res != RES_OK && res != RES_BAD_OP
+          && res != RES_BAD_OP_IRRECOVERABLE) return res;
+          if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
+            mark_path_failed(p, pool);
+            res = RES_OK;
+          }
+          /* Track M1-v2 → M10 escalation */
+          if(phase_before == PATH_ENC_QUERY_FB_EMIT
+          && p->phase == PATH_ENC_LOCATE_PENDING) {
+            pool->enc_query_escalated_to_m10++;
+          }
+          p->steps_taken++;
         }
-        p->steps_taken++;
       }
     }
   }
@@ -987,6 +995,11 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
         pool->cascade_phase_count[(int)phase_before]++;
         pool->cascade_phase_time[(int)phase_before]
           += time_elapsed_sec(&t_step0, &t_step1);
+      }
+      /* Track M10 degenerate → NULL (side < 0 path accepted NULL enc_id) */
+      if(phase_before == PATH_ENC_LOCATE_RESULT
+      && p->enc_locate.prim_id >= 0 && p->enc_locate.side < 0) {
+        pool->enc_locate_degenerate_null++;
       }
 
       if(res != RES_OK && res != RES_BAD_OP
@@ -1228,6 +1241,15 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     pool->time_distribute_s,
     pool->time_cascade_s,
     pool->time_harvest_s);
+
+  /* Enclosure query escalation stats */
+  if(pool->enc_query_escalated_to_m10 > 0
+  || pool->enc_locate_degenerate_null > 0) {
+    log_info(dev,
+      "  enc_escalation: query_fb->m10=%lu  m10_degenerate_null=%lu\n",
+      (unsigned long)pool->enc_query_escalated_to_m10,
+      (unsigned long)pool->enc_locate_degenerate_null);
+  }
 
   /* --- Experiment 3: Cascade per-phase top-N hotspots --- */
   if(pool->cascade_total_advances > 0) {

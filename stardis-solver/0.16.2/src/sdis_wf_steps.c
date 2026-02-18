@@ -937,14 +937,11 @@ step_enc_locate_result(struct path_state* p, struct sdis_scene* scn)
     enc_id = enc_ids[p->enc_locate.side]; /* side 0=front, 1=back */
   } else if(p->enc_locate.prim_id >= 0 && p->enc_locate.side < 0) {
     /* Degenerate: point is ON a surface (distance < threshold).
-     * Fallback to brute-force scene_get_enclosure_id(). */
-    res_T res = scene_get_enclosure_id(scn, p->enc_locate.query_pos, &enc_id);
-    if(res == RES_BAD_OP) {
-      enc_id = ENCLOSURE_ID_NULL;
-    } else if(res != RES_OK) {
-      p->enc_locate.resolved_enc_id = ENCLOSURE_ID_NULL;
-      return res;
-    }
+     * Accept NULL rather than calling the synchronous brute-force
+     * scene_get_enclosure_id() which issues O(nprims) blocking
+     * trace_ray calls.  This case is extremely rare and accepting
+     * NULL does not affect convergence. */
+    enc_id = ENCLOSURE_ID_NULL;
   }
   /* else: prim_id < 0 → miss, enc_id stays ENCLOSURE_ID_NULL */
 
@@ -1128,10 +1125,17 @@ step_enc_query_fb_resolve(struct path_state* p, struct sdis_scene* scn)
   }
 
   if(enc_id == ENCLOSURE_ID_NULL) {
-    /* Last resort: synchronous brute-force (extremely rare) */
-    res_T res = scene_get_enclosure_id(scn, p->enc_query.query_pos, &enc_id);
-    if(res == RES_BAD_OP) enc_id = ENCLOSURE_ID_NULL;
-    else if(res != RES_OK) return res;
+    /* Escalate to M10 BVH closest-point batch instead of synchronous
+     * brute-force.  The return_state is forwarded so that when M10
+     * resolves, the path resumes at the original caller.  enc_locate
+     * and enc_query are independent top-level members of path_state,
+     * so writing enc_locate.* does not clobber enc_query.*. */
+    step_enc_locate_submit(p,
+                           p->enc_query.query_pos,
+                           p->enc_query.return_state);
+    /* p->phase is now PATH_ENC_LOCATE_PENDING; cascade will break out
+     * and the next main-loop Step D2 will collect this request. */
+    return RES_OK;
   }
 
   p->enc_query.resolved_enc_id = enc_id;

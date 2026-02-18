@@ -457,9 +457,9 @@ s3d_scene_view_trace_rays_batch
         return RES_BAD_ARG;
     if(nrays == 1) {
         fprintf(stderr,
-            "[BATCH_TRACE] ABORT: batch size == 1 in "
+            "[BATCH_TRACE] WARNING: batch size == 1 in "
             "s3d_scene_view_trace_rays_batch — inefficient GPU launch!\n");
-        abort();
+        assert(nrays != 1 && "batch size == 1 in trace_rays_batch");
     }
 
     struct cus3d_ray_batch gpu_batch;
@@ -501,9 +501,9 @@ s3d_scene_view_trace_rays_batch_ctx
         return RES_BAD_ARG;
     if(nrays == 1) {
         fprintf(stderr,
-            "[BATCH_TRACE] ABORT: batch size == 1 in "
+            "[BATCH_TRACE] WARNING: batch size == 1 in "
             "s3d_scene_view_trace_rays_batch_ctx — inefficient GPU launch!\n");
-        abort();
+        assert(nrays != 1 && "batch size == 1 in trace_rays_batch_ctx");
     }
 
     return trace_rays_batch_impl(

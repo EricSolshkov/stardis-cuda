@@ -179,6 +179,10 @@ struct wavefront_pool {
   size_t enc_locates_degenerate; /* degenerate fallbacks               */
   double time_enc_locate_s;  /* cumulative enc_locate batch time      */
 
+  /* Enclosure query escalation counters (M1-v2 → M10 cascade) */
+  size_t enc_query_escalated_to_m10; /* fb_resolve → enc_locate cascade */
+  size_t enc_locate_degenerate_null; /* M10 degenerate → accept NULL    */
+
   /* M3: Per-phase wall-clock timing (seconds) */
   double time_collect_s;    /* cumulative collect_ray_requests time  */
   double time_trace_s;      /* cumulative GPU batch trace time       */
