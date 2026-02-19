@@ -103,8 +103,19 @@ target_link_libraries(sdis_obj
         senc2d
         senc3d
         ssp
-        $<$<BOOL:${OpenMP_C_FOUND}>:OpenMP::OpenMP_C>
 )
+
+# OpenMP: link directly (no generator expression) to ensure MSVC Visual Studio
+# generator correctly sets <OpenMPSupport>true</OpenMPSupport> for OBJECT libs.
+# Using $<$<BOOL:...>:OpenMP::OpenMP_C> silently fails to propagate the MSBuild
+# property, causing all #pragma omp directives to be ignored.
+# For OBJECT libraries, we also need target_compile_options to force the flag,
+# because the imported target's INTERFACE_COMPILE_OPTIONS may not map to the
+# MSBuild <OpenMPSupport> property for OBJECT targets.
+if(OpenMP_C_FOUND)
+    target_link_libraries(sdis_obj PUBLIC OpenMP::OpenMP_C)
+    target_compile_options(sdis_obj PRIVATE ${OpenMP_C_FLAGS})
+endif()
 
 # Optional: star-wf
 if(TARGET swf)

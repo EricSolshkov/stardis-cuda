@@ -52,6 +52,7 @@
 #include <rsys/cstr.h>
 #include <rsys/morton.h>
 
+#include <omp.h>
 #include <float.h>
 #include <stdlib.h>
 #include <string.h>
@@ -947,74 +948,206 @@ pool_distribute_ray_results(struct wavefront_pool* pool, struct sdis_scene* scn)
 }
 
 /*******************************************************************************
+ * Cascade non-ray steps -- serial inner kernel
+ *
+ * Advances a single path through non-ray phases until a ray is needed,
+ * the path completes, or no progress can be made.  Accumulates statistics
+ * into caller-provided local counters (thread-safe for OMP).
+ *
+ * Returns: 0 = ok, 1 = fatal error (propagate to caller).
+ ******************************************************************************/
+static int
+cascade_advance_single_path(
+  struct path_state* p,
+  struct sdis_scene* scn,
+  /* --- thread-local accumulators --- */
+  size_t* local_iterations,
+  size_t* local_advances,
+  size_t* local_paths_failed,
+  size_t* local_enc_degenerate_null,
+  size_t  local_phase_count[],
+  double  local_phase_time[])
+{
+  for(;;) {
+    int advanced = 0;
+    enum path_phase phase_before;
+    struct time t_step0, t_step1;
+    res_T res;
+
+    if(p->needs_ray) break;
+    if(p->phase == PATH_DONE || p->phase == PATH_ERROR) {
+      /* M8: intercept PATH_DONE when sfn_stack_depth > 0. */
+      if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
+        p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+        p->active = 1;
+        continue;
+      }
+      break;
+    }
+    if(path_phase_is_ray_pending(p->phase)) break;
+    if(path_phase_is_enc_locate_pending(p->phase)) break;
+
+    (*local_iterations)++;
+    phase_before = p->phase;
+    time_current(&t_step0);
+
+    res = advance_one_step_no_ray(p, scn, &advanced);
+
+    time_current(&t_step1);
+    if((int)phase_before >= 0 && (int)phase_before < PATH_PHASE_COUNT) {
+      local_phase_count[(int)phase_before]++;
+      local_phase_time[(int)phase_before]
+        += time_elapsed_sec(&t_step0, &t_step1);
+    }
+    if(phase_before == PATH_ENC_LOCATE_RESULT
+    && p->enc_locate.prim_id >= 0 && p->enc_locate.side < 0) {
+      (*local_enc_degenerate_null)++;
+    }
+
+    if(res != RES_OK && res != RES_BAD_OP
+    && res != RES_BAD_OP_IRRECOVERABLE) return 1; /* fatal */
+    if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
+      p->phase = PATH_DONE;
+      p->active = 0;
+      p->done_reason = -1;
+      (*local_paths_failed)++;
+      break;
+    }
+    if(!advanced) break;
+    (*local_advances)++;
+    p->steps_taken++;
+  }
+
+  return 0; /* ok */
+}
+
+/*******************************************************************************
  * Cascade non-ray steps -- compact version (M2.5)
  *
  * For each active path, advance through non-ray phases until a ray is
  * needed, the path completes, or no progress can be made.
+ *
+ * OMP parallelization:
+ *   - Controlled by STARDIS_CASCADE_OMP env var (default=1=on).
+ *   - Thread count from scn->dev->nthreads (matches CPU version's -t flag).
+ *   - schedule(dynamic, 64) for load balancing (variable cascade depth).
+ *   - Per-thread local accumulators, reduced after the parallel region.
  ******************************************************************************/
 static res_T
 pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
                                    struct sdis_scene* scn)
 {
-  size_t k;
-  res_T res = RES_OK;
+  const size_t n = pool->active_compact;
+  int use_omp = 1;
+  int omp_nthreads;
+  int had_fatal = 0;
 
-  for(k = 0; k < pool->active_compact; k++) {
-    uint32_t i = pool->active_indices[k];
-    struct path_state* p = &pool->slots[i];
-    if(!p->active) continue;
+  /* Check env var for cascade OMP toggle (default = on) */
+  {
+    const char* env = getenv("STARDIS_CASCADE_OMP");
+    if(env && env[0] == '0') use_omp = 0;
+  }
 
-    for(;;) {
-      int advanced = 0;
-      enum path_phase phase_before;
-      struct time t_step0, t_step1;
+  /* Determine thread count: use scn->dev->nthreads, same as CPU -t flag */
+  omp_nthreads = (scn && scn->dev) ? (int)scn->dev->nthreads : 1;
+  if(omp_nthreads < 1) omp_nthreads = 1;
 
-      if(p->needs_ray) break;
-      if(p->phase == PATH_DONE || p->phase == PATH_ERROR) {
-        /* M8: intercept PATH_DONE when sfn_stack_depth > 0.
-         * The sub-path finished — resume the parent picardN frame. */
-        if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
-          p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
-          p->active = 1;
-          continue;
+  /* For very small wavefronts, serial is faster than OMP overhead */
+  if(n < 64) use_omp = 0;
+
+  if(use_omp) {
+    /* === OMP parallel cascade === */
+    #pragma omp parallel num_threads(omp_nthreads)
+    {
+      /* Per-thread local accumulators */
+      size_t tl_iterations = 0;
+      size_t tl_advances = 0;
+      size_t tl_paths_failed = 0;
+      size_t tl_enc_degenerate_null = 0;
+      size_t tl_phase_count[PATH_PHASE_COUNT];
+      double tl_phase_time[PATH_PHASE_COUNT];
+      int ph;
+      for(ph = 0; ph < PATH_PHASE_COUNT; ph++) {
+        tl_phase_count[ph] = 0;
+        tl_phase_time[ph] = 0.0;
+      }
+
+      #pragma omp for schedule(dynamic, 64)
+      for(ph = 0; ph < (int)n; ph++) {
+        uint32_t idx = pool->active_indices[ph];
+        struct path_state* p = &pool->slots[idx];
+        if(!p->active) continue;
+
+        if(cascade_advance_single_path(
+              p, scn,
+              &tl_iterations, &tl_advances,
+              &tl_paths_failed, &tl_enc_degenerate_null,
+              tl_phase_count, tl_phase_time)) {
+          /* Fatal error — signal, but can't break from OMP for.
+           * Other threads will finish their current work items.
+           * Plain write is safe: x86 aligned-int stores are atomic,
+           * and we only ever set to 1 (monotonic flag). */
+          had_fatal = 1;
         }
-        break;
-      }
-      if(path_phase_is_ray_pending(p->phase)) break;
-      /* M10: also break on enc_locate-pending phases */
-      if(path_phase_is_enc_locate_pending(p->phase)) break;
-
-      pool->cascade_total_iterations++;
-      phase_before = p->phase;
-      time_current(&t_step0);
-
-      res = advance_one_step_no_ray(p, scn, &advanced);
-
-      time_current(&t_step1);
-      if((int)phase_before >= 0 && (int)phase_before < PATH_PHASE_COUNT) {
-        pool->cascade_phase_count[(int)phase_before]++;
-        pool->cascade_phase_time[(int)phase_before]
-          += time_elapsed_sec(&t_step0, &t_step1);
-      }
-      /* Track M10 degenerate → NULL (side < 0 path accepted NULL enc_id) */
-      if(phase_before == PATH_ENC_LOCATE_RESULT
-      && p->enc_locate.prim_id >= 0 && p->enc_locate.side < 0) {
-        pool->enc_locate_degenerate_null++;
       }
 
-      if(res != RES_OK && res != RES_BAD_OP
-      && res != RES_BAD_OP_IRRECOVERABLE) return res;
-      if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
-        p->phase = PATH_DONE;
-        p->active = 0;
-        p->done_reason = -1;
-        pool->paths_failed++;
-        res = RES_OK;
-        break;
+      /* Reduction: merge thread-local counters into pool (critical) */
+      #pragma omp critical
+      {
+        int j;
+        pool->cascade_total_iterations += tl_iterations;
+        pool->cascade_total_advances   += tl_advances;
+        pool->paths_failed             += tl_paths_failed;
+        pool->enc_locate_degenerate_null += tl_enc_degenerate_null;
+        for(j = 0; j < PATH_PHASE_COUNT; j++) {
+          pool->cascade_phase_count[j] += tl_phase_count[j];
+          pool->cascade_phase_time[j]  += tl_phase_time[j];
+        }
       }
-      if(!advanced) break;
-      pool->cascade_total_advances++;
-      p->steps_taken++;
+    } /* end omp parallel */
+
+    return had_fatal ? RES_UNKNOWN_ERR : RES_OK;
+  }
+
+  /* === Serial fallback (STARDIS_CASCADE_OMP=0 or small wavefront) === */
+  {
+    size_t k;
+    size_t tl_iterations = 0;
+    size_t tl_advances = 0;
+    size_t tl_paths_failed = 0;
+    size_t tl_enc_degenerate_null = 0;
+    size_t tl_phase_count[PATH_PHASE_COUNT];
+    double tl_phase_time[PATH_PHASE_COUNT];
+    int ph;
+    for(ph = 0; ph < PATH_PHASE_COUNT; ph++) {
+      tl_phase_count[ph] = 0;
+      tl_phase_time[ph] = 0.0;
+    }
+
+    for(k = 0; k < n; k++) {
+      uint32_t idx = pool->active_indices[k];
+      struct path_state* p = &pool->slots[idx];
+      if(!p->active) continue;
+
+      if(cascade_advance_single_path(
+            p, scn,
+            &tl_iterations, &tl_advances,
+            &tl_paths_failed, &tl_enc_degenerate_null,
+            tl_phase_count, tl_phase_time)) {
+        return RES_UNKNOWN_ERR;
+      }
+    }
+
+    pool->cascade_total_iterations += tl_iterations;
+    pool->cascade_total_advances   += tl_advances;
+    pool->paths_failed             += tl_paths_failed;
+    pool->enc_locate_degenerate_null += tl_enc_degenerate_null;
+    {
+      int j;
+      for(j = 0; j < PATH_PHASE_COUNT; j++) {
+        pool->cascade_phase_count[j] += tl_phase_count[j];
+        pool->cascade_phase_time[j]  += tl_phase_time[j];
+      }
     }
   }
 
@@ -1424,6 +1557,19 @@ solve_camera_persistent_wavefront(
       (unsigned long)image_def[0], (unsigned long)image_def[1],
       (unsigned long)spp, (unsigned long)pool_size,
       sm, (unsigned long)total_tasks);
+  }
+
+  /* Log cascade OMP configuration */
+  {
+    const char* env = getenv("STARDIS_CASCADE_OMP");
+    int cascade_omp = (env && env[0] == '0') ? 0 : 1;
+    int omp_nt = (scn && scn->dev) ? (int)scn->dev->nthreads : 1;
+    if(omp_nt < 1) omp_nt = 1;
+    log_info(scn->dev,
+      "Cascade OMP: %s, threads=%d (STARDIS_CASCADE_OMP=%s)\n",
+      cascade_omp ? "ENABLED" : "DISABLED",
+      cascade_omp ? omp_nt : 1,
+      env ? env : "<unset,default=1>");
   }
 
   /* ====== 1. Allocate pool ====== */
