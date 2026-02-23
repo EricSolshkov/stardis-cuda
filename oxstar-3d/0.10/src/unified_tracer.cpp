@@ -498,6 +498,9 @@ void UnifiedTracer::ensureSingleBuffers()
         m_single_hit_buf.alloc(1);
         m_single_query_buf.alloc(1);
         m_single_result_buf.alloc(1);
+        /* Pre-allocate launch params for traceSingle (Step 2) */
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_single_params_ptr),
+                              sizeof(UnifiedParams)));
         m_single_bufs_allocated = true;
     }
 }
@@ -1139,12 +1142,13 @@ HitResult UnifiedTracer::traceSingle(const Ray& ray)
     lp.rays   = m_single_ray_buf.get();
     lp.hits   = m_single_hit_buf.get();
 
-    CudaBuffer<UnifiedParams> d_params;
-    d_params.alloc(1);
-    d_params.upload(&lp, 1);
+    /* Reuse pre-allocated params buffer (Step 2) */
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(m_single_params_ptr),
+                          &lp, sizeof(UnifiedParams),
+                          cudaMemcpyHostToDevice));
 
     OPTIX_CHECK(optixLaunch(
-        m_pipeline, 0, d_params.devicePtr(), sizeof(UnifiedParams),
+        m_pipeline, 0, m_single_params_ptr, sizeof(UnifiedParams),
         &m_sbt_rt, 1, 1, 1));
     CUDA_SYNC_CHECK();
 
@@ -1163,9 +1167,13 @@ void UnifiedTracer::traceBatch(
     lp.rays   = d_rays;
     lp.hits   = d_hits;
 
-    CUdeviceptr d_params;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_params), sizeof(UnifiedParams)));
-    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(d_params),
+    /* Reuse pre-allocated batch params buffer (Step 3) */
+    if (!m_batch_params_allocated) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_batch_params_ptr),
+                              sizeof(UnifiedParams)));
+        m_batch_params_allocated = true;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(m_batch_params_ptr),
                                &lp, sizeof(UnifiedParams),
                                cudaMemcpyHostToDevice, stream));
 
@@ -1173,9 +1181,8 @@ void UnifiedTracer::traceBatch(
     if (count <= 65536) { w = count; h = 1; }
     else { w = 8192; h = (count + w - 1) / w; }
 
-    OPTIX_CHECK(optixLaunch(m_pipeline, stream, d_params, sizeof(UnifiedParams),
+    OPTIX_CHECK(optixLaunch(m_pipeline, stream, m_batch_params_ptr, sizeof(UnifiedParams),
                             &m_sbt_rt, w, h, 1));
-    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_params)));
 }
 
 TraceResult UnifiedTracer::traceBatchTimed(
@@ -1255,9 +1262,13 @@ void UnifiedTracer::traceBatchMultiHit(
     lp.rays       = d_rays;
     lp.multi_hits = d_multi_hits;
 
-    CUdeviceptr d_params;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_params), sizeof(UnifiedParams)));
-    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(d_params),
+    /* Reuse pre-allocated batch params buffer (Step 3) */
+    if (!m_batch_params_allocated) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_batch_params_ptr),
+                              sizeof(UnifiedParams)));
+        m_batch_params_allocated = true;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(m_batch_params_ptr),
                                &lp, sizeof(UnifiedParams),
                                cudaMemcpyHostToDevice, stream));
 
@@ -1265,9 +1276,8 @@ void UnifiedTracer::traceBatchMultiHit(
     if (count <= 65536) { w = count; h = 1; }
     else { w = 8192; h = (count + w - 1) / w; }
 
-    OPTIX_CHECK(optixLaunch(m_pipeline, stream, d_params, sizeof(UnifiedParams),
+    OPTIX_CHECK(optixLaunch(m_pipeline, stream, m_batch_params_ptr, sizeof(UnifiedParams),
                             &m_sbt_mh, w, h, 1));
-    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_params)));
 }
 
 std::vector<MultiHitResult> UnifiedTracer::traceBatchMultiHit(const std::vector<Ray>& rays)
@@ -1646,6 +1656,18 @@ void UnifiedTracer::cleanup()
     if (m_raygen_rt_pg)             { optixProgramGroupDestroy(m_raygen_rt_pg);                     m_raygen_rt_pg             = nullptr; }
     if (m_nn_module)                { optixModuleDestroy(m_nn_module);                              m_nn_module                = nullptr; }
     if (m_rt_module)                { optixModuleDestroy(m_rt_module);                              m_rt_module                = nullptr; }
+
+    /* Pre-allocated launch params buffers (Step 2 + Step 3) */
+    if (m_single_params_ptr) {
+        cudaFree(reinterpret_cast<void*>(m_single_params_ptr));
+        m_single_params_ptr = 0;
+    }
+    if (m_batch_params_ptr) {
+        cudaFree(reinterpret_cast<void*>(m_batch_params_ptr));
+        m_batch_params_ptr = 0;
+        m_batch_params_allocated = false;
+    }
+    m_single_bufs_allocated = false;
 
     /* Geometry and acceleration structures */
     for (auto& kv : m_geometries)

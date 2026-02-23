@@ -13,9 +13,41 @@
 #include <iostream>
 #include <cstdlib>
 
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <unistd.h>
+#  include <limits.h>
+#  include <libgen.h>
+#endif
+
 /* ================================================================
  * PTX Helpers
  * ================================================================ */
+
+/* Return the directory that contains the running s3d DLL / executable.
+ * On Windows we use GetModuleHandleA("s3d.dll") so the path stays correct
+ * even when CWD differs from the binary location. */
+static std::string get_module_dir()
+{
+#ifdef _WIN32
+    char buf[MAX_PATH] = {0};
+    HMODULE hm = GetModuleHandleA("s3d.dll");
+    if (!hm) hm = GetModuleHandleA(nullptr);   /* fallback: exe */
+    DWORD len = GetModuleFileNameA(hm, buf, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return std::string(".");
+    std::string path(buf);
+    auto pos = path.find_last_of("\\/");
+    return (pos != std::string::npos) ? path.substr(0, pos) : std::string(".");
+#else
+    char buf[PATH_MAX] = {0};
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len <= 0) return std::string(".");
+    buf[len] = '\0';
+    return std::string(dirname(buf));
+#endif
+}
 
 static std::string load_ptx_file(const std::string& filename) {
     std::ifstream f(filename, std::ios::binary);
@@ -27,8 +59,16 @@ static std::string load_ptx_file(const std::string& filename) {
 static std::string find_and_load_ptx(const char* compile_time_path,
                                      const char* filename) {
     std::vector<std::string> search;
+
+    /* 1. directory of the s3d DLL / executable (highest priority for deployment) */
+    std::string mod_dir = get_module_dir();
+    search.push_back(mod_dir + "/" + filename);
+
+    /* 2. compile-time absolute path (works on the build machine) */
     if (compile_time_path && compile_time_path[0])
         search.push_back(compile_time_path);
+
+    /* 3. CWD-relative fallbacks */
     search.push_back(std::string("./") + filename);
     search.push_back(std::string("../") + filename);
     search.push_back(filename);

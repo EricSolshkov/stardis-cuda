@@ -355,4 +355,11 @@ private:
     CudaBuffer<float3>    m_single_query_buf;
     CudaBuffer<NNResult>  m_single_result_buf;
     bool                  m_single_bufs_allocated = false;
+
+    /* ---- Pre-allocated launch params buffer (single-ray) ---- */
+    CUdeviceptr m_single_params_ptr  = 0;
+
+    /* ---- Pre-allocated launch params buffer (batch) ---- */
+    CUdeviceptr m_batch_params_ptr   = 0;
+    bool        m_batch_params_allocated = false;
 };
