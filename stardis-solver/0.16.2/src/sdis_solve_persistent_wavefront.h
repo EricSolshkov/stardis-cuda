@@ -144,6 +144,14 @@ struct wavefront_pool {
   size_t    enc_locate_count;    /* queries this step */
   size_t    max_enc_locates;     /* pool_size */
 
+  /* --- Batch closest_point context (Phase B-4 M9: WoS) --- */
+  struct s3d_batch_cp_context* cp_batch_ctx;
+  struct s3d_cp_request*       cp_requests;
+  struct s3d_hit*              cp_hits;
+  uint32_t*                    cp_to_slot;   /* cp index → slot mapping */
+  size_t                       cp_count;     /* queries this step */
+  size_t                       max_cps;      /* pool_size */
+
   /* --- Drain phase control (M2) --- */
   int                 in_drain_phase;  /* 1 = task_queue exhausted          */
   size_t              drain_step_count;/* steps taken in drain phase        */
@@ -178,6 +186,12 @@ struct wavefront_pool {
   size_t enc_locates_resolved; /* successfully resolved                */
   size_t enc_locates_degenerate; /* degenerate fallbacks               */
   double time_enc_locate_s;  /* cumulative enc_locate batch time      */
+
+  /* M9: closest_point (WoS) batch stats (cumulative) */
+  size_t cp_total;           /* total closest_point queries dispatched */
+  size_t cp_accepted;        /* accepted from GPU batch               */
+  size_t cp_requeried;       /* re-queried via CPU fallback           */
+  double time_cp_s;          /* cumulative closest_point batch time   */
 
   /* Enclosure query escalation counters (M1-v2 → M10 cascade) */
   size_t enc_query_escalated_to_m10; /* fb_resolve → enc_locate cascade */
@@ -243,6 +257,14 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool);
 /* B-4 M10: Collect enc_locate requests from paths in PATH_ENC_LOCATE_PENDING */
 extern LOCAL_SYM res_T
 pool_collect_enc_locate_requests(struct wavefront_pool* pool);
+
+/* B-4 M9: Collect closest_point requests from WoS paths in PATH_CND_WOS_CLOSEST */
+extern LOCAL_SYM res_T
+pool_collect_cp_requests(struct wavefront_pool* pool);
+
+/* B-4 M9: Distribute closest_point results to WoS paths */
+extern LOCAL_SYM res_T
+pool_distribute_cp_results(struct wavefront_pool* pool);
 
 /* ============================================================================
  * Public API

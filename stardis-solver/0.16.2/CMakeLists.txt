@@ -291,6 +291,13 @@ if(ENABLE_TESTS)
     add_test(NAME test_sdis_b4_m8_picardN
              COMMAND test_sdis_b4_m8_picardN)
 
+    # M9 WoS state machine tests
+    add_executable(test_sdis_b4_m9_wos
+        src/test_sdis_b4_m9_wos.c)
+    target_link_libraries(test_sdis_b4_m9_wos PRIVATE sdis_obj)
+    add_test(NAME test_sdis_b4_m9_wos COMMAND test_sdis_b4_m9_wos)
+    set_tests_properties(test_sdis_b4_m9_wos PROPERTIES TIMEOUT 600)
+
     # M10 enc_locate tests
     add_executable(test_sdis_b4_m10_enc_locate
         src/test_sdis_b4_m10_enc_locate.c)

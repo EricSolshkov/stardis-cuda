@@ -295,6 +295,52 @@ extern LOCAL_SYM res_T
 step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn);
 
 /*******************************************************************************
+ * B-4 M9: Walk on Spheres (WoS) conductive path state machine
+ *
+ * WoS uses closest_point queries (batched via s3d_batch_cp_context) instead
+ * of ray traces for the main geometry query.  Fallback to trace_ray only
+ * when check_diffusion_position detects the sampled point crossed a boundary.
+ ******************************************************************************/
+
+/* PATH_CND_WOS_CHECK_TEMP: loop top — check temperature known + emit CP query.
+ * On first entry: initialise WoS state (enc_id, medium, alpha, props).
+ * On re-entry: fetch props at new position, check temperature. */
+extern LOCAL_SYM res_T
+step_cnd_wos_check_temp(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_CND_WOS_CLOSEST: submit closest_point query to batch.
+ * Sets up s3d_cp_request fields; pool collect will gather these. */
+extern LOCAL_SYM void
+step_cnd_wos_closest(struct path_state* p);
+
+/* PATH_CND_WOS_CLOSEST_RESULT: process closest_point result.
+ * Epsilon-shell → snap to boundary → TIME_TRAVEL.
+ * Normal → sample sphere, check_diffusion_position.
+ * check_diffusion fails → FALLBACK_TRACE. */
+extern LOCAL_SYM res_T
+step_cnd_wos_closest_result(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_CND_WOS_FALLBACK_TRACE: emit fallback trace_ray (dir from closest_result).
+ * ray_bucket = RAY_BUCKET_RADIATIVE, 1 ray. */
+extern LOCAL_SYM void
+step_cnd_wos_fallback_trace(struct path_state* p);
+
+/* PATH_CND_WOS_FALLBACK_RESULT: process fallback ray result.
+ * miss → snap to cached closest_point hit.
+ * hit → setup_hit_rt or snap on enclosure mismatch.
+ * Always transitions to TIME_TRAVEL. */
+extern LOCAL_SYM res_T
+step_cnd_wos_fallback_result(struct path_state* p, struct sdis_scene* scn,
+                             const struct s3d_hit* hit);
+
+/* PATH_CND_WOS_TIME_TRAVEL: time rewind + volumic power + loop/exit decision.
+ * T->done → PATH_DONE.
+ * hit → PATH_BND_DISPATCH (via PATH_COUPLED_BOUNDARY).
+ * else → PATH_CND_WOS_CHECK_TEMP (continue loop). */
+extern LOCAL_SYM res_T
+step_cnd_wos_time_travel(struct path_state* p, struct sdis_scene* scn);
+
+/*******************************************************************************
  * B-4 M7: External net flux batch state machine
  ******************************************************************************/
 

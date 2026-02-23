@@ -137,6 +137,19 @@ pool_create(struct wavefront_pool* pool, size_t pool_size)
     return RES_MEM_ERR;
   }
 
+  /* B-4 M9: closest_point (WoS) batch buffers */
+  pool->max_cps = pool_size;
+  pool->cp_requests = (struct s3d_cp_request*)malloc(
+    pool_size * sizeof(struct s3d_cp_request));
+  pool->cp_hits = (struct s3d_hit*)malloc(
+    pool_size * sizeof(struct s3d_hit));
+  pool->cp_to_slot = (uint32_t*)malloc(
+    pool_size * sizeof(uint32_t));
+
+  if(!pool->cp_requests || !pool->cp_hits || !pool->cp_to_slot) {
+    return RES_MEM_ERR;
+  }
+
   /* Initialise diagnostics */
   pool->diag_min_batch = (size_t)-1; /* updated on first step with rays */
   pool->trace_batch_size_min = (size_t)-1;
@@ -151,6 +164,7 @@ pool_destroy(struct wavefront_pool* pool)
 
   if(pool->batch_ctx) s3d_batch_trace_context_destroy(pool->batch_ctx);
   if(pool->enc_batch_ctx) s3d_batch_enc_context_destroy(pool->enc_batch_ctx);
+  if(pool->cp_batch_ctx) s3d_batch_cp_context_destroy(pool->cp_batch_ctx);
 
   /* Release per-slot RNGs */
   if(pool->thin_rng_storage) {
@@ -186,6 +200,11 @@ pool_destroy(struct wavefront_pool* pool)
   free(pool->enc_locate_requests);
   free(pool->enc_locate_results);
   free(pool->enc_locate_to_slot);
+
+  /* B-4 M9: closest_point (WoS) arrays */
+  free(pool->cp_requests);
+  free(pool->cp_hits);
+  free(pool->cp_to_slot);
 
   memset(pool, 0, sizeof(*pool));
 }
@@ -843,6 +862,63 @@ pool_distribute_enc_locate_results(struct wavefront_pool* pool)
   return RES_OK;
 }
 
+/*******************************************************************************
+ * B-4 M9: Collect closest_point requests from WoS paths in PATH_CND_WOS_CLOSEST
+ *
+ * Scans active paths for PATH_CND_WOS_CLOSEST and fills the cp_requests
+ * array.  The requests are then dispatched as a single GPU batch via
+ * s3d_scene_view_closest_point_batch_ctx.
+ ******************************************************************************/
+LOCAL_SYM res_T
+pool_collect_cp_requests(struct wavefront_pool* pool)
+{
+  size_t k, n = 0;
+
+  for(k = 0; k < pool->active_compact; k++) {
+    uint32_t i = pool->active_indices[k];
+    struct path_state* p = &pool->slots[i];
+
+    if(p->phase == PATH_CND_WOS_CLOSEST) {
+      struct s3d_cp_request* req = &pool->cp_requests[n];
+      req->pos[0] = (float)p->locals.cnd_wos.query_pos[0];
+      req->pos[1] = (float)p->locals.cnd_wos.query_pos[1];
+      req->pos[2] = (float)p->locals.cnd_wos.query_pos[2];
+      req->radius = p->locals.cnd_wos.query_radius;
+      req->query_data = NULL; /* no filter */
+      req->user_id = i;
+      pool->cp_to_slot[n] = i;
+      p->locals.cnd_wos.batch_cp_idx = (uint32_t)n;
+      n++;
+    }
+  }
+
+  pool->cp_count = n;
+  return RES_OK;
+}
+
+/*******************************************************************************
+ * B-4 M9: Distribute closest_point results back to WoS paths
+ *
+ * For each CP result, write the hit into the path's cached_hit field,
+ * then transition to PATH_CND_WOS_CLOSEST_RESULT so the cascade loop
+ * can process the result via step_cnd_wos_closest_result.
+ ******************************************************************************/
+static res_T
+pool_distribute_cp_results(struct wavefront_pool* pool)
+{
+  size_t k;
+
+  for(k = 0; k < pool->cp_count; k++) {
+    uint32_t slot_id = pool->cp_to_slot[k];
+    struct path_state* p = &pool->slots[slot_id];
+
+    p->locals.cnd_wos.cached_hit = pool->cp_hits[k];
+    p->phase = PATH_CND_WOS_CLOSEST_RESULT;
+  }
+
+  return RES_OK;
+}
+
 static res_T
 pool_distribute_ray_results(struct wavefront_pool* pool, struct sdis_scene* scn)
 {
@@ -986,6 +1062,7 @@ cascade_advance_single_path(
     }
     if(path_phase_is_ray_pending(p->phase)) break;
     if(path_phase_is_enc_locate_pending(p->phase)) break;
+    if(path_phase_is_cp_pending(p->phase)) break;
 
     (*local_iterations)++;
     phase_before = p->phase;
@@ -1650,6 +1727,15 @@ solve_camera_persistent_wavefront(
     goto cleanup;
   }
 
+  /* ====== 4c. Create batch closest_point context (M9: WoS) ====== */
+  res = s3d_batch_cp_context_create(&pool.cp_batch_ctx, pool.max_cps);
+  if(res != RES_OK) {
+    log_err(scn->dev,
+      "persistent_wavefront: cp_batch_ctx creation failed for %lu queries -- %s\n",
+      (unsigned long)pool.max_cps, res_to_cstr(res));
+    goto cleanup;
+  }
+
   /* ====== 5. Cache scene params for refill ====== */
   pool.scn          = scn;
   pool.enc_id       = enc_id;
@@ -1756,6 +1842,31 @@ solve_camera_persistent_wavefront(
     }
     time_current(&t_phase1);
     pool.time_enc_locate_s += time_elapsed_sec(&t_phase0, &t_phase1);
+
+    /* Step D3 (M9): Collect + dispatch + distribute closest_point batch */
+    time_current(&t_phase0);
+    res = pool_collect_cp_requests(&pool);
+    if(res != RES_OK) goto cleanup;
+
+    if(pool.cp_count > 0) {
+      struct s3d_batch_cp_stats cp_stats;
+      memset(&cp_stats, 0, sizeof(cp_stats));
+
+      res = s3d_scene_view_closest_point_batch_ctx(
+        scn->s3d_view, pool.cp_batch_ctx,
+        pool.cp_requests, pool.cp_count,
+        pool.cp_hits, &cp_stats);
+      if(res != RES_OK) goto cleanup;
+
+      res = pool_distribute_cp_results(&pool);
+      if(res != RES_OK) goto cleanup;
+
+      pool.cp_total    += pool.cp_count;
+      pool.cp_accepted += cp_stats.batch_accepted;
+      pool.cp_requeried += cp_stats.requery_accepted;
+    }
+    time_current(&t_phase1);
+    pool.time_cp_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
     /* Step E: Cascade non-ray steps (compact) */
     time_current(&t_phase0);
@@ -1884,6 +1995,17 @@ solve_camera_persistent_wavefront(
       (unsigned long)pool.paths_done_boundary,
       (unsigned long)pool.paths_failed,
       (unsigned long)pool.max_path_depth);
+  }
+
+  /* M9: WoS closest_point batch summary */
+  if(pool.cp_total > 0) {
+    log_info(scn->dev,
+      "persistent_wavefront CP (WoS): %lu queries, "
+      "%lu gpu-accepted, %lu requeried, %.3fs total\n",
+      (unsigned long)pool.cp_total,
+      (unsigned long)pool.cp_accepted,
+      (unsigned long)pool.cp_requeried,
+      pool.time_cp_s);
   }
 
   log_drain_phase_report(scn->dev, &pool);

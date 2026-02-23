@@ -226,9 +226,18 @@ struct path_state {
       double  query_radius;
       float   new_pos[3];
       float   dir[3];
-      struct s3d_hit cached_hit;
-      double  delta;
-      double  last_distance;
+      struct s3d_hit cached_hit;        /* closest_point hit (for snap)    */
+      double  delta;                    /* material delta parameter        */
+      double  last_distance;            /* wos_distance from closest query */
+      double  alpha;                    /* diffusivity = lambda/(rho*cp)   */
+      unsigned enc_id;                  /* enclosure id for WoS walk       */
+      struct sdis_medium* medium;       /* solid medium pointer            */
+      struct solid_props props_ref;     /* reference properties at start   */
+      struct solid_props props;         /* current position properties     */
+      double  green_power_term;         /* accumulated green function pwr  */
+      double  position_start[3];        /* pos before diffusion step       */
+      int     wos_initialized;          /* 1 = init phase done             */
+      uint32_t batch_cp_idx;            /* index in closest_point batch    */
     } cnd_wos;
 
     struct {                            /* convective path                 */

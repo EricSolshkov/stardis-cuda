@@ -175,7 +175,7 @@ path_phase_is_ray_pending(enum path_phase ph)
   case PATH_CND_INIT_ENC:
   case PATH_CND_DS_STEP_TRACE:
   /* PATH_CND_DS_STEP_ENC_VERIFY is compute-only (sets up ENC query) */
-  case PATH_CND_WOS_CLOSEST:
+  /* PATH_CND_WOS_CLOSEST is closest_point batch, not ray trace */
   case PATH_CND_WOS_FALLBACK_TRACE:
   case PATH_CNV_STARTUP_TRACE:
   /* B-4 M1-v2 enclosure query */
@@ -196,6 +196,17 @@ static INLINE int
 path_phase_is_enc_locate_pending(enum path_phase ph)
 {
   return ph == PATH_ENC_LOCATE_PENDING;
+}
+
+/*******************************************************************************
+ * path_phase_is_cp_pending — returns 1 if the path is waiting for a
+ * batch closest_point result (M9 WoS).  These paths participate in the
+ * closest_point collect/distribute cycle, NOT the ray trace cycle.
+ ******************************************************************************/
+static INLINE int
+path_phase_is_cp_pending(enum path_phase ph)
+{
+  return ph == PATH_CND_WOS_CLOSEST;
 }
 
 #endif /* SDIS_WF_TYPES_H */
