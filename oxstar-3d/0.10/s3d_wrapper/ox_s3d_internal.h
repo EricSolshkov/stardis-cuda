@@ -214,6 +214,13 @@ struct s3d_scene_view {
     float                 total_area;
     bool                  cdf_valid;
 
+    /* Persistent retrace GPU buffers (grow-only, avoid per-call alloc).
+     * Must be members (not static) so they are freed while CUDA context
+     * is still alive — static locals outlive the device and crash on
+     * cudaFree during atexit. */
+    CudaBuffer<Ray>            rt_retrace_rays;
+    CudaBuffer<MultiHitResult> rt_retrace_mhits;
+
     /* Query mesh state for CP — uses same scene geometry */
     bool   query_mesh_set;
     float  search_radius;

@@ -930,15 +930,22 @@ res_T s3d_scene_view_ref_put(s3d_scene_view* sv) {
     if (!sv) return RES_BAD_ARG;
     if (sv->ref == 0) return RES_BAD_ARG;
     if (--sv->ref == 0) {
-        /* Unregister from scene */
+        /* Clean up OptiX resources (pipeline, modules, SBT, GAS/IAS)
+         * BEFORE releasing the scene reference.  The scene holds the
+         * only remaining ref on the device, so scene_ref_put would
+         * cascade into device destruction and optixDeviceContextDestroy,
+         * leaving tracer.cleanup() with a dangling OptiX context. */
+        sv->tracer.cleanup();
+        sv->shape_snapshots.clear();
+        sv->inst_child_snapshots.clear();
+
+        /* Now it is safe to unregister from the scene and release the
+         * scene reference (may cascade-destroy scene → device). */
         if (sv->scn) {
             auto& v = sv->scn->views;
             v.erase(std::remove(v.begin(), v.end(), sv), v.end());
             s3d_scene_ref_put(sv->scn);
         }
-        sv->tracer.cleanup();
-        sv->shape_snapshots.clear();
-        sv->inst_child_snapshots.clear();
         delete sv;
     }
     return RES_OK;
@@ -1311,13 +1318,14 @@ static res_T batch_trace_impl(s3d_scene_view* sv,
         g_batch_retrace_rays += nr;
         size_t retrace_launches = 0;
 #endif
-        /* Persistent GPU buffers — grow-only, survive across calls. */
-        static CudaBuffer<Ray>            s_rt_d_rays;
-        static CudaBuffer<MultiHitResult> s_rt_d_mhits;
-        /* Host-side staging — reused across calls */
-        static std::vector<Ray>            s_active_rays;
-        static std::vector<MultiHitResult> s_active_mhits;
-        static std::vector<size_t>         s_active_map;
+        /* Persistent GPU buffers — grow-only, owned by scene_view so
+         * they are freed while CUDA context is still alive (not at atexit). */
+        CudaBuffer<Ray>&            s_rt_d_rays  = sv->rt_retrace_rays;
+        CudaBuffer<MultiHitResult>& s_rt_d_mhits = sv->rt_retrace_mhits;
+        /* Host-side staging — local (not static) to be thread-safe under OMP */
+        std::vector<Ray>            s_active_rays;
+        std::vector<MultiHitResult> s_active_mhits;
+        std::vector<size_t>         s_active_map;
 
         /* Build retrace Ray buffer — start tmin past Phase 1 candidates */
         std::vector<Ray>    rt_rays(nr);

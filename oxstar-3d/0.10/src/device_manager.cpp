@@ -44,7 +44,7 @@ void DeviceManager::init(int device_id, bool enable_validation)
     /* 3. Create OptiX device context */
     OptixDeviceContextOptions options = {};
     options.logCallbackFunction       = &contextLogCallback;
-    options.logCallbackLevel          = 4;  /* 1-4, higher = more verbose */
+    options.logCallbackLevel          = 1;  /* 1-4, higher = more verbose */
 
     if (enable_validation) {
         options.validationMode = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL;

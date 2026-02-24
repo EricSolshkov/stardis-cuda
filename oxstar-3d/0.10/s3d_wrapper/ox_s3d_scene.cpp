@@ -34,20 +34,28 @@ res_T s3d_scene_ref_get(s3d_scene* scn) {
 res_T s3d_scene_ref_put(s3d_scene* scn) {
     if (!scn) return RES_BAD_ARG;
     if (scn->ref == 0) return RES_BAD_ARG;
+#ifndef NDEBUG
     fprintf(stderr, "[DBG] scene_ref_put scn=%p ref=%u->%u\n",
             (void*)scn, (unsigned)scn->ref, (unsigned)(scn->ref - 1));
     fflush(stderr);
+#endif
     if (--scn->ref == 0) {
         /* Release all shapes */
         for (auto& kv : scn->shapes)
             s3d_shape_ref_put(kv.second);
         scn->shapes.clear();
         /* Release device */
+#ifndef NDEBUG
         fprintf(stderr, "[DBG]   releasing device=%p\n", (void*)scn->dev); fflush(stderr);
+#endif
         s3d_device_ref_put(scn->dev);
+#ifndef NDEBUG
         fprintf(stderr, "[DBG]   deleting scene=%p\n", (void*)scn); fflush(stderr);
+#endif
         delete scn;
+#ifndef NDEBUG
         fprintf(stderr, "[DBG]   scene deleted OK\n"); fflush(stderr);
+#endif
     }
     return RES_OK;
 }

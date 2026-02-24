@@ -101,7 +101,7 @@ void NNQuery::createModule(const std::string& ptx_source)
         s_optix_log, &s_optix_log_size,
         &m_module));
 
-    std::cout << "  [NN Pipeline] Module created.\n";
+    std::cerr << "  [NN Pipeline] Module created.\n";
 }
 
 void NNQuery::createProgramGroups()
@@ -142,7 +142,7 @@ void NNQuery::createProgramGroups()
         m_context, &hitgroup_desc, 1, &pg_options,
         s_optix_log, &s_optix_log_size, &m_hitgroup_pg));
 
-    std::cout << "  [NN Pipeline] Program groups created (raygen, miss, intersection).\n";
+    std::cerr << "  [NN Pipeline] Program groups created (raygen, miss, intersection).\n";
 }
 
 void NNQuery::createPipelineObject()
@@ -184,7 +184,7 @@ void NNQuery::createPipelineObject()
         continuation,
         max_traversal_depth));
 
-    std::cout << "  [NN Pipeline] Pipeline created and stack sizes configured.\n";
+    std::cerr << "  [NN Pipeline] Pipeline created and stack sizes configured.\n";
 }
 
 void NNQuery::createSBT()
@@ -232,7 +232,7 @@ void NNQuery::createSBT()
     m_sbt.hitgroupRecordStrideInBytes = sizeof(NNHitGroupRecord);
     m_sbt.hitgroupRecordCount         = 1;
 
-    std::cout << "  [NN Pipeline] SBT created.\n";
+    std::cerr << "  [NN Pipeline] SBT created.\n";
 }
 
 /* ===========================================================================
@@ -267,7 +267,7 @@ void NNQuery::setPointCloud(
     /* Build AABB-based GAS */
     buildGAS();
 
-    std::cout << "  [NN] Point cloud set: " << m_num_points
+    std::cerr << "  [NN] Point cloud set: " << m_num_points
               << " points, search_radius=" << search_radius << "\n";
 }
 
@@ -358,12 +358,12 @@ void NNQuery::buildGAS()
         CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_output)));
         m_gas_buffer = d_compacted;
 
-        std::cout << "  [NN] Point GAS built: "
+        std::cerr << "  [NN] Point GAS built: "
                   << (compacted_size / 1024) << " KB (compacted from "
                   << (buffer_sizes.outputSizeInBytes / 1024) << " KB)\n";
     } else {
         m_gas_buffer = d_output;
-        std::cout << "  [NN] Point GAS built: "
+        std::cerr << "  [NN] Point GAS built: "
                   << (buffer_sizes.outputSizeInBytes / 1024) << " KB\n";
     }
 

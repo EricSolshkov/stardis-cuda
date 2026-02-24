@@ -57,7 +57,7 @@ void UnifiedTracer::init(
     createProgramGroups();
     createPipeline();
     createBaseSBTs();
-    std::cout << "  [UnifiedTracer] Initialized (single pipeline, triple SBT).\n";
+    std::cerr << "  [UnifiedTracer] Initialized (single pipeline, triple SBT).\n";
 }
 
 /* ===========================================================================
@@ -90,7 +90,7 @@ void UnifiedTracer::createModules(
         rt_ptx.c_str(), rt_ptx.size(),
         s_optix_log, &s_optix_log_size,
         &m_rt_module));
-    std::cout << "  [UnifiedTracer] RT module created.\n";
+    std::cerr << "  [UnifiedTracer] RT module created.\n";
 
     OPTIX_CHECK_LOG(optixModuleCreate(
         m_context,
@@ -99,7 +99,7 @@ void UnifiedTracer::createModules(
         nn_ptx.c_str(), nn_ptx.size(),
         s_optix_log, &s_optix_log_size,
         &m_nn_module));
-    std::cout << "  [UnifiedTracer] NN module created.\n";
+    std::cerr << "  [UnifiedTracer] NN module created.\n";
 }
 
 /* ===========================================================================
@@ -254,7 +254,7 @@ void UnifiedTracer::createProgramGroups()
             s_optix_log, &s_optix_log_size, &m_hitgroup_aabb_sphere_pg));
     }
 
-    std::cout << "  [UnifiedTracer] 12 program groups created.\n";
+    std::cerr << "  [UnifiedTracer] 12 program groups created.\n";
 }
 
 /* ===========================================================================
@@ -300,7 +300,7 @@ void UnifiedTracer::createPipeline()
         continuation,
         2 /* maxTraversalDepth: IAS -> GAS */));
 
-    std::cout << "  [UnifiedTracer] Pipeline created (12 PGs, stack configured).\n";
+    std::cerr << "  [UnifiedTracer] Pipeline created (12 PGs, stack configured).\n";
 }
 
 /* ===========================================================================
@@ -412,7 +412,7 @@ void UnifiedTracer::createBaseSBTs()
         m_sbt_cp.hitgroupRecordCount         = 1;
     }
 
-    std::cout << "  [UnifiedTracer] Base SBTs created (RT + MH + NN + CP).\n";
+    std::cerr << "  [UnifiedTracer] Base SBTs created (RT + MH + NN + CP).\n";
 }
 
 /* ===========================================================================

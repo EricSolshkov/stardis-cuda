@@ -144,15 +144,23 @@ res_T s3d_device_ref_get(s3d_device* dev) {
 res_T s3d_device_ref_put(s3d_device* dev) {
     if (!dev) return RES_BAD_ARG;
     if (dev->ref == 0) return RES_BAD_ARG;
+#ifndef NDEBUG
     fprintf(stderr, "[DBG] device_ref_put dev=%p ref=%u->%u\n",
             (void*)dev, (unsigned)dev->ref, (unsigned)(dev->ref - 1));
     fflush(stderr);
+#endif
     if (--dev->ref == 0) {
+#ifndef NDEBUG
         fprintf(stderr, "[DBG]   calling shutdown...\n"); fflush(stderr);
+#endif
         dev->device_manager.shutdown();
+#ifndef NDEBUG
         fprintf(stderr, "[DBG]   shutdown OK, deleting device...\n"); fflush(stderr);
+#endif
         delete dev;
+#ifndef NDEBUG
         fprintf(stderr, "[DBG]   device deleted OK\n"); fflush(stderr);
+#endif
     }
     return RES_OK;
 }

@@ -98,7 +98,7 @@ void PipelineManager::createModule(
         s_optix_log, &s_optix_log_size,
         &m_module));
 
-    std::cout << "  [Pipeline] Module created successfully.\n";
+    std::cerr << "  [Pipeline] Module created successfully.\n";
 }
 
 /* ===========================================================================
@@ -138,7 +138,7 @@ void PipelineManager::createProgramGroups(OptixDeviceContext context)
         context, &hitgroup_desc, 1, &pg_options,
         s_optix_log, &s_optix_log_size, &m_hitgroup_pg));
 
-    std::cout << "  [Pipeline] Program groups created (raygen, miss, closesthit).\n";
+    std::cerr << "  [Pipeline] Program groups created (raygen, miss, closesthit).\n";
 }
 
 /* ===========================================================================
@@ -188,7 +188,7 @@ void PipelineManager::createPipelineObject(
         continuation,
         max_traversal_depth));
 
-    std::cout << "  [Pipeline] Pipeline created and stack sizes configured.\n";
+    std::cerr << "  [Pipeline] Pipeline created and stack sizes configured.\n";
 }
 
 /* ===========================================================================
@@ -243,7 +243,7 @@ void PipelineManager::createSBT()
     m_sbt.hitgroupRecordStrideInBytes = sizeof(HitGroupRecord);
     m_sbt.hitgroupRecordCount         = 1;
 
-    std::cout << "  [Pipeline] SBT created.\n";
+    std::cerr << "  [Pipeline] SBT created.\n";
 }
 
 /* ===========================================================================

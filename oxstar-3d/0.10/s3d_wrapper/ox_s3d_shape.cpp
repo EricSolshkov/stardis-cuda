@@ -277,19 +277,27 @@ res_T s3d_shape_ref_get(s3d_shape* shape) {
 res_T s3d_shape_ref_put(s3d_shape* shape) {
     if (!shape) return RES_BAD_ARG;
     if (shape->ref == 0) return RES_BAD_ARG;
+#ifndef NDEBUG
     fprintf(stderr, "[DBG] shape_ref_put shape=%p id=%u type=%d ref=%u->%u\n",
             (void*)shape, shape->id, (int)shape->type, (unsigned)shape->ref, (unsigned)(shape->ref - 1));
     fflush(stderr);
+#endif
     if (--shape->ref == 0) {
         /* Release child_scene reference for instance shapes */
         if (shape->type == OX_SHAPE_INSTANCE && shape->child_scene) {
+#ifndef NDEBUG
             fprintf(stderr, "[DBG]   releasing child_scene=%p\n", (void*)shape->child_scene); fflush(stderr);
+#endif
             s3d_scene_ref_put(shape->child_scene);
             shape->child_scene = nullptr;
         }
+#ifndef NDEBUG
         fprintf(stderr, "[DBG]   deleting shape=%p\n", (void*)shape); fflush(stderr);
+#endif
         delete shape;
+#ifndef NDEBUG
         fprintf(stderr, "[DBG]   shape deleted OK\n"); fflush(stderr);
+#endif
     }
     return RES_OK;
 }
