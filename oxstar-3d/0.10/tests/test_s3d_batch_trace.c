@@ -25,6 +25,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define NRAYS 256
 
@@ -239,6 +240,191 @@ main(int argc, char** argv)
   CHK(stats.retrace_accepted + stats.retrace_missed == stats.filter_rejected);
   printf("  Stats consistent: total=%zu, accepted=%zu, rejected=%zu\n",
     stats.total_rays, stats.batch_accepted, stats.filter_rejected);
+
+  /* =====================================================================
+   * Test 7: async+wait vs sync — bit-exact consistency
+   *
+   * Expected behavior: s3d_scene_view_trace_rays_batch_ctx_async followed
+   * by s3d_scene_view_trace_rays_batch_ctx_wait must produce the exact
+   * same hit results as the synchronous _batch_ctx call for every ray.
+   * ===================================================================== */
+  printf("Test 7: async+wait vs sync consistency (%d rays)\n", NRAYS);
+  srand(42);
+  for(i = 0; i < NRAYS; i++) {
+    float pixel[2], org[3], dir[3];
+    pixel[0] = rand_canonic();
+    pixel[1] = rand_canonic();
+    camera_ray(&cam, pixel, org, dir);
+    f3_set(requests[i].origin, org);
+    f3_set(requests[i].direction, dir);
+    requests[i].range[0] = 0.f;
+    requests[i].range[1] = FLT_MAX;
+    requests[i].filter_data = NULL;
+    requests[i].user_id = (uint32_t)i;
+  }
+  CHK(s3d_batch_trace_context_create(&ctx, NRAYS) == RES_OK);
+  {
+    struct s3d_hit sync_hits[NRAYS];
+    struct s3d_hit async_hits[NRAYS];
+    struct s3d_batch_trace_stats sync_stats, async_stats;
+
+    /* Reference: synchronous _batch_ctx (internally delegates to async+wait) */
+    memset(&sync_stats, 0, sizeof(sync_stats));
+    CHK(s3d_scene_view_trace_rays_batch_ctx(
+      scnview, ctx, requests, NRAYS, sync_hits, &sync_stats) == RES_OK);
+
+    /* Test: explicit _async + _wait */
+    memset(&async_stats, 0, sizeof(async_stats));
+    CHK(s3d_scene_view_trace_rays_batch_ctx_async(
+      scnview, ctx, requests, NRAYS) == RES_OK);
+    CHK(s3d_scene_view_trace_rays_batch_ctx_wait(
+      scnview, ctx, requests, NRAYS, async_hits, &async_stats) == RES_OK);
+
+    mismatches = 0;
+    for(i = 0; i < NRAYS; i++) {
+      if(!hits_equal(&sync_hits[i], &async_hits[i])) {
+        mismatches++;
+        fprintf(stderr,
+          "  MISMATCH ray %zu: sync(prim=%u, dist=%f) vs "
+          "async(prim=%u, dist=%f)\n",
+          i,
+          sync_hits[i].prim.prim_id, (double)sync_hits[i].distance,
+          async_hits[i].prim.prim_id, (double)async_hits[i].distance);
+      }
+    }
+    printf("  Results: %d mismatches out of %d rays\n", mismatches, NRAYS);
+    CHK(mismatches == 0);
+
+    /* ===================================================================
+     * Test 8: async+wait context reuse — 3 iterations, stable results
+     *
+     * Expected behavior: repeated async+wait cycles with the same ctx
+     * and same requests must yield identical results every time. The
+     * per-ctx stream and host staging buffers are correctly reused.
+     * =================================================================== */
+    printf("Test 8: async+wait context reuse (%d rays x 3 iterations)\n",
+      NRAYS);
+    {
+      int iter;
+      for(iter = 0; iter < 3; iter++) {
+        struct s3d_hit iter_hits[NRAYS];
+        CHK(s3d_scene_view_trace_rays_batch_ctx_async(
+          scnview, ctx, requests, NRAYS) == RES_OK);
+        CHK(s3d_scene_view_trace_rays_batch_ctx_wait(
+          scnview, ctx, requests, NRAYS, iter_hits, NULL) == RES_OK);
+
+        mismatches = 0;
+        for(i = 0; i < NRAYS; i++) {
+          if(!hits_equal(&iter_hits[i], &sync_hits[i]))
+            mismatches++;
+        }
+        printf("  iter %d: %d mismatches\n", iter, mismatches);
+        CHK(mismatches == 0);
+      }
+    }
+
+    /* ===================================================================
+     * Test 9: async+wait stats accuracy
+     *
+     * Expected behavior: the stats returned by the async+wait path must
+     * match the sync path field-by-field (total_rays, batch_accepted,
+     * filter_rejected, retrace_accepted, retrace_missed).
+     * =================================================================== */
+    printf("Test 9: async+wait stats accuracy\n");
+    CHK(async_stats.total_rays      == sync_stats.total_rays);
+    CHK(async_stats.batch_accepted  == sync_stats.batch_accepted);
+    CHK(async_stats.filter_rejected == sync_stats.filter_rejected);
+    CHK(async_stats.retrace_accepted == sync_stats.retrace_accepted);
+    CHK(async_stats.retrace_missed  == sync_stats.retrace_missed);
+    printf("  Stats match: total=%zu, accepted=%zu, rejected=%zu, "
+           "retrace_accepted=%zu, retrace_missed=%zu\n",
+      async_stats.total_rays, async_stats.batch_accepted,
+      async_stats.filter_rejected, async_stats.retrace_accepted,
+      async_stats.retrace_missed);
+  }
+  s3d_batch_trace_context_destroy(ctx);
+  ctx = NULL;
+
+  /* =====================================================================
+   * Test 10: async+wait empty batch
+   *
+   * Expected behavior: nrays=0 with _async + _wait returns RES_OK
+   * without crashing or leaving ctx in an inconsistent state.
+   * ===================================================================== */
+  printf("Test 10: async+wait empty batch\n");
+  CHK(s3d_batch_trace_context_create(&ctx, NRAYS) == RES_OK);
+  {
+    struct s3d_hit empty_hits[1];
+    CHK(s3d_scene_view_trace_rays_batch_ctx_async(
+      scnview, ctx, requests, 0) == RES_OK);
+    CHK(s3d_scene_view_trace_rays_batch_ctx_wait(
+      scnview, ctx, requests, 0, empty_hits, NULL) == RES_OK);
+    printf("  Empty async+wait returned RES_OK\n");
+  }
+  s3d_batch_trace_context_destroy(ctx);
+  ctx = NULL;
+
+  /* =====================================================================
+   * Test 11: async+wait bad args
+   *
+   * Expected behavior: NULL scnview or ctx in _async returns RES_BAD_ARG.
+   * NULL scnview, ctx, or hits in _wait returns RES_BAD_ARG.
+   * ===================================================================== */
+  printf("Test 11: async+wait bad args\n");
+  CHK(s3d_batch_trace_context_create(&ctx, NRAYS) == RES_OK);
+  {
+    struct s3d_hit bad_hits[1];
+    /* _async bad args */
+    CHK(s3d_scene_view_trace_rays_batch_ctx_async(
+      NULL, ctx, requests, NRAYS) == RES_BAD_ARG);
+    CHK(s3d_scene_view_trace_rays_batch_ctx_async(
+      scnview, NULL, requests, NRAYS) == RES_BAD_ARG);
+    /* _wait bad args */
+    CHK(s3d_scene_view_trace_rays_batch_ctx_wait(
+      NULL, ctx, requests, NRAYS, bad_hits, NULL) == RES_BAD_ARG);
+    CHK(s3d_scene_view_trace_rays_batch_ctx_wait(
+      scnview, NULL, requests, NRAYS, bad_hits, NULL) == RES_BAD_ARG);
+    CHK(s3d_scene_view_trace_rays_batch_ctx_wait(
+      scnview, ctx, requests, NRAYS, NULL, NULL) == RES_BAD_ARG);
+    printf("  All bad-arg checks passed\n");
+  }
+  s3d_batch_trace_context_destroy(ctx);
+  ctx = NULL;
+
+  /* =====================================================================
+   * Test 12: async+wait miss consistency
+   *
+   * Expected behavior: rays aimed away from the scene, traced via the
+   * async+wait path, must all return S3D_HIT_NONE with correct stats.
+   * ===================================================================== */
+  printf("Test 12: async+wait miss consistency (%d rays)\n", NRAYS);
+  for(i = 0; i < NRAYS; i++) {
+    f3(requests[i].origin, 0.f, -2000.f, 0.f);
+    f3(requests[i].direction, 0.f, -1.f, 0.f);
+    requests[i].range[0] = 0.f;
+    requests[i].range[1] = FLT_MAX;
+    requests[i].filter_data = NULL;
+    requests[i].user_id = (uint32_t)i;
+  }
+  CHK(s3d_batch_trace_context_create(&ctx, NRAYS) == RES_OK);
+  {
+    struct s3d_hit miss_hits[NRAYS];
+    struct s3d_batch_trace_stats miss_stats;
+    memset(&miss_stats, 0, sizeof(miss_stats));
+    CHK(s3d_scene_view_trace_rays_batch_ctx_async(
+      scnview, ctx, requests, NRAYS) == RES_OK);
+    CHK(s3d_scene_view_trace_rays_batch_ctx_wait(
+      scnview, ctx, requests, NRAYS, miss_hits, &miss_stats) == RES_OK);
+    for(i = 0; i < NRAYS; i++) {
+      CHK(S3D_HIT_NONE(&miss_hits[i]));
+    }
+    CHK(miss_stats.total_rays == NRAYS);
+    CHK(miss_stats.batch_accepted == NRAYS);
+    CHK(miss_stats.filter_rejected == 0);
+    printf("  All %d rays correctly returned miss via async+wait\n", NRAYS);
+  }
+  s3d_batch_trace_context_destroy(ctx);
+  ctx = NULL;
 
   /* Cleanup */
   CHK(s3d_scene_view_ref_put(scnview) == RES_OK);

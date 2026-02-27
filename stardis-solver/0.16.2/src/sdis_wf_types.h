@@ -107,6 +107,8 @@ enum path_phase {
   PATH_CND_WOS_CHECK_TEMP,                /* [C] check known temp       [B4-FUTURE] */
   PATH_CND_WOS_CLOSEST,                   /* [R] closest_point query    [B4-FUTURE] */
   PATH_CND_WOS_CLOSEST_RESULT,            /* [C] e-shell / diffuse      [B4-FUTURE] */
+  PATH_CND_WOS_DIFFUSION_CHECK,           /* [R] CP batch: validate new pos [B4]     */
+  PATH_CND_WOS_DIFFUSION_CHECK_RESULT,     /* [C] process validation result  [B4]     */
   PATH_CND_WOS_FALLBACK_TRACE,            /* [R] fallback trace_ray     [B4-FUTURE] */
   PATH_CND_WOS_FALLBACK_RESULT,           /* [C] fallback result        [B4-FUTURE] */
   PATH_CND_WOS_TIME_TRAVEL,               /* [C] time rewind + loop     [B4-FUTURE] */
@@ -206,7 +208,8 @@ path_phase_is_enc_locate_pending(enum path_phase ph)
 static INLINE int
 path_phase_is_cp_pending(enum path_phase ph)
 {
-  return ph == PATH_CND_WOS_CLOSEST;
+  return ph == PATH_CND_WOS_CLOSEST
+      || ph == PATH_CND_WOS_DIFFUSION_CHECK;
 }
 
 #endif /* SDIS_WF_TYPES_H */

@@ -269,11 +269,48 @@ struct s3d_batch_trace_context {
     CudaBuffer<Ray>             d_rays;
     CudaBuffer<MultiHitResult>  d_multi_hits;
 
+    /* === P0: async support === */
+    cudaStream_t                stream;          /* per-ctx CUDA stream */
+    std::vector<Ray>            host_rays;       /* pre-allocated host staging */
+    std::vector<MultiHitResult> host_mhits;      /* pre-allocated host staging */
+    bool                        async_pending;   /* async operation in flight */
+    size_t                      async_nrays;     /* ray count for current async */
+
+    /* === P1 placeholder: per-ctx launch params + retrace buffers === */
+    CUdeviceptr                 params_ptr;      /* per-ctx params device mem */
+    bool                        params_allocated;
+    CudaBuffer<Ray>             rt_d_rays;       /* retrace buffer (per-ctx) */
+    CudaBuffer<MultiHitResult>  rt_d_mhits;      /* retrace buffer (per-ctx) */
+
     s3d_batch_trace_context(size_t max)
-        : max_rays(max) {
+        : max_rays(max)
+        , stream(nullptr)
+        , async_pending(false)
+        , async_nrays(0)
+        , params_ptr(0)
+        , params_allocated(false)
+    {
         d_rays.alloc(static_cast<unsigned int>(max));
         d_multi_hits.alloc(static_cast<unsigned int>(max));
+        CUDA_CHECK(cudaStreamCreate(&stream));
+        host_rays.reserve(max);
+        host_mhits.reserve(max);
     }
+
+    ~s3d_batch_trace_context() {
+        if (params_ptr) {
+            cudaFree(reinterpret_cast<void*>(params_ptr));
+            params_ptr = 0;
+        }
+        if (stream) {
+            cudaStreamDestroy(stream);
+            stream = nullptr;
+        }
+    }
+
+    /* Non-copyable */
+    s3d_batch_trace_context(const s3d_batch_trace_context&) = delete;
+    s3d_batch_trace_context& operator=(const s3d_batch_trace_context&) = delete;
 };
 
 struct s3d_batch_cp_context {

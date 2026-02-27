@@ -97,6 +97,18 @@ wf_context_create(struct wavefront_context* wf, size_t total_paths)
     return RES_MEM_ERR;
   }
 
+  /* B-4 M9: closest_point (WoS) batch buffers */
+  wf->max_cps = total_paths;
+  wf->cp_requests = (struct s3d_cp_request*)malloc(
+    total_paths * sizeof(struct s3d_cp_request));
+  wf->cp_hits = (struct s3d_hit*)malloc(
+    total_paths * sizeof(struct s3d_hit));
+  wf->cp_to_path = (uint32_t*)malloc(
+    total_paths * sizeof(uint32_t));
+  if(!wf->cp_requests || !wf->cp_hits || !wf->cp_to_path) {
+    return RES_MEM_ERR;
+  }
+
   return RES_OK;
 }
 
@@ -106,6 +118,7 @@ wf_context_destroy(struct wavefront_context* wf)
   if(!wf) return;
   if(wf->batch_ctx)    s3d_batch_trace_context_destroy(wf->batch_ctx);
   if(wf->enc_batch_ctx) s3d_batch_enc_context_destroy(wf->enc_batch_ctx);
+  if(wf->cp_batch_ctx)  s3d_batch_cp_context_destroy(wf->cp_batch_ctx);
   free(wf->paths);
   free(wf->ray_requests);
   free(wf->ray_to_path);
@@ -114,6 +127,9 @@ wf_context_destroy(struct wavefront_context* wf)
   free(wf->enc_locate_requests);
   free(wf->enc_locate_results);
   free(wf->enc_locate_to_path);
+  free(wf->cp_requests);
+  free(wf->cp_hits);
+  free(wf->cp_to_path);
   memset(wf, 0, sizeof(*wf));
 }
 
@@ -520,6 +536,8 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
         if(path_phase_is_ray_pending(p->phase)) break;
         /* Skip enc_locate-waiting phases (M10) */
         if(path_phase_is_enc_locate_pending(p->phase)) break;
+        /* Skip closest_point-waiting phases (M9: WoS) */
+        if(path_phase_is_cp_pending(p->phase)) break;
 
         res = advance_one_step_no_ray(p, scn, &advanced);
         if(res != RES_OK && res != RES_BAD_OP
@@ -533,6 +551,90 @@ distribute_and_advance(struct wavefront_context* wf, struct sdis_scene* scn)
           break;
         }
         if(!advanced) break;
+        p->steps_taken++;
+      }
+    }
+  }
+
+  return RES_OK;
+}
+
+/* ---- Step C3 helper: batch closest_point for all CP-pending WoS paths ---- */
+static res_T
+wf_batch_closest_point(struct wavefront_context* wf,
+                       struct sdis_scene* scn)
+{
+  size_t i, n = 0;
+  res_T res = RES_OK;
+
+  /* Collect CP requests from all CP-pending paths */
+  for(i = 0; i < wf->total_paths; i++) {
+    struct path_state* p = &wf->paths[i];
+    if(p->active && path_phase_is_cp_pending(p->phase)) {
+      struct s3d_cp_request* req = &wf->cp_requests[n];
+      req->pos[0] = (float)p->locals.cnd_wos.query_pos[0];
+      req->pos[1] = (float)p->locals.cnd_wos.query_pos[1];
+      req->pos[2] = (float)p->locals.cnd_wos.query_pos[2];
+      req->radius = p->locals.cnd_wos.query_radius;
+      req->query_data = NULL;
+      req->user_id = (uint32_t)i;
+      wf->cp_to_path[n] = (uint32_t)i;
+      if(p->phase == PATH_CND_WOS_CLOSEST)
+        p->locals.cnd_wos.batch_cp_idx = (uint32_t)n;
+      else
+        p->locals.cnd_wos.batch_cp2_idx = (uint32_t)n;
+      n++;
+    }
+  }
+  wf->cp_count = n;
+
+  if(n > 0) {
+    struct s3d_batch_cp_stats cp_stats;
+    memset(&cp_stats, 0, sizeof(cp_stats));
+
+    res = s3d_scene_view_closest_point_batch_ctx(
+      scn->s3d_view, wf->cp_batch_ctx,
+      wf->cp_requests, n,
+      wf->cp_hits, &cp_stats);
+    if(res != RES_OK) return res;
+
+    /* Distribute results to paths, advancing phase */
+    for(i = 0; i < n; i++) {
+      uint32_t pid = wf->cp_to_path[i];
+      struct path_state* p = &wf->paths[pid];
+      p->locals.cnd_wos.cached_hit = wf->cp_hits[i];
+      if(p->phase == PATH_CND_WOS_CLOSEST)
+        p->phase = PATH_CND_WOS_CLOSEST_RESULT;
+      else if(p->phase == PATH_CND_WOS_DIFFUSION_CHECK)
+        p->phase = PATH_CND_WOS_DIFFUSION_CHECK_RESULT;
+    }
+
+    /* Cascade non-ray steps for paths that got CP results */
+    for(i = 0; i < n; i++) {
+      uint32_t pid = wf->cp_to_path[i];
+      struct path_state* p = &wf->paths[pid];
+      while(p->active && !p->needs_ray
+          && p->phase != PATH_DONE && p->phase != PATH_ERROR) {
+        int advanced = 0;
+        if(path_phase_is_ray_pending(p->phase)) break;
+        if(path_phase_is_enc_locate_pending(p->phase)) break;
+        if(path_phase_is_cp_pending(p->phase)) break;
+        res = advance_one_step_no_ray(p, scn, &advanced);
+        if(res != RES_OK && res != RES_BAD_OP
+        && res != RES_BAD_OP_IRRECOVERABLE) return res;
+        if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
+          p->phase = PATH_DONE;
+          p->active = 0;
+          p->done_reason = -1;
+          wf->paths_failed++;
+          res = RES_OK;
+          break;
+        }
+        if(!advanced) break;
+        if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
+          p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+          p->active = 1;
+        }
         p->steps_taken++;
       }
     }
@@ -643,6 +745,10 @@ solve_tile_wavefront(
   res = s3d_batch_enc_context_create(&wf.enc_batch_ctx, wf.max_enc_locates);
   if(res != RES_OK) goto cleanup;
 
+  /* Create batch closest_point context (M9: WoS) */
+  res = s3d_batch_cp_context_create(&wf.cp_batch_ctx, wf.max_cps);
+  if(res != RES_OK) goto cleanup;
+
   /* ====== Initialise all paths ====== */
   res = init_all_paths(&wf, scn, base_rng, enc_id, cam, time_range,
                        tile_org, tile_size, spp, register_paths,
@@ -661,6 +767,7 @@ solve_tile_wavefront(
           && p->phase != PATH_DONE && p->phase != PATH_ERROR) {
         if(path_phase_is_ray_pending(p->phase)) break;
         if(path_phase_is_enc_locate_pending(p->phase)) break;
+        if(path_phase_is_cp_pending(p->phase)) break;
 
         res = advance_one_step_no_ray(p, scn, &advanced);
         if(res != RES_OK && res != RES_BAD_OP
@@ -773,6 +880,7 @@ solve_tile_wavefront(
             int advanced = 0;
             if(path_phase_is_ray_pending(p->phase)) break;
             if(path_phase_is_enc_locate_pending(p->phase)) break;
+            if(path_phase_is_cp_pending(p->phase)) break;
             res = advance_one_step_no_ray(p, scn, &advanced);
             if(res != RES_OK && res != RES_BAD_OP
             && res != RES_BAD_OP_IRRECOVERABLE) goto cleanup;
@@ -794,6 +902,10 @@ solve_tile_wavefront(
         }
       }
     }
+
+    /* Step C3 (M9): Batch closest_point for all CP-pending WoS paths */
+    res = wf_batch_closest_point(&wf, scn);
+    if(res != RES_OK) goto cleanup;
 
     /* Step D: Update active count */
     update_active_count(&wf);
@@ -1042,6 +1154,11 @@ solve_wavefront_probe(
   const size_t total_paths = nrealisations;
   res_T res = RES_OK;
   struct time t_start, t_end, t_elapsed;
+#ifdef SDIS_WF_DIAG
+  FILE* diag = fopen("wf_probe_diag.log", "w");
+#else
+  FILE* diag = NULL;
+#endif
 
   ASSERT(scn && base_rng && position && time_range && nrealisations > 0);
   ASSERT(out_acc_temp);
@@ -1058,15 +1175,25 @@ solve_wavefront_probe(
   res = s3d_batch_enc_context_create(&wf.enc_batch_ctx, wf.max_enc_locates);
   if(res != RES_OK) goto cleanup;
 
+  /* Create batch closest_point context (M9: WoS) */
+  res = s3d_batch_cp_context_create(&wf.cp_batch_ctx, wf.max_cps);
+  if(res != RES_OK) goto cleanup;
+
   /* ====== Initialise all paths from probe position ====== */
+  if(diag) { fprintf(diag, "[WF-DIAG] probe: entering init_paths_from_probe "
+    "nreals=%lu enc_id=%u diff_algo=%d\n",
+    (unsigned long)nrealisations, enc_id, (int)diff_algo); fflush(diag); }
   res = init_paths_from_probe(&wf, scn, base_rng, enc_id,
                               position, time_range, nrealisations,
                               picard_order, diff_algo);
   if(res != RES_OK) goto cleanup;
+  if(diag) { fprintf(diag, "[WF-DIAG] probe: init_paths_from_probe OK\n"); fflush(diag); }
 
   /* ====== Initial step: advance all paths from PATH_INIT ====== */
   {
     size_t i;
+    size_t init_ph[PATH_PHASE_COUNT];
+    memset(init_ph, 0, sizeof(init_ph));
     for(i = 0; i < wf.total_paths; i++) {
       int advanced = 0;
       struct path_state* p = &wf.paths[i];
@@ -1075,6 +1202,7 @@ solve_wavefront_probe(
           && p->phase != PATH_DONE && p->phase != PATH_ERROR) {
         if(path_phase_is_ray_pending(p->phase)) break;
         if(path_phase_is_enc_locate_pending(p->phase)) break;
+        if(path_phase_is_cp_pending(p->phase)) break;
 
         res = advance_one_step_no_ray(p, scn, &advanced);
         if(res != RES_OK && res != RES_BAD_OP
@@ -1094,6 +1222,17 @@ solve_wavefront_probe(
         }
         p->steps_taken++;
       }
+      if((int)p->phase >= 0 && (int)p->phase < PATH_PHASE_COUNT)
+        init_ph[(int)p->phase]++;
+    }
+    if(diag) {
+      fprintf(diag, "[WF-DIAG] probe: initial step done. Phase histogram:\n");
+      for(i = 0; i < PATH_PHASE_COUNT; i++) {
+        if(init_ph[i] > 0)
+          fprintf(diag, "  phase[%lu]=%lu\n",
+            (unsigned long)i, (unsigned long)init_ph[i]);
+      }
+      fflush(diag);
     }
   }
 
@@ -1101,6 +1240,54 @@ solve_wavefront_probe(
   time_current(&t_start);
   while(wf.active_count > 0) {
     wf.total_steps++;
+
+    /* ---- Diagnostic: phase histogram (first 20 steps + every 500) ---- */
+    if(diag && (wf.total_steps <= 20
+    || (wf.total_steps % 500) == 0
+    || wf.total_steps == total_paths * 1000)) {
+      size_t ph_counts[PATH_PHASE_COUNT];
+      size_t di, n_needs_ray = 0, n_active = 0, n_done = 0;
+      memset(ph_counts, 0, sizeof(ph_counts));
+      for(di = 0; di < wf.total_paths; di++) {
+        const struct path_state* dp = &wf.paths[di];
+        if(dp->active) {
+          n_active++;
+          if((int)dp->phase >= 0 && (int)dp->phase < PATH_PHASE_COUNT)
+            ph_counts[(int)dp->phase]++;
+          if(dp->needs_ray) n_needs_ray++;
+        }
+        if(dp->phase == PATH_DONE) n_done++;
+      }
+      fprintf(diag,
+        "[WF-DIAG] step=%lu active=%lu done=%lu needs_ray=%lu rays=%lu "
+        "cp_count=%lu enc_count=%lu\n",
+        (unsigned long)wf.total_steps, (unsigned long)n_active,
+        (unsigned long)n_done, (unsigned long)n_needs_ray,
+        (unsigned long)wf.ray_count,
+        (unsigned long)wf.cp_count, (unsigned long)wf.enc_locate_count);
+      for(di = 0; di < PATH_PHASE_COUNT; di++) {
+        if(ph_counts[di] > 0)
+          fprintf(diag, "  phase[%lu]=%lu\n",
+            (unsigned long)di, (unsigned long)ph_counts[di]);
+      }
+      /* Extra: log first active path's WoS state for first 20 steps */
+      if(wf.total_steps <= 20) {
+        for(di = 0; di < wf.total_paths; di++) {
+          const struct path_state* dp = &wf.paths[di];
+          if(dp->active) {
+            fprintf(diag, "  path[%lu]: phase=%d pos=(%g,%g,%g) "
+              "wos_dist=%g delta=%g steps=%lu\n",
+              (unsigned long)di, (int)dp->phase,
+              dp->rwalk.vtx.P[0], dp->rwalk.vtx.P[1], dp->rwalk.vtx.P[2],
+              dp->locals.cnd_wos.last_distance,
+              dp->locals.cnd_wos.delta,
+              (unsigned long)dp->steps_taken);
+            break; /* only first active path */
+          }
+        }
+      }
+      fflush(diag);
+    }
 
     /* Step A: Collect ray requests from all active paths */
     wf.ray_count = 0;
@@ -1175,6 +1362,7 @@ solve_wavefront_probe(
             int advanced = 0;
             if(path_phase_is_ray_pending(p->phase)) break;
             if(path_phase_is_enc_locate_pending(p->phase)) break;
+            if(path_phase_is_cp_pending(p->phase)) break;
             res = advance_one_step_no_ray(p, scn, &advanced);
             if(res != RES_OK && res != RES_BAD_OP
             && res != RES_BAD_OP_IRRECOVERABLE) goto cleanup;
@@ -1196,6 +1384,10 @@ solve_wavefront_probe(
         }
       }
     }
+
+    /* Step C3 (M9): Batch closest_point for all CP-pending WoS paths */
+    res = wf_batch_closest_point(&wf, scn);
+    if(res != RES_OK) goto cleanup;
 
     /* Step D: Update active count */
     update_active_count(&wf);
@@ -1242,6 +1434,9 @@ solve_wavefront_probe(
   }
 
 cleanup:
+  if(diag) { fprintf(diag, "[WF-DIAG] cleanup: res=%d total_steps=%lu active=%lu\n",
+    (int)res, (unsigned long)wf.total_steps, (unsigned long)wf.active_count);
+    fclose(diag); diag = NULL; }
   wf_context_destroy(&wf);
   return res;
 }

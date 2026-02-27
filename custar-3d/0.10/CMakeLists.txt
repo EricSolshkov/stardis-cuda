@@ -133,6 +133,21 @@ target_include_directories(s3d
 
 target_link_libraries(s3d PUBLIC rsys)
 
+# OpenMP for CPU post-processing in batch trace.
+# MSVC Visual Studio generator does not reliably propagate OpenMP::OpenMP_CXX
+# imported target properties to the MSBuild <OpenMPSupport> XML element.
+# We must explicitly set /openmp on the specific .cpp file(s) that use OMP,
+# and avoid applying it to .cu files (nvcc does not support /openmp).
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(s3d PRIVATE OpenMP::OpenMP_CXX)
+    set_source_files_properties(
+        src/s3d_scene_view_batch_trace.cpp
+        PROPERTIES COMPILE_OPTIONS "${OpenMP_CXX_FLAGS}"
+    )
+    message(STATUS "custar-3d: OpenMP enabled (flags: ${OpenMP_CXX_FLAGS})")
+endif()
+
 if(TARGET cubql)
     target_link_libraries(s3d PRIVATE cubql)
     target_compile_definitions(s3d PRIVATE S3D_USE_CUBQL_BACKEND)

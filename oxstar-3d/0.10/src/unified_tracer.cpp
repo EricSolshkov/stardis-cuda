@@ -1280,6 +1280,34 @@ void UnifiedTracer::traceBatchMultiHit(
                             &m_sbt_mh, w, h, 1));
 }
 
+/* P1: overload accepting external params buffer — each ctx owns its own
+ * device memory for launch params, eliminating the race on m_batch_params_ptr
+ * when two streams call traceBatchMultiHit concurrently. */
+void UnifiedTracer::traceBatchMultiHit(
+    Ray* d_rays, MultiHitResult* d_multi_hits,
+    unsigned int count, CUstream stream,
+    CUdeviceptr external_params_ptr)
+{
+    UnifiedParams lp = {};
+    lp.handle     = activeRTHandle();
+    lp.count      = count;
+    lp.rays       = d_rays;
+    lp.multi_hits = d_multi_hits;
+
+    /* Use caller-provided params buffer — per-ctx, no race */
+    CUDA_CHECK(cudaMemcpyAsync(
+        reinterpret_cast<void*>(external_params_ptr),
+        &lp, sizeof(UnifiedParams),
+        cudaMemcpyHostToDevice, stream));
+
+    unsigned int w, h;
+    if (count <= 65536) { w = count; h = 1; }
+    else { w = 8192; h = (count + w - 1) / w; }
+
+    OPTIX_CHECK(optixLaunch(m_pipeline, stream, external_params_ptr,
+                            sizeof(UnifiedParams), &m_sbt_mh, w, h, 1));
+}
+
 std::vector<MultiHitResult> UnifiedTracer::traceBatchMultiHit(const std::vector<Ray>& rays)
 {
     unsigned int count = static_cast<unsigned int>(rays.size());

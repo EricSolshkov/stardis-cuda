@@ -41,6 +41,10 @@
 #include <stdio.h>
 #include <assert.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -231,7 +235,9 @@ trace_rays_batch_impl
     t1 = stats ? get_time_ms() : 0;
     if(stats) stats->batch_time_ms = t1 - t0;
 
-    /* Step 3: CPU post-processing — iterate Top-K candidates per ray */
+    /* Step 3: CPU post-processing — iterate Top-K candidates per ray
+     * OMP parallelized: each ray is fully independent (read-only inputs,
+     * per-ray output writes, thread-local stat counters). */
     t0 = stats ? get_time_ms() : 0;
 
     size_t diag_miss_count = 0;      /* count==0 rays this batch */
@@ -239,6 +245,116 @@ trace_rays_batch_impl
     size_t diag_detail_dumps = 0;    /* per-ray detail dumps emitted */
     /* Per-candidate-index acceptance this batch */
     size_t diag_accept_at[CUS3D_MAX_MULTI_HITS] = {0};
+
+#ifdef _OPENMP
+    {
+      /* OMP toggle: STARDIS_POSTPROCESS_OMP=0 disables */
+      int pp_use_omp = 1;
+      int pp_nthreads = omp_get_max_threads();
+      {
+        const char* env = getenv("STARDIS_POSTPROCESS_OMP");
+        if(env && env[0] == '0') pp_use_omp = 0;
+      }
+      /* Allow explicit thread count: STARDIS_POSTPROCESS_THREADS=N */
+      {
+        const char* thr_env = getenv("STARDIS_POSTPROCESS_THREADS");
+        if(thr_env) {
+          int ct = atoi(thr_env);
+          if(ct > 0) pp_nthreads = ct;
+        }
+      }
+      if((int)nrays < 256) pp_use_omp = 0;
+      if(pp_nthreads < 2) pp_use_omp = 0;
+
+      if(pp_use_omp) {
+        /* Per-thread reduction variables */
+        size_t omp_stat_accepted = 0;
+        size_t omp_stat_topk_accepted = 0;
+        size_t omp_stat_rejected = 0;
+        size_t omp_diag_miss = 0;
+        size_t omp_diag_no_filter = 0;
+
+        #pragma omp parallel num_threads(pp_nthreads) \
+          reduction(+: omp_stat_accepted, omp_stat_topk_accepted, \
+                       omp_stat_rejected, omp_diag_miss, omp_diag_no_filter)
+        {
+          int kk;
+          #pragma omp for schedule(static)
+          for(kk = 0; kk < (int)nrays; kk++) {
+            const struct cus3d_multi_hit_result* multi = &h_multi_results[kk];
+            int pp_accepted = 0;
+            int jj;
+
+            if(multi->count == 0) {
+              hits[kk] = S3D_HIT_NULL;
+              omp_stat_accepted++;
+              omp_diag_miss++;
+              continue;
+            }
+
+            for(jj = 0; jj < multi->count; jj++) {
+              const struct cus3d_hit_result* candidate = &multi->hits[jj];
+              if(candidate->prim_id < 0) continue;
+
+              const struct cus3d_geom_store* resolved_store = store;
+              if(candidate->inst_id >= 0) {
+                const struct cus3d_geom_store* cs =
+                  cus3d_bvh_get_instance_store(bvh, (unsigned)candidate->inst_id);
+                if(cs) resolved_store = cs;
+              }
+
+              cus3d_hit_to_s3d_hit(resolved_store, bvh, candidate, &hits[kk]);
+
+              const struct geom_entry* ge =
+                cus3d_geom_store_get_entry(resolved_store,
+                                           (uint32_t)candidate->geom_idx);
+              if(!ge) continue;
+
+              trace_hit_fixup(&hits[kk], ge);
+
+              if(requests[kk].filter_data != NULL && ge->filter_func != NULL) {
+                int rejected = ge->filter_func(
+                  &hits[kk],
+                  requests[kk].origin,
+                  requests[kk].direction,
+                  requests[kk].range,
+                  requests[kk].filter_data,
+                  ge->filter_data);
+                if(rejected) continue;
+              } else if(requests[kk].filter_data == NULL) {
+                omp_diag_no_filter++;
+              }
+
+              pp_accepted = 1;
+              if(jj == 0)
+                omp_stat_accepted++;
+              else
+                omp_stat_topk_accepted++;
+              break;
+            }
+
+            if(!pp_accepted) {
+              if(multi->count < BATCH_TOPK_COUNT) {
+                hits[kk] = S3D_HIT_NULL;
+                omp_stat_rejected++;
+              } else {
+                needs_retrace[kk] = 1;
+                omp_stat_rejected++;
+              }
+            }
+          } /* end omp for */
+        } /* end omp parallel */
+
+        stat_accepted      += omp_stat_accepted;
+        stat_topk_accepted += omp_stat_topk_accepted;
+        stat_rejected      += omp_stat_rejected;
+        diag_miss_count    += omp_diag_miss;
+        diag_no_filter     += omp_diag_no_filter;
+
+        goto postprocess_done;
+      }
+    }
+#endif /* _OPENMP */
 
     for(i = 0; i < nrays; i++) {
         const struct cus3d_multi_hit_result* multi = &h_multi_results[i];
@@ -352,6 +468,7 @@ trace_rays_batch_impl
         }
     }
 
+postprocess_done:
     t1 = stats ? get_time_ms() : 0;
     if(stats) stats->postprocess_time_ms = t1 - t0;
 

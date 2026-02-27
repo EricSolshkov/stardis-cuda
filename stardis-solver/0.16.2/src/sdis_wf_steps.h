@@ -315,10 +315,22 @@ step_cnd_wos_closest(struct path_state* p);
 
 /* PATH_CND_WOS_CLOSEST_RESULT: process closest_point result.
  * Epsilon-shell → snap to boundary → TIME_TRAVEL.
- * Normal → sample sphere, check_diffusion_position.
- * check_diffusion fails → FALLBACK_TRACE. */
+ * Normal → sample sphere, save candidate pos → DIFFUSION_CHECK. */
 extern LOCAL_SYM res_T
 step_cnd_wos_closest_result(struct path_state* p, struct sdis_scene* scn);
+
+/* PATH_CND_WOS_DIFFUSION_CHECK: submit batched CP query to validate
+ * diffusion candidate position (radius = delta).  Replaces former
+ * synchronous wf_check_diffusion_position(). */
+extern LOCAL_SYM void
+step_cnd_wos_diffusion_check(struct path_state* p);
+
+/* PATH_CND_WOS_DIFFUSION_CHECK_RESULT: process validation CP result.
+ * position valid → move, TIME_TRAVEL.
+ * position invalid → FALLBACK_TRACE. */
+extern LOCAL_SYM res_T
+step_cnd_wos_diffusion_check_result(struct path_state* p,
+                                     struct sdis_scene* scn);
 
 /* PATH_CND_WOS_FALLBACK_TRACE: emit fallback trace_ray (dir from closest_result).
  * ray_bucket = RAY_BUCKET_RADIATIVE, 1 ray. */

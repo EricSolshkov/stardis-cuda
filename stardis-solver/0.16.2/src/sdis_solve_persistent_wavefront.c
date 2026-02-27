@@ -80,6 +80,243 @@ static FILE* pixel_trace_file(void) {
 #include "sdis_wf_steps.h"
 
 /*******************************************************************************
+ * P2: pool_view — Unified pool view init / destroy / merge / split
+ *
+ * A pool_view represents a view over slots[base..base+view_size).
+ * Single-buffer: views[0] covers the entire pool.
+ * Dual-buffer:   views[0] front half, views[1] back half.
+ *
+ * All pool operation functions will be unified to accept (pool, pv) in P3.
+ * Until then, the old pool-level fields remain and are used by existing code.
+ ******************************************************************************/
+
+/**
+ * pool_view_init — Allocate and initialise a single pool view.
+ *
+ * @param pv         Target view struct (caller-owned, e.g. &pool->views[i])
+ * @param base       Slot start offset (0 or view_size)
+ * @param view_size  Number of slots this view covers
+ * @param capacity   Allocation capacity (>= view_size; views[0] may use
+ *                   pool_size to support merge)
+ */
+static res_T
+pool_view_init(struct pool_view* pv, size_t base, size_t view_size,
+               size_t capacity)
+{
+  size_t max_rays = capacity * 6;  /* each slot can request up to 6 rays */
+
+  memset(pv, 0, sizeof(*pv));
+  pv->base      = base;
+  pv->view_size = view_size;
+  pv->capacity  = capacity;
+  pv->max_rays  = max_rays;
+
+  /* Index arrays — allocated by capacity */
+  pv->active_indices   = (uint32_t*)calloc(capacity, sizeof(uint32_t));
+  pv->need_ray_indices = (uint32_t*)calloc(capacity, sizeof(uint32_t));
+  pv->done_indices     = (uint32_t*)calloc(capacity, sizeof(uint32_t));
+  pv->bucket_radiative = (uint32_t*)calloc(capacity, sizeof(uint32_t));
+  pv->bucket_conductive= (uint32_t*)calloc(capacity, sizeof(uint32_t));
+
+  if(!pv->active_indices || !pv->need_ray_indices || !pv->done_indices
+  || !pv->bucket_radiative || !pv->bucket_conductive)
+    return RES_MEM_ERR;
+
+  /* Ray buffers — allocated by max_rays */
+  pv->ray_requests = (struct s3d_ray_request*)calloc(
+    max_rays, sizeof(struct s3d_ray_request));
+  pv->ray_to_slot  = (uint32_t*)calloc(max_rays, sizeof(uint32_t));
+  pv->ray_slot_sub = (uint32_t*)calloc(max_rays, sizeof(uint32_t));
+  pv->ray_hits     = (struct s3d_hit*)calloc(max_rays, sizeof(struct s3d_hit));
+
+  if(!pv->ray_requests || !pv->ray_to_slot
+  || !pv->ray_slot_sub || !pv->ray_hits)
+    return RES_MEM_ERR;
+
+  /* GPU batch trace context (will hold independent CUDA stream + params) */
+  {
+    res_T rc = s3d_batch_trace_context_create(&pv->batch_ctx, max_rays);
+    if(rc != RES_OK) return rc;
+  }
+
+  /* enc_locate buffers */
+  pv->max_enc_locates     = capacity;
+  pv->enc_locate_requests = (struct s3d_enc_locate_request*)calloc(
+    capacity, sizeof(struct s3d_enc_locate_request));
+  pv->enc_locate_results  = (struct s3d_enc_locate_result*)calloc(
+    capacity, sizeof(struct s3d_enc_locate_result));
+  pv->enc_locate_to_slot  = (uint32_t*)calloc(capacity, sizeof(uint32_t));
+
+  if(!pv->enc_locate_requests || !pv->enc_locate_results
+  || !pv->enc_locate_to_slot)
+    return RES_MEM_ERR;
+
+  {
+    res_T rc = s3d_batch_enc_context_create(&pv->enc_batch_ctx, capacity);
+    if(rc != RES_OK) return rc;
+  }
+
+  /* closest_point buffers */
+  pv->max_cps     = capacity;
+  pv->cp_requests = (struct s3d_cp_request*)calloc(
+    capacity, sizeof(struct s3d_cp_request));
+  pv->cp_hits     = (struct s3d_hit*)calloc(
+    capacity, sizeof(struct s3d_hit));
+  pv->cp_to_slot  = (uint32_t*)calloc(capacity, sizeof(uint32_t));
+
+  if(!pv->cp_requests || !pv->cp_hits || !pv->cp_to_slot)
+    return RES_MEM_ERR;
+
+  {
+    res_T rc = s3d_batch_cp_context_create(&pv->cp_batch_ctx, capacity);
+    if(rc != RES_OK) return rc;
+  }
+
+  return RES_OK;
+}
+
+/**
+ * pool_view_destroy — Free all resources held by a pool view.
+ */
+static void
+pool_view_destroy(struct pool_view* pv)
+{
+  if(!pv) return;
+
+  free(pv->active_indices);
+  free(pv->need_ray_indices);
+  free(pv->done_indices);
+  free(pv->bucket_radiative);
+  free(pv->bucket_conductive);
+
+  free(pv->ray_requests);
+  free(pv->ray_to_slot);
+  free(pv->ray_slot_sub);
+  free(pv->ray_hits);
+
+  if(pv->batch_ctx) s3d_batch_trace_context_destroy(pv->batch_ctx);
+
+  free(pv->enc_locate_requests);
+  free(pv->enc_locate_results);
+  free(pv->enc_locate_to_slot);
+  if(pv->enc_batch_ctx) s3d_batch_enc_context_destroy(pv->enc_batch_ctx);
+
+  free(pv->cp_requests);
+  free(pv->cp_hits);
+  free(pv->cp_to_slot);
+  if(pv->cp_batch_ctx) s3d_batch_cp_context_destroy(pv->cp_batch_ctx);
+
+  memset(pv, 0, sizeof(*pv));
+}
+
+/*******************************************************************************
+ * P2: Dynamic merge / split — dual-buffer <-> single-buffer transitions
+ ******************************************************************************/
+
+/**
+ * should_merge — Check if dual-buffer should collapse to single-buffer.
+ *
+ * Condition: either half's active count drops below 12.5% of its view_size.
+ */
+static int
+should_merge(const struct wavefront_pool* pool)
+{
+  size_t thresh;
+  if(pool->num_active_views != 2) return 0;
+
+  thresh = pool->views[0].view_size / 8;     /* 12.5% */
+
+  return (pool->views[0].active_compact < thresh)
+      || (pool->views[1].active_compact < thresh);
+}
+
+/**
+ * should_split — Check if single-buffer should split to dual-buffer.
+ *
+ * Condition: active paths > 75% pool capacity, and undistributed tasks remain.
+ */
+static int
+should_split(const struct wavefront_pool* pool)
+{
+  if(pool->num_active_views != 1) return 0;
+  if(pool->task_next >= pool->task_count) return 0;
+
+  return pool->views[0].active_compact > (pool->pool_size * 3 / 4);
+}
+
+/**
+ * merge_to_single_pool — Collapse dual-buffer views into a single full-range view.
+ *
+ * Precondition: both views' GPU traces have completed (no async pending).
+ * views[0].capacity was allocated as pool_size, so no reallocation needed.
+ * views[1] resources are NOT freed (may split back later).
+ */
+static void
+merge_to_single_pool(struct wavefront_pool* pool)
+{
+  /* Expand views[0] to cover the full pool */
+  pool->views[0].base      = 0;
+  pool->views[0].view_size = pool->pool_size;
+
+  /* Clear runtime counts — next compact pass will rebuild them */
+  pool->views[0].active_compact     = 0;
+  pool->views[0].need_ray_count     = 0;
+  pool->views[0].done_count         = 0;
+  pool->views[0].bucket_radiative_n = 0;
+  pool->views[0].bucket_conductive_n= 0;
+  pool->views[0].ray_count          = 0;
+  pool->views[0].enc_locate_count   = 0;
+  pool->views[0].cp_count           = 0;
+
+  pool->num_active_views = 1;
+
+  /* views[1] resources retained for potential future split */
+}
+
+/**
+ * split_to_dual_pool — Split single-buffer view into two half-range views.
+ *
+ * Precondition: views[1] was previously initialised by pool_view_init
+ * (only valid if initially started in dual mode; single-mode start does
+ * not initialise views[1], and should_split returns 0 in that case).
+ *
+ * Must be called before compact, so the next compact pass works on
+ * the new view ranges.
+ */
+static void
+split_to_dual_pool(struct wavefront_pool* pool)
+{
+  size_t half = pool->pool_size / 2;
+
+  pool->views[0].base      = 0;
+  pool->views[0].view_size = half;
+
+  pool->views[1].base      = half;
+  pool->views[1].view_size = half;
+
+  /* Clear both views' runtime counts */
+  pool->views[0].active_compact     = 0;
+  pool->views[0].need_ray_count     = 0;
+  pool->views[0].done_count         = 0;
+  pool->views[0].bucket_radiative_n = 0;
+  pool->views[0].bucket_conductive_n= 0;
+  pool->views[0].ray_count          = 0;
+  pool->views[0].enc_locate_count   = 0;
+  pool->views[0].cp_count           = 0;
+
+  pool->views[1].active_compact     = 0;
+  pool->views[1].need_ray_count     = 0;
+  pool->views[1].done_count         = 0;
+  pool->views[1].bucket_radiative_n = 0;
+  pool->views[1].bucket_conductive_n= 0;
+  pool->views[1].ray_count          = 0;
+  pool->views[1].enc_locate_count   = 0;
+  pool->views[1].cp_count           = 0;
+
+  pool->num_active_views = 2;
+}
+
+/*******************************************************************************
  * Pool allocation / deallocation
  ******************************************************************************/
 static res_T
@@ -154,6 +391,35 @@ pool_create(struct wavefront_pool* pool, size_t pool_size)
   pool->diag_min_batch = (size_t)-1; /* updated on first step with rays */
   pool->trace_batch_size_min = (size_t)-1;
 
+  /* P2: Initialise unified pool views */
+  {
+    const char* env = getenv("STARDIS_PIPELINE");
+    int dual = (env && env[0] == '0') ? 0 : 1;
+    res_T vrc;
+
+    if(dual) {
+      /* Dual-buffer pipeline mode */
+      size_t half = pool_size / 2;
+
+      /* views[0]: capacity = pool_size (supports merge to full range)
+       *           initial view_size = half (front half only) */
+      vrc = pool_view_init(&pool->views[0], 0, half, pool_size);
+      if(vrc != RES_OK) return vrc;
+
+      /* views[1]: capacity = half (back half only) */
+      vrc = pool_view_init(&pool->views[1], half, half, half);
+      if(vrc != RES_OK) return vrc;
+
+      pool->num_active_views = 2;
+    } else {
+      /* Single-buffer mode: views[0] covers entire pool */
+      vrc = pool_view_init(&pool->views[0], 0, pool_size, pool_size);
+      if(vrc != RES_OK) return vrc;
+
+      pool->num_active_views = 1;
+    }
+  }
+
   return RES_OK;
 }
 
@@ -161,6 +427,10 @@ static void
 pool_destroy(struct wavefront_pool* pool)
 {
   if(!pool) return;
+
+  /* P2: Destroy pool views (GPU batch contexts + view buffers) */
+  pool_view_destroy(&pool->views[0]);
+  pool_view_destroy(&pool->views[1]);  /* safe even if not initialised (zeroed) */
 
   if(pool->batch_ctx) s3d_batch_trace_context_destroy(pool->batch_ctx);
   if(pool->enc_batch_ctx) s3d_batch_enc_context_destroy(pool->enc_batch_ctx);
@@ -492,16 +762,19 @@ fill_pool(struct wavefront_pool* pool)
  *   bucket_conductive[0..n-1]             = need_ray + conductive phase
  ******************************************************************************/
 static void
-compact_active_paths(struct wavefront_pool* pool)
+compact_active_paths(struct wavefront_pool* pool, struct pool_view* pv)
 {
+  size_t base = pv->base;
+  size_t end  = base + pv->view_size;
   size_t i;
-  pool->active_compact      = 0;
-  pool->need_ray_count      = 0;
-  pool->done_count          = 0;
-  pool->bucket_radiative_n  = 0;
-  pool->bucket_conductive_n = 0;
 
-  for(i = 0; i < pool->pool_size; i++) {
+  pv->active_compact      = 0;
+  pv->need_ray_count      = 0;
+  pv->done_count          = 0;
+  pv->bucket_radiative_n  = 0;
+  pv->bucket_conductive_n = 0;
+
+  for(i = base; i < end; i++) {
     struct path_state* p = &pool->slots[i];
 
     if(p->phase == PATH_DONE || p->phase == PATH_ERROR
@@ -513,23 +786,23 @@ compact_active_paths(struct wavefront_pool* pool)
         p->active = 1;
         /* Fall through to treat as active path */
       } else {
-        pool->done_indices[pool->done_count++] = (uint32_t)i;
+        pv->done_indices[pv->done_count++] = (uint32_t)i;
         continue;
       }
     }
     if(!p->active) continue;
 
-    pool->active_indices[pool->active_compact++] = (uint32_t)i;
+    pv->active_indices[pv->active_compact++] = (uint32_t)i;
 
     if(p->needs_ray && p->ray_req.ray_count > 0) {
-      pool->need_ray_indices[pool->need_ray_count++] = (uint32_t)i;
+      pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
 
       /* Bucket by phase type */
       if(p->phase == PATH_RAD_TRACE_PENDING) {
-        pool->bucket_radiative[pool->bucket_radiative_n++] = (uint32_t)i;
+        pv->bucket_radiative[pv->bucket_radiative_n++] = (uint32_t)i;
       } else if(p->phase == PATH_COUPLED_COND_DS_PENDING
              || p->phase == PATH_CND_DS_STEP_TRACE) {
-        pool->bucket_conductive[pool->bucket_conductive_n++] = (uint32_t)i;
+        pv->bucket_conductive[pv->bucket_conductive_n++] = (uint32_t)i;
       }
       /* Other ray-pending phases (boundary reinject) go into
        * need_ray_indices but not into type-specific buckets. */
@@ -669,139 +942,337 @@ time_elapsed_sec(const struct time* t0, const struct time* t1)
 /* count_path_rays is now static INLINE in persistent_wavefront.h */
 
 LOCAL_SYM res_T
-pool_collect_ray_requests_bucketed(struct wavefront_pool* pool)
+pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
+                                    struct pool_view* pv)
 {
-  size_t k, b;
-  /* Per-bucket write cursors */
-  size_t cursor[RAY_BUCKET_COUNT];
+  size_t b;
+  int omp_nthreads;
+  int use_omp = 1;
 
-  /* ---- Pass 1: Count rays per bucket ---- */
-  memset(pool->bucket_counts, 0, sizeof(pool->bucket_counts));
+  /* Max OMP threads for stack-allocated per-thread arrays */
+  #define COLLECT_MAX_THREADS 32
 
-  for(k = 0; k < pool->need_ray_count; k++) {
-    uint32_t i = pool->need_ray_indices[k];
-    struct path_state* p = &pool->slots[i];
-    size_t nrays = count_path_rays(p);
-    int bkt = (int)p->ray_bucket;
-
-    ASSERT(bkt >= 0 && bkt < RAY_BUCKET_COUNT);
-    pool->bucket_counts[bkt] += nrays;
+  /* OMP toggle: STARDIS_COLLECT_OMP=0 disables */
+  {
+    const char* env = getenv("STARDIS_COLLECT_OMP");
+    if(env && env[0] == '0') use_omp = 0;
   }
+  omp_nthreads = (pool->scn && pool->scn->dev)
+               ? (int)pool->scn->dev->nthreads : 1;
+  if(omp_nthreads < 1) omp_nthreads = 1;
+  if(omp_nthreads > COLLECT_MAX_THREADS) omp_nthreads = COLLECT_MAX_THREADS;
+  if(pv->need_ray_count < 128) use_omp = 0;
 
-  /* ---- Compute bucket offsets (prefix sum) ---- */
-  pool->bucket_offsets[0] = 0;
-  for(b = 0; b < RAY_BUCKET_COUNT; b++) {
-    pool->bucket_offsets[b + 1] = pool->bucket_offsets[b]
-                                + pool->bucket_counts[b];
-  }
+  if(use_omp) {
+    /* ════════════ OMP 3-pass bucketed collect (zero atomic) ════════════
+     *
+     * Pass 1: Per-thread bucket counting.  Each thread counts rays per
+     *         bucket for its chunk.  Same schedule(static) as Pass 2 so
+     *         thread t processes identical index range in both passes.
+     *
+     * Prefix sum: Compute global bucket_offsets, then per-thread per-bucket
+     *             write offsets.  Thread t's rays for bucket b start at
+     *             tl_write_base[t][b].  No overlap -> zero contention.
+     *
+     * Pass 2: Scatter.  Each thread writes rays using a local cursor
+     *         initialised from tl_write_base.  No atomic, no sharing.
+     * ================================================================== */
 
-  /* Initialise write cursors to bucket starts */
-  for(b = 0; b < RAY_BUCKET_COUNT; b++) {
-    cursor[b] = pool->bucket_offsets[b];
-  }
+    /* Per-thread per-bucket ray counts (padded to avoid false sharing) */
+    size_t tl_ray_counts[COLLECT_MAX_THREADS][RAY_BUCKET_COUNT];
+    size_t tl_write_base[COLLECT_MAX_THREADS][RAY_BUCKET_COUNT];
 
-  /* ---- Pass 2: Scatter rays into bucketed positions ---- */
-  for(k = 0; k < pool->need_ray_count; k++) {
-    uint32_t i = pool->need_ray_indices[k];
-    struct path_state* p = &pool->slots[i];
-    int bkt = (int)p->ray_bucket;
+    memset(tl_ray_counts, 0, sizeof(tl_ray_counts));
 
-    /* Detailed stats by phase type */
-    if(p->phase == PATH_RAD_TRACE_PENDING)
-      pool->rays_radiative += (size_t)p->ray_req.ray_count;
-    else if(p->phase == PATH_COUPLED_COND_DS_PENDING
-         || p->phase == PATH_CND_DS_STEP_TRACE) {
-      if(p->ds_robust_attempt > 0)
-        pool->rays_conductive_ds_retry += (size_t)p->ray_req.ray_count;
-      else
-        pool->rays_conductive_ds += (size_t)p->ray_req.ray_count;
-    }
-    /* B-4 M2: additional per-bucket stats */
-    if(bkt == RAY_BUCKET_SHADOW)
-      pool->rays_shadow += count_path_rays(p);
-    else if(bkt == RAY_BUCKET_STARTUP)
-      pool->rays_startup += count_path_rays(p);
-
-    /* --- Emit ray 0 --- */
+    /* ---- Pass 1: Per-thread bucket counting ---- */
+    #pragma omp parallel num_threads(omp_nthreads)
     {
-      size_t ray_idx = cursor[bkt]++;
-      struct s3d_ray_request* rr = &pool->ray_requests[ray_idx];
-      rr->origin[0]    = p->ray_req.origin[0];
-      rr->origin[1]    = p->ray_req.origin[1];
-      rr->origin[2]    = p->ray_req.origin[2];
-      rr->direction[0] = p->ray_req.direction[0];
-      rr->direction[1] = p->ray_req.direction[1];
-      rr->direction[2] = p->ray_req.direction[2];
-      rr->range[0]     = p->ray_req.range[0];
-      rr->range[1]     = p->ray_req.range[1];
-      rr->user_id      = i;
+      int tid = omp_get_thread_num();
+      int kk;
 
-      if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
-        rr->filter_data = &p->filter_data_storage;
-      } else {
-        rr->filter_data = NULL;
+      #pragma omp for schedule(static)
+      for(kk = 0; kk < (int)pv->need_ray_count; kk++) {
+        uint32_t i = pv->need_ray_indices[kk];
+        struct path_state* p = &pool->slots[i];
+        size_t nrays = count_path_rays(p);
+        int bkt = (int)p->ray_bucket;
+        tl_ray_counts[tid][bkt] += nrays;
       }
-
-      pool->ray_to_slot[ray_idx] = i;
-      pool->ray_slot_sub[ray_idx] = 0;
-      p->ray_req.batch_idx = (uint32_t)ray_idx;
     }
 
-    /* --- Ray 1 (2-ray request: delta_sphere or reinjection) --- */
-    if(p->ray_req.ray_count >= 2) {
-      size_t ray_idx = cursor[bkt]++;
-      struct s3d_ray_request* rr = &pool->ray_requests[ray_idx];
-      rr->origin[0]    = p->ray_req.origin[0];
-      rr->origin[1]    = p->ray_req.origin[1];
-      rr->origin[2]    = p->ray_req.origin[2];
-      rr->direction[0] = p->ray_req.direction2[0];
-      rr->direction[1] = p->ray_req.direction2[1];
-      rr->direction[2] = p->ray_req.direction2[2];
-      rr->range[0]     = p->ray_req.range2[0];
-      rr->range[1]     = p->ray_req.range2[1];
-      if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
-        rr->filter_data = &p->filter_data_storage;
-      } else {
-        rr->filter_data = NULL;
+    /* ---- Aggregate bucket totals ---- */
+    memset(pv->bucket_counts, 0, sizeof(pv->bucket_counts));
+    {
+      int t;
+      for(t = 0; t < omp_nthreads; t++) {
+        for(b = 0; b < RAY_BUCKET_COUNT; b++) {
+          pv->bucket_counts[b] += tl_ray_counts[t][b];
+        }
       }
-      rr->user_id      = i;
-
-      pool->ray_to_slot[ray_idx] = i;
-      pool->ray_slot_sub[ray_idx] = 1;
-      p->ray_req.batch_idx2 = (uint32_t)ray_idx;
     }
 
-    /* --- B-4 M1-v2: Rays 2..5 for 6-ray enclosure query --- */
-    if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT) {
-      int j;
-      /* Record batch indices for ray 0 and ray 1 (already emitted) */
-      p->enc_query.batch_indices[0] = p->ray_req.batch_idx;
-      p->enc_query.batch_indices[1] = p->ray_req.batch_idx2;
+    /* ---- Bucket offsets (global prefix sum) ---- */
+    pv->bucket_offsets[0] = 0;
+    for(b = 0; b < RAY_BUCKET_COUNT; b++) {
+      pv->bucket_offsets[b + 1] = pv->bucket_offsets[b]
+                                 + pv->bucket_counts[b];
+    }
 
-      for(j = 2; j < 6; j++) {
-        size_t ray_idx = cursor[bkt]++;
-        struct s3d_ray_request* rr = &pool->ray_requests[ray_idx];
+    /* ---- Per-thread per-bucket write bases ---- */
+    for(b = 0; b < RAY_BUCKET_COUNT; b++) {
+      size_t running = pv->bucket_offsets[b];
+      int t;
+      for(t = 0; t < omp_nthreads; t++) {
+        tl_write_base[t][b] = running;
+        running += tl_ray_counts[t][b];
+      }
+    }
+
+    /* ---- Pass 2: Scatter rays (no atomic, each thread owns its region) ---- */
+    #pragma omp parallel num_threads(omp_nthreads)
+    {
+      int tid = omp_get_thread_num();
+      int kk, bb;
+      size_t my_cursor[RAY_BUCKET_COUNT];
+      size_t tl_rays_radiative = 0;
+      size_t tl_rays_cond_ds = 0;
+      size_t tl_rays_cond_ds_retry = 0;
+      size_t tl_rays_shadow = 0;
+      size_t tl_rays_startup = 0;
+
+      for(bb = 0; bb < RAY_BUCKET_COUNT; bb++)
+        my_cursor[bb] = tl_write_base[tid][bb];
+
+      /* MUST use identical schedule(static) as Pass 1 */
+      #pragma omp for schedule(static)
+      for(kk = 0; kk < (int)pv->need_ray_count; kk++) {
+        uint32_t i = pv->need_ray_indices[kk];
+        struct path_state* p = &pool->slots[i];
+        int bkt = (int)p->ray_bucket;
+
+        /* Thread-local stats accumulation */
+        if(p->phase == PATH_RAD_TRACE_PENDING)
+          tl_rays_radiative += (size_t)p->ray_req.ray_count;
+        else if(p->phase == PATH_COUPLED_COND_DS_PENDING
+             || p->phase == PATH_CND_DS_STEP_TRACE) {
+          if(p->ds_robust_attempt > 0)
+            tl_rays_cond_ds_retry += (size_t)p->ray_req.ray_count;
+          else
+            tl_rays_cond_ds += (size_t)p->ray_req.ray_count;
+        }
+        if(bkt == RAY_BUCKET_SHADOW)
+          tl_rays_shadow += count_path_rays(p);
+        else if(bkt == RAY_BUCKET_STARTUP)
+          tl_rays_startup += count_path_rays(p);
+
+        /* --- Emit ray 0 --- */
+        {
+          size_t ray_idx = my_cursor[bkt]++;
+          struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
+          rr->origin[0]    = p->ray_req.origin[0];
+          rr->origin[1]    = p->ray_req.origin[1];
+          rr->origin[2]    = p->ray_req.origin[2];
+          rr->direction[0] = p->ray_req.direction[0];
+          rr->direction[1] = p->ray_req.direction[1];
+          rr->direction[2] = p->ray_req.direction[2];
+          rr->range[0]     = p->ray_req.range[0];
+          rr->range[1]     = p->ray_req.range[1];
+          rr->user_id      = i;
+
+          if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d))
+            rr->filter_data = &p->filter_data_storage;
+          else
+            rr->filter_data = NULL;
+
+          pv->ray_to_slot[ray_idx] = i;
+          pv->ray_slot_sub[ray_idx] = 0;
+          p->ray_req.batch_idx = (uint32_t)ray_idx;
+        }
+
+        /* --- Ray 1 (2-ray request) --- */
+        if(p->ray_req.ray_count >= 2) {
+          size_t ray_idx = my_cursor[bkt]++;
+          struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
+          rr->origin[0]    = p->ray_req.origin[0];
+          rr->origin[1]    = p->ray_req.origin[1];
+          rr->origin[2]    = p->ray_req.origin[2];
+          rr->direction[0] = p->ray_req.direction2[0];
+          rr->direction[1] = p->ray_req.direction2[1];
+          rr->direction[2] = p->ray_req.direction2[2];
+          rr->range[0]     = p->ray_req.range2[0];
+          rr->range[1]     = p->ray_req.range2[1];
+          if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d))
+            rr->filter_data = &p->filter_data_storage;
+          else
+            rr->filter_data = NULL;
+          rr->user_id      = i;
+
+          pv->ray_to_slot[ray_idx] = i;
+          pv->ray_slot_sub[ray_idx] = 1;
+          p->ray_req.batch_idx2 = (uint32_t)ray_idx;
+        }
+
+        /* --- Rays 2..5 for 6-ray enclosure query --- */
+        if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT) {
+          int j;
+          p->enc_query.batch_indices[0] = p->ray_req.batch_idx;
+          p->enc_query.batch_indices[1] = p->ray_req.batch_idx2;
+
+          for(j = 2; j < 6; j++) {
+            size_t ray_idx = my_cursor[bkt]++;
+            struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
+            rr->origin[0]    = p->ray_req.origin[0];
+            rr->origin[1]    = p->ray_req.origin[1];
+            rr->origin[2]    = p->ray_req.origin[2];
+            rr->direction[0] = p->enc_query.directions[j][0];
+            rr->direction[1] = p->enc_query.directions[j][1];
+            rr->direction[2] = p->enc_query.directions[j][2];
+            rr->range[0]     = p->ray_req.range[0];
+            rr->range[1]     = p->ray_req.range[1];
+            rr->filter_data  = NULL;
+            rr->user_id      = i;
+
+            pv->ray_to_slot[ray_idx] = i;
+            pv->ray_slot_sub[ray_idx] = (uint32_t)j;
+            p->enc_query.batch_indices[j] = (uint32_t)ray_idx;
+          }
+        }
+      } /* end omp for */
+
+      #pragma omp critical
+      {
+        pool->rays_radiative         += tl_rays_radiative;
+        pool->rays_conductive_ds     += tl_rays_cond_ds;
+        pool->rays_conductive_ds_retry += tl_rays_cond_ds_retry;
+        pool->rays_shadow            += tl_rays_shadow;
+        pool->rays_startup           += tl_rays_startup;
+      }
+    } /* end omp parallel */
+
+    pv->ray_count = pv->bucket_offsets[RAY_BUCKET_COUNT];
+    return RES_OK;
+
+    #undef COLLECT_MAX_THREADS
+  }
+
+  /* ════════════ Serial fallback ════════════ */
+  {
+    size_t k;
+    size_t ser_cursor[RAY_BUCKET_COUNT];
+
+    memset(pv->bucket_counts, 0, sizeof(pv->bucket_counts));
+
+    for(k = 0; k < pv->need_ray_count; k++) {
+      uint32_t i = pv->need_ray_indices[k];
+      struct path_state* p = &pool->slots[i];
+      size_t nrays = count_path_rays(p);
+      int bkt = (int)p->ray_bucket;
+      ASSERT(bkt >= 0 && bkt < RAY_BUCKET_COUNT);
+      pv->bucket_counts[bkt] += nrays;
+    }
+
+    pv->bucket_offsets[0] = 0;
+    for(b = 0; b < RAY_BUCKET_COUNT; b++) {
+      pv->bucket_offsets[b + 1] = pv->bucket_offsets[b]
+                                 + pv->bucket_counts[b];
+    }
+    for(b = 0; b < RAY_BUCKET_COUNT; b++) {
+      ser_cursor[b] = pv->bucket_offsets[b];
+    }
+
+    for(k = 0; k < pv->need_ray_count; k++) {
+      uint32_t i = pv->need_ray_indices[k];
+      struct path_state* p = &pool->slots[i];
+      int bkt = (int)p->ray_bucket;
+
+      if(p->phase == PATH_RAD_TRACE_PENDING)
+        pool->rays_radiative += (size_t)p->ray_req.ray_count;
+      else if(p->phase == PATH_COUPLED_COND_DS_PENDING
+           || p->phase == PATH_CND_DS_STEP_TRACE) {
+        if(p->ds_robust_attempt > 0)
+          pool->rays_conductive_ds_retry += (size_t)p->ray_req.ray_count;
+        else
+          pool->rays_conductive_ds += (size_t)p->ray_req.ray_count;
+      }
+      if(bkt == RAY_BUCKET_SHADOW)
+        pool->rays_shadow += count_path_rays(p);
+      else if(bkt == RAY_BUCKET_STARTUP)
+        pool->rays_startup += count_path_rays(p);
+
+      {
+        size_t ray_idx = ser_cursor[bkt]++;
+        struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
         rr->origin[0]    = p->ray_req.origin[0];
         rr->origin[1]    = p->ray_req.origin[1];
         rr->origin[2]    = p->ray_req.origin[2];
-        rr->direction[0] = p->enc_query.directions[j][0];
-        rr->direction[1] = p->enc_query.directions[j][1];
-        rr->direction[2] = p->enc_query.directions[j][2];
+        rr->direction[0] = p->ray_req.direction[0];
+        rr->direction[1] = p->ray_req.direction[1];
+        rr->direction[2] = p->ray_req.direction[2];
         rr->range[0]     = p->ray_req.range[0];
         rr->range[1]     = p->ray_req.range[1];
-        rr->filter_data  = NULL;  /* no self-intersection filter */
         rr->user_id      = i;
 
-        pool->ray_to_slot[ray_idx] = i;
-        pool->ray_slot_sub[ray_idx] = (uint32_t)j;
-        p->enc_query.batch_indices[j] = (uint32_t)ray_idx;
+        if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d))
+          rr->filter_data = &p->filter_data_storage;
+        else
+          rr->filter_data = NULL;
+
+        pv->ray_to_slot[ray_idx] = i;
+        pv->ray_slot_sub[ray_idx] = 0;
+        p->ray_req.batch_idx = (uint32_t)ray_idx;
+      }
+
+      if(p->ray_req.ray_count >= 2) {
+        size_t ray_idx = ser_cursor[bkt]++;
+        struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
+        rr->origin[0]    = p->ray_req.origin[0];
+        rr->origin[1]    = p->ray_req.origin[1];
+        rr->origin[2]    = p->ray_req.origin[2];
+        rr->direction[0] = p->ray_req.direction2[0];
+        rr->direction[1] = p->ray_req.direction2[1];
+        rr->direction[2] = p->ray_req.direction2[2];
+        rr->range[0]     = p->ray_req.range2[0];
+        rr->range[1]     = p->ray_req.range2[1];
+        if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d))
+          rr->filter_data = &p->filter_data_storage;
+        else
+          rr->filter_data = NULL;
+        rr->user_id      = i;
+
+        pv->ray_to_slot[ray_idx] = i;
+        pv->ray_slot_sub[ray_idx] = 1;
+        p->ray_req.batch_idx2 = (uint32_t)ray_idx;
+      }
+
+      if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT) {
+        int j;
+        p->enc_query.batch_indices[0] = p->ray_req.batch_idx;
+        p->enc_query.batch_indices[1] = p->ray_req.batch_idx2;
+
+        for(j = 2; j < 6; j++) {
+          size_t ray_idx = ser_cursor[bkt]++;
+          struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
+          rr->origin[0]    = p->ray_req.origin[0];
+          rr->origin[1]    = p->ray_req.origin[1];
+          rr->origin[2]    = p->ray_req.origin[2];
+          rr->direction[0] = p->enc_query.directions[j][0];
+          rr->direction[1] = p->enc_query.directions[j][1];
+          rr->direction[2] = p->enc_query.directions[j][2];
+          rr->range[0]     = p->ray_req.range[0];
+          rr->range[1]     = p->ray_req.range[1];
+          rr->filter_data  = NULL;
+          rr->user_id      = i;
+
+          pv->ray_to_slot[ray_idx] = i;
+          pv->ray_slot_sub[ray_idx] = (uint32_t)j;
+          p->enc_query.batch_indices[j] = (uint32_t)ray_idx;
+        }
       }
     }
-  }
 
-  /* Total ray count = end of last bucket */
-  pool->ray_count = pool->bucket_offsets[RAY_BUCKET_COUNT];
-  return RES_OK;
+    pv->ray_count = pv->bucket_offsets[RAY_BUCKET_COUNT];
+    return RES_OK;
+  }
 }
 
 /*******************************************************************************
@@ -812,27 +1283,28 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool)
  * single GPU batch via s3d_scene_view_find_enclosure_batch_ctx.
  ******************************************************************************/
 LOCAL_SYM res_T
-pool_collect_enc_locate_requests(struct wavefront_pool* pool)
+pool_collect_enc_locate_requests(struct wavefront_pool* pool,
+                                  struct pool_view* pv)
 {
   size_t k, n = 0;
 
-  for(k = 0; k < pool->active_compact; k++) {
-    uint32_t i = pool->active_indices[k];
+  for(k = 0; k < pv->active_compact; k++) {
+    uint32_t i = pv->active_indices[k];
     struct path_state* p = &pool->slots[i];
 
     if(p->phase == PATH_ENC_LOCATE_PENDING) {
-      struct s3d_enc_locate_request* req = &pool->enc_locate_requests[n];
+      struct s3d_enc_locate_request* req = &pv->enc_locate_requests[n];
       req->pos[0] = (float)p->enc_locate.query_pos[0];
       req->pos[1] = (float)p->enc_locate.query_pos[1];
       req->pos[2] = (float)p->enc_locate.query_pos[2];
       req->user_id = i;
-      pool->enc_locate_to_slot[n] = i;
+      pv->enc_locate_to_slot[n] = i;
       p->enc_locate.batch_idx = (uint32_t)n;
       n++;
     }
   }
 
-  pool->enc_locate_count = n;
+  pv->enc_locate_count = n;
   return RES_OK;
 }
 
@@ -844,14 +1316,15 @@ pool_collect_enc_locate_requests(struct wavefront_pool* pool)
  * cascade loop can resolve enc_id via step_enc_locate_result.
  ******************************************************************************/
 static res_T
-pool_distribute_enc_locate_results(struct wavefront_pool* pool)
+pool_distribute_enc_locate_results(struct wavefront_pool* pool,
+                                    struct pool_view* pv)
 {
   size_t k;
 
-  for(k = 0; k < pool->enc_locate_count; k++) {
-    uint32_t slot_id = pool->enc_locate_to_slot[k];
+  for(k = 0; k < pv->enc_locate_count; k++) {
+    uint32_t slot_id = pv->enc_locate_to_slot[k];
     struct path_state* p = &pool->slots[slot_id];
-    const struct s3d_enc_locate_result* r = &pool->enc_locate_results[k];
+    const struct s3d_enc_locate_result* r = &pv->enc_locate_results[k];
 
     p->enc_locate.prim_id  = r->prim_id;
     p->enc_locate.side     = r->side;
@@ -870,29 +1343,30 @@ pool_distribute_enc_locate_results(struct wavefront_pool* pool)
  * s3d_scene_view_closest_point_batch_ctx.
  ******************************************************************************/
 LOCAL_SYM res_T
-pool_collect_cp_requests(struct wavefront_pool* pool)
+pool_collect_cp_requests(struct wavefront_pool* pool,
+                          struct pool_view* pv)
 {
   size_t k, n = 0;
 
-  for(k = 0; k < pool->active_compact; k++) {
-    uint32_t i = pool->active_indices[k];
+  for(k = 0; k < pv->active_compact; k++) {
+    uint32_t i = pv->active_indices[k];
     struct path_state* p = &pool->slots[i];
 
     if(p->phase == PATH_CND_WOS_CLOSEST) {
-      struct s3d_cp_request* req = &pool->cp_requests[n];
+      struct s3d_cp_request* req = &pv->cp_requests[n];
       req->pos[0] = (float)p->locals.cnd_wos.query_pos[0];
       req->pos[1] = (float)p->locals.cnd_wos.query_pos[1];
       req->pos[2] = (float)p->locals.cnd_wos.query_pos[2];
       req->radius = p->locals.cnd_wos.query_radius;
       req->query_data = NULL; /* no filter */
       req->user_id = i;
-      pool->cp_to_slot[n] = i;
+      pv->cp_to_slot[n] = i;
       p->locals.cnd_wos.batch_cp_idx = (uint32_t)n;
       n++;
     }
   }
 
-  pool->cp_count = n;
+  pv->cp_count = n;
   return RES_OK;
 }
 
@@ -903,16 +1377,17 @@ pool_collect_cp_requests(struct wavefront_pool* pool)
  * then transition to PATH_CND_WOS_CLOSEST_RESULT so the cascade loop
  * can process the result via step_cnd_wos_closest_result.
  ******************************************************************************/
-static res_T
-pool_distribute_cp_results(struct wavefront_pool* pool)
+LOCAL_SYM res_T
+pool_distribute_cp_results(struct wavefront_pool* pool,
+                            struct pool_view* pv)
 {
   size_t k;
 
-  for(k = 0; k < pool->cp_count; k++) {
-    uint32_t slot_id = pool->cp_to_slot[k];
+  for(k = 0; k < pv->cp_count; k++) {
+    uint32_t slot_id = pv->cp_to_slot[k];
     struct path_state* p = &pool->slots[slot_id];
 
-    p->locals.cnd_wos.cached_hit = pool->cp_hits[k];
+    p->locals.cnd_wos.cached_hit = pv->cp_hits[k];
     p->phase = PATH_CND_WOS_CLOSEST_RESULT;
   }
 
@@ -920,107 +1395,265 @@ pool_distribute_cp_results(struct wavefront_pool* pool)
 }
 
 static res_T
-pool_distribute_ray_results(struct wavefront_pool* pool, struct sdis_scene* scn)
+pool_distribute_ray_results(struct wavefront_pool* pool,
+                             struct pool_view* pv,
+                             struct sdis_scene* scn)
 {
-  size_t k;
-  res_T res = RES_OK;
   size_t bucket_other_n = 0;
+  int omp_nthreads;
+  int use_omp = 1;
+  int had_fatal = 0;
 
-  /* ---- Phase 1: Radiative paths (1 ray each) ---- */
-  for(k = 0; k < pool->bucket_radiative_n; k++) {
-    uint32_t i = pool->bucket_radiative[k];
-    struct path_state* p = &pool->slots[i];
-    const struct s3d_hit* h0 = &pool->ray_hits[p->ray_req.batch_idx];
-
-    p->needs_ray = 0;
-    res = step_radiative_trace(p, scn, h0);
-    if(res != RES_OK && res != RES_BAD_OP
-    && res != RES_BAD_OP_IRRECOVERABLE) return res;
-    if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
-      mark_path_failed(p, pool);
-      res = RES_OK;
-    }
-    p->steps_taken++;
+  /* OMP toggle: STARDIS_DISTRIBUTE_OMP=0 disables */
+  {
+    const char* env = getenv("STARDIS_DISTRIBUTE_OMP");
+    if(env && env[0] == '0') use_omp = 0;
   }
+  omp_nthreads = (scn && scn->dev) ? (int)scn->dev->nthreads : 1;
+  if(omp_nthreads < 1) omp_nthreads = 1;
+  if(pv->bucket_radiative_n + pv->bucket_conductive_n < 128) use_omp = 0;
 
-  /* ---- Phase 2: Conductive / delta-sphere paths (2 rays each) ---- */
-  for(k = 0; k < pool->bucket_conductive_n; k++) {
-    uint32_t i = pool->bucket_conductive[k];
-    struct path_state* p = &pool->slots[i];
-    const struct s3d_hit* h0 = &pool->ray_hits[p->ray_req.batch_idx];
-    const struct s3d_hit* h1 = NULL;
-    if(p->ray_req.ray_count >= 2)
-      h1 = &pool->ray_hits[p->ray_req.batch_idx2];
+  if(use_omp) {
+    /* ════════════ OMP parallel distribute ════════════ */
 
-    p->needs_ray = 0;
-    res = step_conductive_ds_process(p, scn, h0, h1);
-    if(res != RES_OK && res != RES_BAD_OP
-    && res != RES_BAD_OP_IRRECOVERABLE) return res;
-    if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
-      mark_path_failed(p, pool);
-      res = RES_OK;
-    }
-    p->steps_taken++;
-  }
+    /* ---- Phase 1: Radiative paths (1 ray each) ---- */
+    #pragma omp parallel num_threads(omp_nthreads)
+    {
+      int kk;
+      size_t tl_paths_failed = 0;
+      int tl_fatal = 0;
 
-  /* ---- Phase 3: Fallback — unbucketed ray paths (boundary reinject etc.) ---- */
-  bucket_other_n = pool->need_ray_count
-                 - pool->bucket_radiative_n
-                 - pool->bucket_conductive_n;
-  if(bucket_other_n > 0) {
-    for(k = 0; k < pool->need_ray_count; k++) {
-      uint32_t i = pool->need_ray_indices[k];
-      struct path_state* p = &pool->slots[i];
+      #pragma omp for schedule(static)
+      for(kk = 0; kk < (int)pv->bucket_radiative_n; kk++) {
+        uint32_t i = pv->bucket_radiative[kk];
+        struct path_state* p = &pool->slots[i];
+        const struct s3d_hit* h0 = &pv->ray_hits[p->ray_req.batch_idx];
+        res_T lr;
 
-      /* Skip already-processed buckets */
-      if(p->phase == PATH_RAD_TRACE_PENDING) continue;
-      if(p->phase == PATH_COUPLED_COND_DS_PENDING) continue;
-      if(p->phase == PATH_CND_DS_STEP_TRACE) continue;
-      /* These paths have already been advanced by the bucketed loops above,
-       * so their phase has changed.  Check needs_ray to find remaining ones. */
-      if(!p->needs_ray) continue;
+        p->needs_ray = 0;
+        lr = step_radiative_trace(p, scn, h0);
+        if(lr != RES_OK && lr != RES_BAD_OP
+        && lr != RES_BAD_OP_IRRECOVERABLE) { tl_fatal = 1; }
+        else if(lr == RES_BAD_OP || lr == RES_BAD_OP_IRRECOVERABLE) {
+          p->phase = PATH_DONE; p->active = 0; p->done_reason = -1;
+          tl_paths_failed++;
+        }
+        p->steps_taken++;
+      }
 
+      #pragma omp critical
       {
-        const struct s3d_hit* h0 = &pool->ray_hits[p->ray_req.batch_idx];
-        const struct s3d_hit* h1 = NULL;
-        if(p->ray_req.ray_count >= 2)
-          h1 = &pool->ray_hits[p->ray_req.batch_idx2];
+        pool->paths_failed += tl_paths_failed;
+        if(tl_fatal) had_fatal = 1;
+      }
+    } /* end omp parallel Phase 1 */
+    if(had_fatal) return RES_UNKNOWN_ERR;
 
-        /* B-4 M1-v2: Pre-deliver 6-ray enc_query hits before advance */
-        if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6) {
-          int j;
-          for(j = 0; j < 6; j++) {
-            p->enc_query.dir_hits[j] =
-              pool->ray_hits[p->enc_query.batch_indices[j]];
+    /* ---- Phase 2: Conductive / delta-sphere paths (2 rays each) ---- */
+    had_fatal = 0;
+    #pragma omp parallel num_threads(omp_nthreads)
+    {
+      int kk;
+      size_t tl_paths_failed = 0;
+      int tl_fatal = 0;
+
+      #pragma omp for schedule(static)
+      for(kk = 0; kk < (int)pv->bucket_conductive_n; kk++) {
+        uint32_t i = pv->bucket_conductive[kk];
+        struct path_state* p = &pool->slots[i];
+        const struct s3d_hit* h0 = &pv->ray_hits[p->ray_req.batch_idx];
+        const struct s3d_hit* h1 = NULL;
+        res_T lr;
+        if(p->ray_req.ray_count >= 2)
+          h1 = &pv->ray_hits[p->ray_req.batch_idx2];
+
+        p->needs_ray = 0;
+        lr = step_conductive_ds_process(p, scn, h0, h1);
+        if(lr != RES_OK && lr != RES_BAD_OP
+        && lr != RES_BAD_OP_IRRECOVERABLE) { tl_fatal = 1; }
+        else if(lr == RES_BAD_OP || lr == RES_BAD_OP_IRRECOVERABLE) {
+          p->phase = PATH_DONE; p->active = 0; p->done_reason = -1;
+          tl_paths_failed++;
+        }
+        p->steps_taken++;
+      }
+
+      #pragma omp critical
+      {
+        pool->paths_failed += tl_paths_failed;
+        if(tl_fatal) had_fatal = 1;
+      }
+    } /* end omp parallel Phase 2 */
+    if(had_fatal) return RES_UNKNOWN_ERR;
+
+    /* ---- Phase 3: Fallback — unbucketed ray paths ---- */
+    bucket_other_n = pv->need_ray_count
+                   - pv->bucket_radiative_n
+                   - pv->bucket_conductive_n;
+    if(bucket_other_n > 0) {
+      had_fatal = 0;
+      #pragma omp parallel num_threads(omp_nthreads)
+      {
+        int kk;
+        size_t tl_paths_failed = 0;
+        size_t tl_enc_escalated = 0;
+        int tl_fatal = 0;
+
+        #pragma omp for schedule(static)
+        for(kk = 0; kk < (int)pv->need_ray_count; kk++) {
+          uint32_t i = pv->need_ray_indices[kk];
+          struct path_state* p = &pool->slots[i];
+
+          if(p->phase == PATH_RAD_TRACE_PENDING) continue;
+          if(p->phase == PATH_COUPLED_COND_DS_PENDING) continue;
+          if(p->phase == PATH_CND_DS_STEP_TRACE) continue;
+          if(!p->needs_ray) continue;
+
+          {
+            const struct s3d_hit* h0 = &pv->ray_hits[p->ray_req.batch_idx];
+            const struct s3d_hit* h1 = NULL;
+            res_T lr;
+            if(p->ray_req.ray_count >= 2)
+              h1 = &pv->ray_hits[p->ray_req.batch_idx2];
+
+            if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6) {
+              int j;
+              for(j = 0; j < 6; j++) {
+                p->enc_query.dir_hits[j] =
+                  pv->ray_hits[p->enc_query.batch_indices[j]];
+              }
+            }
+            if(p->phase == PATH_ENC_QUERY_FB_EMIT) {
+              p->enc_query.fb_hit = pv->ray_hits[p->ray_req.batch_idx];
+            }
+
+            {
+              enum path_phase phase_before = p->phase;
+              p->needs_ray = 0;
+              lr = advance_one_step_with_ray(p, scn, h0, h1);
+              if(lr != RES_OK && lr != RES_BAD_OP
+              && lr != RES_BAD_OP_IRRECOVERABLE) { tl_fatal = 1; }
+              else if(lr == RES_BAD_OP || lr == RES_BAD_OP_IRRECOVERABLE) {
+                p->phase = PATH_DONE; p->active = 0; p->done_reason = -1;
+                tl_paths_failed++;
+              }
+              if(phase_before == PATH_ENC_QUERY_FB_EMIT
+              && p->phase == PATH_ENC_LOCATE_PENDING) {
+                tl_enc_escalated++;
+              }
+              p->steps_taken++;
+            }
           }
         }
-        /* B-4 M1-v2: Pre-deliver fallback enc_query hit */
-        if(p->phase == PATH_ENC_QUERY_FB_EMIT) {
-          p->enc_query.fb_hit = pool->ray_hits[p->ray_req.batch_idx];
+
+        #pragma omp critical
+        {
+          pool->paths_failed += tl_paths_failed;
+          pool->enc_query_escalated_to_m10 += tl_enc_escalated;
+          if(tl_fatal) had_fatal = 1;
         }
+      } /* end omp parallel Phase 3 */
+      if(had_fatal) return RES_UNKNOWN_ERR;
+    }
+
+    return RES_OK;
+  }
+
+  /* ════════════ Serial fallback ════════════ */
+  {
+    size_t k;
+    res_T res = RES_OK;
+
+    /* ---- Phase 1: Radiative paths ---- */
+    for(k = 0; k < pv->bucket_radiative_n; k++) {
+      uint32_t i = pv->bucket_radiative[k];
+      struct path_state* p = &pool->slots[i];
+      const struct s3d_hit* h0 = &pv->ray_hits[p->ray_req.batch_idx];
+
+      p->needs_ray = 0;
+      res = step_radiative_trace(p, scn, h0);
+      if(res != RES_OK && res != RES_BAD_OP
+      && res != RES_BAD_OP_IRRECOVERABLE) return res;
+      if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
+        mark_path_failed(p, pool);
+        res = RES_OK;
+      }
+      p->steps_taken++;
+    }
+
+    /* ---- Phase 2: Conductive / delta-sphere paths ---- */
+    for(k = 0; k < pv->bucket_conductive_n; k++) {
+      uint32_t i = pv->bucket_conductive[k];
+      struct path_state* p = &pool->slots[i];
+      const struct s3d_hit* h0 = &pv->ray_hits[p->ray_req.batch_idx];
+      const struct s3d_hit* h1 = NULL;
+      if(p->ray_req.ray_count >= 2)
+        h1 = &pv->ray_hits[p->ray_req.batch_idx2];
+
+      p->needs_ray = 0;
+      res = step_conductive_ds_process(p, scn, h0, h1);
+      if(res != RES_OK && res != RES_BAD_OP
+      && res != RES_BAD_OP_IRRECOVERABLE) return res;
+      if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
+        mark_path_failed(p, pool);
+        res = RES_OK;
+      }
+      p->steps_taken++;
+    }
+
+    /* ---- Phase 3: Fallback — unbucketed ray paths ---- */
+    bucket_other_n = pv->need_ray_count
+                   - pv->bucket_radiative_n
+                   - pv->bucket_conductive_n;
+    if(bucket_other_n > 0) {
+      for(k = 0; k < pv->need_ray_count; k++) {
+        uint32_t i = pv->need_ray_indices[k];
+        struct path_state* p = &pool->slots[i];
+
+        if(p->phase == PATH_RAD_TRACE_PENDING) continue;
+        if(p->phase == PATH_COUPLED_COND_DS_PENDING) continue;
+        if(p->phase == PATH_CND_DS_STEP_TRACE) continue;
+        if(!p->needs_ray) continue;
 
         {
-          enum path_phase phase_before = p->phase;
-          p->needs_ray = 0;
-          res = advance_one_step_with_ray(p, scn, h0, h1);
-          if(res != RES_OK && res != RES_BAD_OP
-          && res != RES_BAD_OP_IRRECOVERABLE) return res;
-          if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
-            mark_path_failed(p, pool);
-            res = RES_OK;
+          const struct s3d_hit* h0 = &pv->ray_hits[p->ray_req.batch_idx];
+          const struct s3d_hit* h1 = NULL;
+          if(p->ray_req.ray_count >= 2)
+            h1 = &pv->ray_hits[p->ray_req.batch_idx2];
+
+          if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6) {
+            int j;
+            for(j = 0; j < 6; j++) {
+              p->enc_query.dir_hits[j] =
+                pv->ray_hits[p->enc_query.batch_indices[j]];
+            }
           }
-          /* Track M1-v2 → M10 escalation */
-          if(phase_before == PATH_ENC_QUERY_FB_EMIT
-          && p->phase == PATH_ENC_LOCATE_PENDING) {
-            pool->enc_query_escalated_to_m10++;
+          if(p->phase == PATH_ENC_QUERY_FB_EMIT) {
+            p->enc_query.fb_hit = pv->ray_hits[p->ray_req.batch_idx];
           }
-          p->steps_taken++;
+
+          {
+            enum path_phase phase_before = p->phase;
+            p->needs_ray = 0;
+            res = advance_one_step_with_ray(p, scn, h0, h1);
+            if(res != RES_OK && res != RES_BAD_OP
+            && res != RES_BAD_OP_IRRECOVERABLE) return res;
+            if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
+              mark_path_failed(p, pool);
+              res = RES_OK;
+            }
+            if(phase_before == PATH_ENC_QUERY_FB_EMIT
+            && p->phase == PATH_ENC_LOCATE_PENDING) {
+              pool->enc_query_escalated_to_m10++;
+            }
+            p->steps_taken++;
+          }
         }
       }
     }
-  }
 
-  return RES_OK;
+    return RES_OK;
+  }
 }
 
 /*******************************************************************************
@@ -1112,9 +1745,10 @@ cascade_advance_single_path(
  ******************************************************************************/
 static res_T
 pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
+                                   struct pool_view* pv,
                                    struct sdis_scene* scn)
 {
-  const size_t n = pool->active_compact;
+  const size_t n = pv->active_compact;
   int use_omp = 1;
   int omp_nthreads;
   int had_fatal = 0;
@@ -1151,7 +1785,7 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
 
       #pragma omp for schedule(dynamic, 64)
       for(ph = 0; ph < (int)n; ph++) {
-        uint32_t idx = pool->active_indices[ph];
+        uint32_t idx = pv->active_indices[ph];
         struct path_state* p = &pool->slots[idx];
         if(!p->active) continue;
 
@@ -1202,7 +1836,7 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
     }
 
     for(k = 0; k < n; k++) {
-      uint32_t idx = pool->active_indices[k];
+      uint32_t idx = pv->active_indices[k];
       struct path_state* p = &pool->slots[idx];
       if(!p->active) continue;
 
@@ -1240,14 +1874,15 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
 static res_T
 harvest_completed_paths(
   struct wavefront_pool* pool,
+  struct pool_view* pv,
   struct sdis_estimator_buffer* buf)
 {
   size_t k;
 
   ASSERT(pool && buf);
 
-  for(k = 0; k < pool->done_count; k++) {
-    uint32_t i = pool->done_indices[k];
+  for(k = 0; k < pv->done_count; k++) {
+    uint32_t i = pv->done_indices[k];
     struct path_state* p = &pool->slots[i];
 
     /* Skip if already harvested */
@@ -1314,7 +1949,8 @@ harvest_completed_paths(
  * tasks.  Returns refill count.
  ******************************************************************************/
 static res_T
-refill_pool(struct wavefront_pool* pool, size_t* out_refill_count)
+refill_pool(struct wavefront_pool* pool, struct pool_view* pv,
+            size_t* out_refill_count)
 {
   size_t k, refill_count = 0;
   res_T res = RES_OK;
@@ -1324,8 +1960,8 @@ refill_pool(struct wavefront_pool* pool, size_t* out_refill_count)
     return RES_OK;
   }
 
-  for(k = 0; k < pool->done_count; k++) {
-    uint32_t i = pool->done_indices[k];
+  for(k = 0; k < pv->done_count; k++) {
+    uint32_t i = pv->done_indices[k];
     struct path_state* p = &pool->slots[i];
 
     /* Only refill slots that have been harvested */
@@ -1365,31 +2001,32 @@ refill_pool(struct wavefront_pool* pool, size_t* out_refill_count)
 static void
 pool_update_active_count(struct wavefront_pool* pool)
 {
-  size_t i, count = 0;
-  for(i = 0; i < pool->pool_size; i++) {
-    if(pool->slots[i].active) count++;
+  if(pool->num_active_views == 1) {
+    pool->active_count = pool->views[0].active_compact;
+  } else {
+    pool->active_count = pool->views[0].active_compact
+                       + pool->views[1].active_compact;
   }
-  pool->active_count = count;
 }
 
 /*******************************************************************************
  * Update diagnostics -- track batch size statistics + wavefront width (M3)
  ******************************************************************************/
 static void
-pool_update_diagnostics(struct wavefront_pool* pool)
+pool_update_diagnostics(struct wavefront_pool* pool, struct pool_view* pv)
 {
-  if(pool->ray_count > 0) {
-    if(pool->ray_count < pool->diag_min_batch)
-      pool->diag_min_batch = pool->ray_count;
-    if(pool->ray_count > pool->diag_max_batch)
-      pool->diag_max_batch = pool->ray_count;
+  if(pv->ray_count > 0) {
+    if(pv->ray_count < pool->diag_min_batch)
+      pool->diag_min_batch = pv->ray_count;
+    if(pv->ray_count > pool->diag_max_batch)
+      pool->diag_max_batch = pv->ray_count;
   }
 
   if(pool->in_drain_phase) {
-    pool->diag_drain_rays += pool->ray_count;
+    pool->diag_drain_rays += pv->ray_count;
     pool->drain_step_count++;
   } else {
-    pool->diag_refill_rays += pool->ray_count;
+    pool->diag_refill_rays += pv->ray_count;
   }
 
   /* M3: accumulate active_count for average wavefront width */
@@ -1544,6 +2181,203 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
 }
 
 /*******************************************************************************
+ * P4: Pipeline helper functions
+ *
+ * Four stage functions that wrap the existing P3 pool operations into
+ * pipeline-friendly units.  Used by both single-pool and dual-pool loops.
+ *
+ *   cpu_pre_gpu             — compact + collect (prepare rays for GPU)
+ *   gpu_launch_async        — launch GPU trace asynchronously
+ *   gpu_wait_and_postprocess — wait GPU + distribute + enc/cp batches
+ *   cpu_between             — cascade + harvest + refill
+ ******************************************************************************/
+
+#define VIEW_TAG(pv, pool) ((pv) == &(pool)->views[0] ? "[A]" : "[B]")
+
+/**
+ * cpu_pre_gpu — compact active paths + collect ray requests.
+ */
+static res_T
+cpu_pre_gpu(struct wavefront_pool* pool, struct pool_view* pv)
+{
+  struct time t0, t1;
+  res_T res;
+
+  time_current(&t0);
+  compact_active_paths(pool, pv);
+  time_current(&t1);
+  pool->time_compact_s += time_elapsed_sec(&t0, &t1);
+
+  time_current(&t0);
+  pv->ray_count = 0;
+  res = pool_collect_ray_requests_bucketed(pool, pv);
+  if(res != RES_OK) return res;
+  time_current(&t1);
+  pool->time_collect_s += time_elapsed_sec(&t0, &t1);
+
+  return RES_OK;
+}
+
+/**
+ * gpu_launch_async — launch GPU trace asynchronously.
+ * Sets pv->gpu_pending = 1 on success, 0 if no rays.
+ */
+static res_T
+gpu_launch_async(struct wavefront_pool* pool, struct pool_view* pv,
+                 struct s3d_scene_view* sv)
+{
+  res_T res;
+  (void)pool;
+
+  if(pv->ray_count == 0) {
+    pv->gpu_pending = 0;
+    return RES_OK;
+  }
+
+  res = s3d_scene_view_trace_rays_batch_ctx_async(
+    sv, pv->batch_ctx, pv->ray_requests, pv->ray_count);
+  if(res != RES_OK) return res;
+  pv->gpu_pending = 1;
+  return RES_OK;
+}
+
+/**
+ * gpu_wait_and_postprocess — wait for async GPU trace, then distribute
+ * ray results, enc_locate, and closest_point batches.
+ */
+static res_T
+gpu_wait_and_postprocess(struct wavefront_pool* pool,
+                         struct pool_view* pv,
+                         struct s3d_scene_view* sv,
+                         struct sdis_scene* scn)
+{
+  struct time t0, t1;
+  res_T res;
+
+  /* ---- batch trace wait + postprocess ---- */
+  time_current(&t0);
+  if(pv->ray_count > 0 && pv->gpu_pending) {
+    struct s3d_batch_trace_stats stats;
+    memset(&stats, 0, sizeof(stats));
+
+    res = s3d_scene_view_trace_rays_batch_ctx_wait(
+      sv, pv->batch_ctx,
+      pv->ray_requests, pv->ray_count,
+      pv->ray_hits, &stats);
+    if(res != RES_OK) return res;
+    pv->gpu_pending = 0;
+
+    pool->total_rays_traced += pv->ray_count;
+    pool->trace_call_count++;
+    pool->trace_batch_size_sum   += pv->ray_count;
+    pool->trace_batch_time_ms_sum  += stats.batch_time_ms;
+    pool->trace_post_time_ms_sum   += stats.postprocess_time_ms;
+    pool->trace_retrace_time_ms_sum += stats.retrace_time_ms;
+    pool->trace_retrace_accepted_sum += stats.retrace_accepted;
+    pool->trace_retrace_missed_sum   += stats.retrace_missed;
+    pool->trace_filter_rejected_sum  += stats.filter_rejected;
+
+    if(pv->ray_count < pool->trace_batch_size_min)
+      pool->trace_batch_size_min = pv->ray_count;
+    if(pv->ray_count > pool->trace_batch_size_max)
+      pool->trace_batch_size_max = pv->ray_count;
+  }
+  time_current(&t1);
+  pool->time_trace_s += time_elapsed_sec(&t0, &t1);
+
+  /* ---- distribute ray results ---- */
+  time_current(&t0);
+  res = pool_distribute_ray_results(pool, pv, scn);
+  if(res != RES_OK) return res;
+  time_current(&t1);
+  pool->time_distribute_s += time_elapsed_sec(&t0, &t1);
+
+  /* ---- enc_locate batch ---- */
+  time_current(&t0);
+  res = pool_collect_enc_locate_requests(pool, pv);
+  if(res != RES_OK) return res;
+
+  if(pv->enc_locate_count > 0) {
+    struct s3d_batch_enc_stats enc_stats;
+    memset(&enc_stats, 0, sizeof(enc_stats));
+
+    res = s3d_scene_view_find_enclosure_batch_ctx(
+      scn->s3d_view, pv->enc_batch_ctx,
+      pv->enc_locate_requests, pv->enc_locate_count,
+      pv->enc_locate_results, &enc_stats);
+    if(res != RES_OK) return res;
+
+    res = pool_distribute_enc_locate_results(pool, pv);
+    if(res != RES_OK) return res;
+
+    pool->enc_locates_total     += pv->enc_locate_count;
+    pool->enc_locates_resolved  += enc_stats.resolved;
+    pool->enc_locates_degenerate += enc_stats.degenerate;
+  }
+  time_current(&t1);
+  pool->time_enc_locate_s += time_elapsed_sec(&t0, &t1);
+
+  /* ---- closest_point batch ---- */
+  time_current(&t0);
+  res = pool_collect_cp_requests(pool, pv);
+  if(res != RES_OK) return res;
+
+  if(pv->cp_count > 0) {
+    struct s3d_batch_cp_stats cp_stats;
+    memset(&cp_stats, 0, sizeof(cp_stats));
+
+    res = s3d_scene_view_closest_point_batch_ctx(
+      scn->s3d_view, pv->cp_batch_ctx,
+      pv->cp_requests, pv->cp_count,
+      pv->cp_hits, &cp_stats);
+    if(res != RES_OK) return res;
+
+    res = pool_distribute_cp_results(pool, pv);
+    if(res != RES_OK) return res;
+
+    pool->cp_total     += pv->cp_count;
+    pool->cp_accepted  += cp_stats.batch_accepted;
+    pool->cp_requeried += cp_stats.requery_accepted;
+  }
+  time_current(&t1);
+  pool->time_cp_s += time_elapsed_sec(&t0, &t1);
+
+  return RES_OK;
+}
+
+/**
+ * cpu_between — cascade non-ray steps + harvest completed + refill pool.
+ */
+static res_T
+cpu_between(struct wavefront_pool* pool, struct pool_view* pv,
+            struct sdis_scene* scn,
+            struct sdis_estimator_buffer* buf)
+{
+  size_t refill_count = 0;
+  struct time t0, t1;
+  res_T res;
+
+  /* cascade non-ray steps */
+  time_current(&t0);
+  res = pool_cascade_non_ray_steps_compact(pool, pv, scn);
+  if(res != RES_OK) return res;
+  time_current(&t1);
+  pool->time_cascade_s += time_elapsed_sec(&t0, &t1);
+
+  /* rebuild done_indices after cascade + harvest + refill */
+  time_current(&t0);
+  compact_active_paths(pool, pv);
+  res = harvest_completed_paths(pool, pv, buf);
+  if(res != RES_OK) return res;
+  res = refill_pool(pool, pv, &refill_count);
+  if(res != RES_OK) return res;
+  time_current(&t1);
+  pool->time_harvest_s += time_elapsed_sec(&t0, &t1);
+
+  return RES_OK;
+}
+
+/*******************************************************************************
  * Determine pool size — adaptive based on GPU SM count (M3)
  *
  * Formula: pool_size = sm_count × WARPS_PER_SM × 32
@@ -1611,7 +2445,6 @@ solve_camera_persistent_wavefront(
   struct wavefront_pool pool;
   size_t total_tasks;
   size_t pool_size;
-  size_t i;
   res_T res = RES_OK;
   struct time t_start, t_end, t_elapsed;
   int last_pcent = 0;
@@ -1624,6 +2457,27 @@ solve_camera_persistent_wavefront(
 
   total_tasks = image_def[0] * image_def[1] * spp;
   pool_size = determine_pool_size(total_tasks, scn);
+
+  /* P4: In dual-buffer pipeline mode each view sees pool_size/2 slots.
+   * Double pool_size so that each half matches the single-buffer width.
+   * STARDIS_POOL_SIZE env var still controls the *per-view* width. */
+  {
+    const char* env_pipe = getenv("STARDIS_PIPELINE");
+    int dual = (env_pipe && env_pipe[0] == '0') ? 0 : 1;
+    if(dual) {
+      size_t doubled = pool_size * 2;
+      if(doubled > total_tasks) doubled = total_tasks;
+      /* Ensure even split */
+      doubled = (doubled / 2) * 2;
+      if(doubled < 2) doubled = 2;
+      log_info(scn->dev,
+        "pipeline: dual-buffer auto-double pool_size %lu -> %lu "
+        "(per-view=%lu)\n",
+        (unsigned long)pool_size, (unsigned long)doubled,
+        (unsigned long)(doubled / 2));
+      pool_size = doubled;
+    }
+  }
 
   {
     int sm = (scn->dev && scn->dev->s3d_dev)
@@ -1656,6 +2510,20 @@ solve_camera_persistent_wavefront(
       "persistent_wavefront: pool_create failed for %lu paths -- %s\n",
       (unsigned long)pool_size, res_to_cstr(res));
     goto cleanup;
+  }
+
+  /* P2: Log pool view configuration */
+  if(pool.num_active_views == 2) {
+    log_info(scn->dev,
+      "persistent_wavefront: dual-buffer pipeline, "
+      "view_size=%lu, views[0].capacity=%lu, views[1].capacity=%lu\n",
+      (unsigned long)pool.views[0].view_size,
+      (unsigned long)pool.views[0].capacity,
+      (unsigned long)pool.views[1].capacity);
+  } else {
+    log_info(scn->dev,
+      "persistent_wavefront: single-buffer mode, pool_size=%lu\n",
+      (unsigned long)pool.pool_size);
   }
 
   /* ====== 2. Create per-path CBRNG thin wrappers ====== */
@@ -1759,46 +2627,344 @@ solve_camera_persistent_wavefront(
   /* ====== 7. Wavefront main loop ====== */
   time_current(&t_start);
 
+  /* ═══════════════════════════════════════════════════════ */
+  /*  P4: Dual-buffer pipeline (num_active_views == 2)       */
+  /* ═══════════════════════════════════════════════════════ */
+  if(pool.num_active_views == 2) {
+    struct pool_view* pv_a = &pool.views[0];
+    struct pool_view* pv_b = &pool.views[1];
+
+    log_info(scn->dev,
+      "pipeline: starting dual-buffer mode, half=%lu\n",
+      (unsigned long)pv_a->view_size);
+
+    /* ---- Startup: prepare A and launch first GPU ---- */
+    res = cpu_pre_gpu(&pool, pv_a);
+    if(res != RES_OK) goto cleanup;
+    res = gpu_launch_async(&pool, pv_a, scn->s3d_view);
+    if(res != RES_OK) goto cleanup;
+
+    /* ---- Prepare B (first cycle: no cascade yet, just pre) ---- */
+    res = cpu_pre_gpu(&pool, pv_b);
+    if(res != RES_OK) goto cleanup;
+
+    while(pool.active_count > 0 || pool.task_next < pool.task_count) {
+      struct time t_pl0, t_pl1;
+      /* P4 timeline: 7 timestamps spanning one full A+B cycle
+       * [0]=start [1]=waitA [2]=launchB [3]=cpuA [4]=waitB [5]=launchA [6]=cpuB */
+      struct time t_cy[7];
+
+      /* ════════ Phase 1: wait GPU(A) → launch GPU(B) → CPU on A ════════ */
+      time_current(&t_cy[0]);
+      time_current(&t_pl0);
+      res = gpu_wait_and_postprocess(&pool, pv_a, scn->s3d_view, scn);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_pl1);
+      pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
+      t_cy[1] = t_pl1;  /* after wait(A) */
+
+      res = gpu_launch_async(&pool, pv_b, scn->s3d_view);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_cy[2]);  /* after launch(B) */
+
+      pool.total_steps++;  /* view A completed one step */
+
+      time_current(&t_pl0);
+      res = cpu_between(&pool, pv_a, scn, buf);
+      if(res != RES_OK) goto cleanup;
+      res = cpu_pre_gpu(&pool, pv_a);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_pl1);
+      pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
+      t_cy[3] = t_pl1;  /* after cpu(A) */
+
+      /* -- Housekeeping after A's step -- */
+      pool_update_active_count(&pool);
+
+      if(!pool.in_drain_phase && pool.task_next >= pool.task_count) {
+        struct time t_now;
+        pool.in_drain_phase = 1;
+        time_current(&t_now);
+        pool.time_refill_phase_s = time_elapsed_sec(&t_start, &t_now);
+        log_info(scn->dev,
+          "persistent_wavefront: entering drain phase at step %lu, "
+          "%lu active paths remain, refill_wall=%.3fs\n",
+          (unsigned long)pool.total_steps,
+          (unsigned long)pool.active_count,
+          pool.time_refill_phase_s);
+      }
+      pool_update_diagnostics(&pool, pv_a);
+      {
+        size_t tasks_done = pool.paths_completed + pool.paths_failed;
+        int pcent = (int)((double)tasks_done * 100.0
+                        / (double)total_tasks + 0.5);
+        if(pcent > 100) pcent = 100;
+        if(pcent / pcent_progress > last_pcent / pcent_progress) {
+          last_pcent = pcent;
+          if(progress) {
+            progress[0] = pcent;
+            print_progress_update(scn->dev, progress, progress_label);
+          }
+        }
+      }
+      if(pool.total_steps % 1000 == 1
+      || (pool.in_drain_phase && pool.drain_step_count % 500 == 0
+       && pool.active_count > 0)) {
+        log_info(scn->dev,
+          "persistent_wavefront pipeline step %lu [A]: %lu/%lu active, "
+          "%lu rays (rad=%lu ds=%lu shd=%lu st=%lu), "
+          "%lu/%lu tasks done, %s\n",
+          (unsigned long)pool.total_steps,
+          (unsigned long)pool.active_count,
+          (unsigned long)pool.pool_size,
+          (unsigned long)pv_a->ray_count,
+          (unsigned long)pv_a->bucket_counts[RAY_BUCKET_RADIATIVE],
+          (unsigned long)pv_a->bucket_counts[RAY_BUCKET_STEP_PAIR],
+          (unsigned long)pv_a->bucket_counts[RAY_BUCKET_SHADOW],
+          (unsigned long)pv_a->bucket_counts[RAY_BUCKET_STARTUP],
+          (unsigned long)(pool.paths_completed + pool.paths_failed),
+          (unsigned long)total_tasks,
+          pool.in_drain_phase ? "DRAIN" : "refill");
+      }
+      { /* STARDIS_PIPELINE_LOG */
+        const char* env_log = getenv("STARDIS_PIPELINE_LOG");
+        if(env_log && env_log[0] == '1') {
+          log_info(scn->dev,
+            "[A] step %lu: rays=%lu, active=%lu\n",
+            (unsigned long)pool.total_steps,
+            (unsigned long)pv_a->ray_count,
+            (unsigned long)pv_a->active_compact);
+        }
+      }
+      if(pool.total_steps > total_tasks * 1000) {
+        log_err(scn->dev,
+          "pipeline: infinite loop safety break at step %lu\n",
+          (unsigned long)pool.total_steps);
+        res = RES_BAD_OP;
+        goto cleanup;
+      }
+
+      /* ════════ Phase 2: wait GPU(B) → launch GPU(A) → CPU on B ════════ */
+      time_current(&t_pl0);
+      res = gpu_wait_and_postprocess(&pool, pv_b, scn->s3d_view, scn);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_pl1);
+      pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
+      t_cy[4] = t_pl1;  /* after wait(B) */
+
+      res = gpu_launch_async(&pool, pv_a, scn->s3d_view);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_cy[5]);  /* after launch(A) */
+
+      pool.total_steps++;  /* view B completed one step */
+
+      time_current(&t_pl0);
+      res = cpu_between(&pool, pv_b, scn, buf);
+      if(res != RES_OK) goto cleanup;
+      res = cpu_pre_gpu(&pool, pv_b);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_pl1);
+      pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
+      t_cy[6] = t_pl1;  /* after cpu(B) */
+
+      /* -- Housekeeping after B's step -- */
+      pool_update_active_count(&pool);
+
+      if(!pool.in_drain_phase && pool.task_next >= pool.task_count) {
+        struct time t_now;
+        pool.in_drain_phase = 1;
+        time_current(&t_now);
+        pool.time_refill_phase_s = time_elapsed_sec(&t_start, &t_now);
+        log_info(scn->dev,
+          "persistent_wavefront: entering drain phase at step %lu, "
+          "%lu active paths remain, refill_wall=%.3fs\n",
+          (unsigned long)pool.total_steps,
+          (unsigned long)pool.active_count,
+          pool.time_refill_phase_s);
+      }
+      pool_update_diagnostics(&pool, pv_b);
+      {
+        size_t tasks_done = pool.paths_completed + pool.paths_failed;
+        int pcent = (int)((double)tasks_done * 100.0
+                        / (double)total_tasks + 0.5);
+        if(pcent > 100) pcent = 100;
+        if(pcent / pcent_progress > last_pcent / pcent_progress) {
+          last_pcent = pcent;
+          if(progress) {
+            progress[0] = pcent;
+            print_progress_update(scn->dev, progress, progress_label);
+          }
+        }
+      }
+      if(pool.total_steps % 1000 == 0
+      || (pool.in_drain_phase && pool.drain_step_count % 500 == 0
+       && pool.active_count > 0)) {
+        log_info(scn->dev,
+          "persistent_wavefront pipeline step %lu [B]: %lu/%lu active, "
+          "%lu rays (rad=%lu ds=%lu shd=%lu st=%lu), "
+          "%lu/%lu tasks done, %s\n",
+          (unsigned long)pool.total_steps,
+          (unsigned long)pool.active_count,
+          (unsigned long)pool.pool_size,
+          (unsigned long)pv_b->ray_count,
+          (unsigned long)pv_b->bucket_counts[RAY_BUCKET_RADIATIVE],
+          (unsigned long)pv_b->bucket_counts[RAY_BUCKET_STEP_PAIR],
+          (unsigned long)pv_b->bucket_counts[RAY_BUCKET_SHADOW],
+          (unsigned long)pv_b->bucket_counts[RAY_BUCKET_STARTUP],
+          (unsigned long)(pool.paths_completed + pool.paths_failed),
+          (unsigned long)total_tasks,
+          pool.in_drain_phase ? "DRAIN" : "refill");
+      }
+      { /* STARDIS_PIPELINE_LOG */
+        const char* env_log = getenv("STARDIS_PIPELINE_LOG");
+        if(env_log && env_log[0] == '1') {
+          log_info(scn->dev,
+            "[B] step %lu: rays=%lu, active=%lu\n",
+            (unsigned long)pool.total_steps,
+            (unsigned long)pv_b->ray_count,
+            (unsigned long)pv_b->active_compact);
+        }
+      }
+      if(pool.total_steps > total_tasks * 1000) {
+        log_err(scn->dev,
+          "pipeline: infinite loop safety break at step %lu\n",
+          (unsigned long)pool.total_steps);
+        res = RES_BAD_OP;
+        goto cleanup;
+      }
+
+      /* ════════ P4 Timeline output (STARDIS_PIPELINE_LOG=2) ════════ */
+      {
+        const char* env_tl = getenv("STARDIS_PIPELINE_LOG");
+        env_tl="2";
+        if(env_tl && env_tl[0] == '2' && pool.total_steps % 500 == 0) {
+          double waitA   = time_elapsed_sec(&t_cy[0], &t_cy[1]) * 1000.0;
+          double launchB = time_elapsed_sec(&t_cy[1], &t_cy[2]) * 1000.0;
+          double cpuA    = time_elapsed_sec(&t_cy[2], &t_cy[3]) * 1000.0;
+          double waitB   = time_elapsed_sec(&t_cy[3], &t_cy[4]) * 1000.0;
+          double launchA = time_elapsed_sec(&t_cy[4], &t_cy[5]) * 1000.0;
+          double cpuB    = time_elapsed_sec(&t_cy[5], &t_cy[6]) * 1000.0;
+          double cycle   = time_elapsed_sec(&t_cy[0], &t_cy[6]) * 1000.0;
+          log_info(scn->dev,
+            "[TIMELINE] step=%lu "
+            "|waitA=%.2fms|launchB=%.2fms|cpuA=%.2fms"
+            "|waitB=%.2fms|launchA=%.2fms|cpuB=%.2fms"
+            "|cycle=%.2fms raysA=%lu raysB=%lu\n",
+            (unsigned long)pool.total_steps,
+            waitA, launchB, cpuA,
+            waitB, launchA, cpuB,
+            cycle,
+            (unsigned long)pv_a->ray_count,
+            (unsigned long)pv_b->ray_count);
+        }
+      }
+
+      /* ════════ Dynamic merge check ════════ */
+      if(should_merge(&pool)) {
+        /* Wait for all pending GPU calls */
+        if(pv_a->gpu_pending) {
+          res = gpu_wait_and_postprocess(&pool, pv_a, scn->s3d_view, scn);
+          if(res != RES_OK) goto cleanup;
+        }
+        if(pv_b->gpu_pending) {
+          res = gpu_wait_and_postprocess(&pool, pv_b, scn->s3d_view, scn);
+          if(res != RES_OK) goto cleanup;
+        }
+        log_info(scn->dev,
+          "pipeline: merging to single-pool at step %lu "
+          "(A.active=%lu, B.active=%lu)\n",
+          (unsigned long)pool.total_steps,
+          (unsigned long)pv_a->active_compact,
+          (unsigned long)pv_b->active_compact);
+        merge_to_single_pool(&pool);
+        break;  /* fall through to single-pool loop */
+      }
+    } /* end dual-pool while */
+
+    /* ---- Drain: wait for last pending GPU calls ---- */
+    if(pool.num_active_views == 2) {
+      if(pv_a->gpu_pending) {
+        res = gpu_wait_and_postprocess(&pool, pv_a, scn->s3d_view, scn);
+        if(res != RES_OK) goto cleanup;
+        pool.total_steps++;
+        res = cpu_between(&pool, pv_a, scn, buf);
+        if(res != RES_OK) goto cleanup;
+      }
+      if(pv_b->gpu_pending) {
+        res = gpu_wait_and_postprocess(&pool, pv_b, scn->s3d_view, scn);
+        if(res != RES_OK) goto cleanup;
+        pool.total_steps++;
+        res = cpu_between(&pool, pv_b, scn, buf);
+        if(res != RES_OK) goto cleanup;
+      }
+    }
+
+    /* Log pipeline stats */
+    {
+      struct time t_now;
+      double pipeline_wall;
+      time_current(&t_now);
+      pipeline_wall = time_elapsed_sec(&t_start, &t_now);
+      if(pipeline_wall <= 0) pipeline_wall = 1e-9;
+      log_info(scn->dev,
+        "pipeline stats: wall=%.3fs, gpu_wait=%.3fs, cpu_between=%.3fs, "
+        "gpu_util=%.1f%%, steps=%lu\n",
+        pipeline_wall,
+        pool.time_pipeline_wait_s,
+        pool.time_pipeline_cpu_between_s,
+        100.0 * (1.0 - pool.time_pipeline_gpu_idle_s / pipeline_wall),
+        (unsigned long)pool.total_steps);
+    }
+  } /* end if(num_active_views == 2) */
+
+  /* ═══════════════════════════════════════════════════════════ */
+  /*  Single-pool main loop (num_active_views == 1)              */
+  /*  - STARDIS_PIPELINE=0 enters directly                      */
+  /*  - Or merge_to_single_pool above falls through              */
+  /* ═══════════════════════════════════════════════════════════ */
+  if(pool.num_active_views == 1) {
+
   while(pool.active_count > 0 || pool.task_next < pool.task_count) {
     size_t refill_count = 0;
     struct time t_phase0, t_phase1; /* M3 per-phase timing */
+    struct pool_view* pv = &pool.views[0]; /* single-pool view */
     pool.total_steps++;
 
     /* Step A: Stream compaction (M2.5) */
     time_current(&t_phase0);
-    compact_active_paths(&pool);
+    compact_active_paths(&pool, pv);
     time_current(&t_phase1);
     pool.time_compact_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
     /* Step B: Collect ray requests — bucketed (B-4 M2) */
     time_current(&t_phase0);
-    pool.ray_count = 0;
-    res = pool_collect_ray_requests_bucketed(&pool);
+    pv->ray_count = 0;
+    res = pool_collect_ray_requests_bucketed(&pool, pv);
     if(res != RES_OK) goto cleanup;
     time_current(&t_phase1);
     pool.time_collect_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
     /* Step C: Batch trace via Phase B-1 */
     time_current(&t_phase0);
-    if(pool.ray_count > 0) {
+    if(pv->ray_count > 0) {
       struct s3d_batch_trace_stats stats;
       memset(&stats, 0, sizeof(stats));
 
       res = s3d_scene_view_trace_rays_batch_ctx(
-        scn->s3d_view, pool.batch_ctx,
-        pool.ray_requests, pool.ray_count,
-        pool.ray_hits, &stats);
+        scn->s3d_view, pv->batch_ctx,
+        pv->ray_requests, pv->ray_count,
+        pv->ray_hits, &stats);
       if(res != RES_OK) goto cleanup;
 
-      pool.total_rays_traced += pool.ray_count;
+      pool.total_rays_traced += pv->ray_count;
 
       /* Experiment 7+8: accumulate per-call batch trace stats */
       pool.trace_call_count++;
-      pool.trace_batch_size_sum += pool.ray_count;
-      if(pool.ray_count < pool.trace_batch_size_min)
-        pool.trace_batch_size_min = pool.ray_count;
-      if(pool.ray_count > pool.trace_batch_size_max)
-        pool.trace_batch_size_max = pool.ray_count;
+      pool.trace_batch_size_sum += pv->ray_count;
+      if(pv->ray_count < pool.trace_batch_size_min)
+        pool.trace_batch_size_min = pv->ray_count;
+      if(pv->ray_count > pool.trace_batch_size_max)
+        pool.trace_batch_size_max = pv->ray_count;
       pool.trace_batch_time_ms_sum   += stats.batch_time_ms;
       pool.trace_post_time_ms_sum    += stats.postprocess_time_ms;
       pool.trace_retrace_time_ms_sum += stats.retrace_time_ms;
@@ -1811,32 +2977,32 @@ solve_camera_persistent_wavefront(
 
     /* Step D: Distribute ray results — bucketed dispatch (M3) */
     time_current(&t_phase0);
-    res = pool_distribute_ray_results(&pool, scn);
+    res = pool_distribute_ray_results(&pool, pv, scn);
     if(res != RES_OK) goto cleanup;
     time_current(&t_phase1);
     pool.time_distribute_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
     /* Step D2 (M10): Collect + dispatch + distribute enc_locate batch */
     time_current(&t_phase0);
-    res = pool_collect_enc_locate_requests(&pool);
+    res = pool_collect_enc_locate_requests(&pool, pv);
     if(res != RES_OK) goto cleanup;
 
-    if(pool.enc_locate_count > 0) {
+    if(pv->enc_locate_count > 0) {
       struct s3d_batch_enc_stats enc_stats;
       memset(&enc_stats, 0, sizeof(enc_stats));
 
       res = s3d_scene_view_find_enclosure_batch_ctx(
-        scn->s3d_view, pool.enc_batch_ctx,
-        pool.enc_locate_requests, pool.enc_locate_count,
-        pool.enc_locate_results, &enc_stats);
+        scn->s3d_view, pv->enc_batch_ctx,
+        pv->enc_locate_requests, pv->enc_locate_count,
+        pv->enc_locate_results, &enc_stats);
       if(res != RES_OK) goto cleanup;
 
       /* Distribute prim_id + side to paths; enc_id resolution happens
        * in step_enc_locate_result() during cascade (handles degenerate). */
-      res = pool_distribute_enc_locate_results(&pool);
+      res = pool_distribute_enc_locate_results(&pool, pv);
       if(res != RES_OK) goto cleanup;
 
-      pool.enc_locates_total += pool.enc_locate_count;
+      pool.enc_locates_total += pv->enc_locate_count;
       pool.enc_locates_resolved += enc_stats.resolved;
       pool.enc_locates_degenerate += enc_stats.degenerate;
     }
@@ -1845,23 +3011,23 @@ solve_camera_persistent_wavefront(
 
     /* Step D3 (M9): Collect + dispatch + distribute closest_point batch */
     time_current(&t_phase0);
-    res = pool_collect_cp_requests(&pool);
+    res = pool_collect_cp_requests(&pool, pv);
     if(res != RES_OK) goto cleanup;
 
-    if(pool.cp_count > 0) {
+    if(pv->cp_count > 0) {
       struct s3d_batch_cp_stats cp_stats;
       memset(&cp_stats, 0, sizeof(cp_stats));
 
       res = s3d_scene_view_closest_point_batch_ctx(
-        scn->s3d_view, pool.cp_batch_ctx,
-        pool.cp_requests, pool.cp_count,
-        pool.cp_hits, &cp_stats);
+        scn->s3d_view, pv->cp_batch_ctx,
+        pv->cp_requests, pv->cp_count,
+        pv->cp_hits, &cp_stats);
       if(res != RES_OK) goto cleanup;
 
-      res = pool_distribute_cp_results(&pool);
+      res = pool_distribute_cp_results(&pool, pv);
       if(res != RES_OK) goto cleanup;
 
-      pool.cp_total    += pool.cp_count;
+      pool.cp_total    += pv->cp_count;
       pool.cp_accepted += cp_stats.batch_accepted;
       pool.cp_requeried += cp_stats.requery_accepted;
     }
@@ -1870,19 +3036,19 @@ solve_camera_persistent_wavefront(
 
     /* Step E: Cascade non-ray steps (compact) */
     time_current(&t_phase0);
-    res = pool_cascade_non_ray_steps_compact(&pool, scn);
+    res = pool_cascade_non_ray_steps_compact(&pool, pv, scn);
     if(res != RES_OK) goto cleanup;
     time_current(&t_phase1);
     pool.time_cascade_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
     /* Step F+G: Harvest completed paths + refill (timed together) */
     time_current(&t_phase0);
-    compact_active_paths(&pool); /* rebuild done_indices after cascade */
-    res = harvest_completed_paths(&pool, buf);
+    compact_active_paths(&pool, pv); /* rebuild done_indices after cascade */
+    res = harvest_completed_paths(&pool, pv, buf);
     if(res != RES_OK) goto cleanup;
 
     /* Step G: Refill pool with new tasks (M2) */
-    res = refill_pool(&pool, &refill_count);
+    res = refill_pool(&pool, pv, &refill_count);
     if(res != RES_OK) goto cleanup;
     time_current(&t_phase1);
     pool.time_harvest_s += time_elapsed_sec(&t_phase0, &t_phase1);
@@ -1908,7 +3074,7 @@ solve_camera_persistent_wavefront(
     }
 
     /* Step J: Update diagnostics (M2.5 + M3 wavefront width) */
-    pool_update_diagnostics(&pool);
+    pool_update_diagnostics(&pool, pv);
 
     /* Step K: Progress reporting */
     {
@@ -1937,11 +3103,11 @@ solve_camera_persistent_wavefront(
         (unsigned long)pool.total_steps,
         (unsigned long)pool.active_count,
         (unsigned long)pool.pool_size,
-        (unsigned long)pool.ray_count,
-        (unsigned long)pool.bucket_counts[RAY_BUCKET_RADIATIVE],
-        (unsigned long)pool.bucket_counts[RAY_BUCKET_STEP_PAIR],
-        (unsigned long)pool.bucket_counts[RAY_BUCKET_SHADOW],
-        (unsigned long)pool.bucket_counts[RAY_BUCKET_STARTUP],
+        (unsigned long)pv->ray_count,
+        (unsigned long)pv->bucket_counts[RAY_BUCKET_RADIATIVE],
+        (unsigned long)pv->bucket_counts[RAY_BUCKET_STEP_PAIR],
+        (unsigned long)pv->bucket_counts[RAY_BUCKET_SHADOW],
+        (unsigned long)pv->bucket_counts[RAY_BUCKET_STARTUP],
         (unsigned long)(pool.paths_completed + pool.paths_failed),
         (unsigned long)total_tasks,
         pool.in_drain_phase ? "DRAIN" : "refill");
@@ -1957,7 +3123,8 @@ solve_camera_persistent_wavefront(
       res = RES_BAD_OP;
       goto cleanup;
     }
-  }
+  } /* end single-pool while */
+  } /* end if(pool.num_active_views == 1) */
 
   /* ====== 8. Summary logging ====== */
   time_current(&t_end);

@@ -78,6 +78,14 @@ struct wavefront_context {
   size_t                         enc_locate_count;
   size_t                         max_enc_locates;
 
+  /* B-4 M9: closest_point (WoS) batch buffers */
+  struct s3d_batch_cp_context*   cp_batch_ctx;
+  struct s3d_cp_request*         cp_requests;
+  struct s3d_hit*                cp_hits;
+  uint32_t*                      cp_to_path;
+  size_t                         cp_count;
+  size_t                         max_cps;
+
   /* Per-path RNG array (allocated once) */
   /* (each path stores a non-owning pointer to the shared per-thread RNG) */
 

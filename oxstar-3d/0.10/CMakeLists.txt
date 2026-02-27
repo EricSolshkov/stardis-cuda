@@ -246,6 +246,18 @@ target_link_libraries(s3d
     PRIVATE CUDA::cudart
 )
 
+# OpenMP (optional — CPU post-process parallelization)
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(s3d PRIVATE OpenMP::OpenMP_CXX)
+    # MSVC: ensure /openmp flag propagates via MSBuild properties
+    set_source_files_properties(
+        s3d_wrapper/ox_s3d_scene_view.cpp
+        PROPERTIES COMPILE_OPTIONS "${OpenMP_CXX_FLAGS}"
+    )
+    message(STATUS "oxstar-3d: OpenMP enabled (flags: ${OpenMP_CXX_FLAGS})")
+endif()
+
 target_compile_definitions(s3d PRIVATE S3D_USE_OPTIX_BACKEND)
 
 set_property(TARGET s3d PROPERTY CXX_STANDARD 17)

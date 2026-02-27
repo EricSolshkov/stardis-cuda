@@ -157,6 +157,11 @@ public:
     void traceBatchMultiHit(Ray* d_rays, MultiHitResult* d_multi_hits,
                             unsigned int count, CUstream stream = 0);
 
+    /* P1: overload accepting external params buffer (dual-buffer safe) */
+    void traceBatchMultiHit(Ray* d_rays, MultiHitResult* d_multi_hits,
+                            unsigned int count, CUstream stream,
+                            CUdeviceptr external_params_ptr);
+
     std::vector<MultiHitResult> traceBatchMultiHit(const std::vector<Ray>& rays);
 
     /* ================================================================

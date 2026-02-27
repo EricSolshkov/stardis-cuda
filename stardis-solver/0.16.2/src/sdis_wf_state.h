@@ -238,6 +238,9 @@ struct path_state {
       double  position_start[3];        /* pos before diffusion step       */
       int     wos_initialized;          /* 1 = init phase done             */
       uint32_t batch_cp_idx;            /* index in closest_point batch    */
+      /* --- diffusion-check batch (CP2) --- */
+      double  diffusion_pos[3];         /* candidate new pos for validation*/
+      uint32_t batch_cp2_idx;           /* index in CP batch (2nd round)   */
     } cnd_wos;
 
     struct {                            /* convective path                 */

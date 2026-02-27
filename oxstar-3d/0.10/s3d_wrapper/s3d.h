@@ -405,6 +405,19 @@ S3D_API res_T s3d_scene_view_trace_rays_batch_ctx(
   const struct s3d_ray_request* requests, size_t nrays,
   struct s3d_hit* hits, struct s3d_batch_trace_stats* stats);
 
+/* P0: async ray tracing — launch GPU work and return immediately */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_async(
+  struct s3d_scene_view* scnview,
+  struct s3d_batch_trace_context* ctx,
+  const struct s3d_ray_request* requests, size_t nrays);
+
+/* P0: wait for async ray tracing to complete, run CPU post-process */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_wait(
+  struct s3d_scene_view* scnview,
+  struct s3d_batch_trace_context* ctx,
+  const struct s3d_ray_request* requests, size_t nrays,
+  struct s3d_hit* hits, struct s3d_batch_trace_stats* stats);
+
 /*******************************************************************************
  * Batch Closest Point API (GPU-accelerated)
  ******************************************************************************/

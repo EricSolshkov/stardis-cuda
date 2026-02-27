@@ -17,7 +17,12 @@
  */
 
 #include "ox_s3d_internal.h"
+#include "../include/unified_params.h"  /* P1: sizeof(UnifiedParams) for per-ctx params alloc */
 #include <chrono>
+#include <cstdlib>   /* getenv, atoi — OMP env-var checks */
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using namespace ox_s3d_util;
 
@@ -1235,9 +1240,118 @@ static res_T batch_trace_impl(s3d_scene_view* sv,
     double t1 = now_ms();
     if (stats) stats->batch_time_ms = t1 - t0;
 
-    /* ---- Phase 2: CPU post-process (filter + UV fixup) ---- */
+    /* ---- Phase 2: CPU post-process (filter + UV fixup) ----
+     * OMP parallelized: each ray processes independently.  Thread-local
+     * retrace lists are merged after the parallel region. */
     std::vector<size_t> retrace_list;
     std::vector<float>  retrace_tmin;  /* tmin for Phase 3, past Phase 1 last candidate */
+
+#ifdef _OPENMP
+    {
+      int pp_use_omp = 1;
+      int pp_nthreads = omp_get_max_threads();
+      {
+        const char* env = std::getenv("STARDIS_POSTPROCESS_OMP");
+        if (env && env[0] == '0') pp_use_omp = 0;
+      }
+      {
+        const char* thr_env = std::getenv("STARDIS_POSTPROCESS_THREADS");
+        if (thr_env) {
+          int ct = std::atoi(thr_env);
+          if (ct > 0) pp_nthreads = ct;
+        }
+      }
+      if ((int)nrays < 256) pp_use_omp = 0;
+      if (pp_nthreads < 2)  pp_use_omp = 0;
+
+      if (pp_use_omp) {
+        std::vector<std::vector<size_t>> tl_retrace(pp_nthreads);
+        std::vector<std::vector<float>>  tl_tmin(pp_nthreads);
+        size_t omp_accepted = 0;
+        size_t omp_rejected = 0;
+
+        #pragma omp parallel num_threads(pp_nthreads) \
+          reduction(+: omp_accepted, omp_rejected)
+        {
+          int tid = omp_get_thread_num();
+          int ii;
+          #pragma omp for schedule(static)
+          for (ii = 0; ii < (int)nrays; ii++) {
+            const MultiHitResult& mh = mhits[ii];
+            bool accepted_flag = false;
+            bool had_candidates = false;
+            bool filter_rejected_any = false;
+            float last_candidate_t = -1.0f;
+
+            for (unsigned k = 0; k < mh.count; k++) {
+              const HitResult& cand = mh.hits[k];
+              if (cand.t < 0.0f) continue;
+              had_candidates = true;
+              last_candidate_t = cand.t;
+
+              unsigned shape_id;
+              s3d_shape* shape = resolve_shape(sv, cand.geom_id, shape_id);
+              s3d_shape* inst  = resolve_instance(sv, cand.geom_id);
+
+              s3d_hit h;
+              hitresult_to_s3d_hit(sv, cand, shape, shape_id, cand.prim_idx,
+                                   &h, inst);
+
+              {
+                s3d_hit_filter_function_T filt = nullptr;
+                void* filt_data_snap = nullptr;
+                {
+                  auto snap = sv->find_snapshot(shape_id);
+                  if (snap) {
+                    filt = snap->filter_func;
+                    filt_data_snap = snap->filter_data;
+                  }
+                }
+                if (shape && filt) {
+                  void* fdata = requests[ii].filter_data;
+                  int rej = filt(&h,
+                    requests[ii].origin, requests[ii].direction,
+                    requests[ii].range, fdata, filt_data_snap);
+                  if (rej != 0) {
+                    filter_rejected_any = true;
+                    continue;
+                  }
+                }
+              }
+
+              hits[ii] = h;
+              accepted_flag = true;
+              omp_accepted++;
+              break;
+            }
+
+            if (!accepted_flag) {
+              hits[ii] = S3D_HIT_NULL;
+              if (had_candidates && filter_rejected_any) {
+                omp_rejected++;
+                tl_retrace[tid].push_back(static_cast<size_t>(ii));
+                tl_tmin[tid].push_back(last_candidate_t + 1e-6f);
+              } else {
+                omp_accepted++;
+              }
+            }
+          } /* end omp for */
+        } /* end omp parallel */
+
+        if (stats) {
+          stats->batch_accepted += omp_accepted;
+          stats->filter_rejected += omp_rejected;
+        }
+        for (int t = 0; t < pp_nthreads; t++) {
+          retrace_list.insert(retrace_list.end(),
+            tl_retrace[t].begin(), tl_retrace[t].end());
+          retrace_tmin.insert(retrace_tmin.end(),
+            tl_tmin[t].begin(), tl_tmin[t].end());
+        }
+        goto postprocess_done_sync;
+      }
+    }
+#endif /* _OPENMP */
 
     for (size_t i = 0; i < nrays; i++) {
         const MultiHitResult& mh = mhits[i];
@@ -1304,6 +1418,7 @@ static res_T batch_trace_impl(s3d_scene_view* sv,
         }
     }
 
+postprocess_done_sync:
     double t2 = now_ms();
     if (stats) stats->postprocess_time_ms = t2 - t1;
 
@@ -1484,6 +1599,437 @@ static res_T batch_trace_impl(s3d_scene_view* sv,
     return RES_OK;
 }
 
+/* ===========================================================================
+ * P0: Async batch trace — launch GPU work and return immediately
+ * =========================================================================*/
+static res_T batch_trace_async_impl(
+    s3d_scene_view* sv,
+    s3d_batch_trace_context* ctx,
+    const s3d_ray_request* requests,
+    size_t nrays)
+{
+    res_T rc = ensure_built(sv);
+    if (rc != RES_OK) return rc;
+
+    /* Empty scene or zero rays → mark no async, caller handles miss fill */
+    if (!sv->has_geometry || nrays == 0) {
+        ctx->async_pending = false;
+        ctx->async_nrays   = nrays;
+        return RES_OK;
+    }
+
+    /* AoS → SoA ray conversion into ctx host staging buffer */
+    ctx->host_rays.resize(nrays);
+    for (size_t i = 0; i < nrays; i++) {
+        ctx->host_rays[i].origin    = make_float3(
+            requests[i].origin[0], requests[i].origin[1], requests[i].origin[2]);
+        ctx->host_rays[i].direction = make_float3(
+            requests[i].direction[0], requests[i].direction[1], requests[i].direction[2]);
+        ctx->host_rays[i].tmin      = requests[i].range[0];
+        ctx->host_rays[i].tmax      = requests[i].range[1];
+    }
+
+    /* Async upload + GPU launch on ctx->stream */
+    unsigned int count = static_cast<unsigned int>(nrays);
+    ctx->d_rays.uploadAsync(ctx->host_rays.data(), count, ctx->stream);
+
+    /* P1: ensure per-ctx params buffer is allocated */
+    if (!ctx->params_allocated) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ctx->params_ptr),
+                              sizeof(UnifiedParams)));
+        ctx->params_allocated = true;
+    }
+
+    /* P1: use per-ctx params buffer to avoid race on tracer's shared buffer */
+    sv->tracer.traceBatchMultiHit(
+        ctx->d_rays.get(), ctx->d_multi_hits.get(), count,
+        ctx->stream, ctx->params_ptr);
+
+    ctx->async_pending = true;
+    ctx->async_nrays   = nrays;
+
+    return RES_OK;
+    /* GPU executing asynchronously on ctx->stream, CPU returns immediately */
+}
+
+/* ===========================================================================
+ * P0: Wait for async batch trace, download results, CPU post-process + retrace
+ * =========================================================================*/
+static res_T batch_trace_wait_impl(
+    s3d_scene_view* sv,
+    s3d_batch_trace_context* ctx,
+    const s3d_ray_request* requests,
+    size_t nrays,
+    s3d_hit* hits,
+    s3d_batch_trace_stats* stats)
+{
+    if (stats) memset(stats, 0, sizeof(*stats));
+    if (stats) stats->total_rays = nrays;
+
+    /* Empty scene → all misses */
+    if (!sv->has_geometry || nrays == 0) {
+        for (size_t i = 0; i < nrays; i++) hits[i] = S3D_HIT_NULL;
+        if (stats) stats->batch_accepted = nrays;
+        ctx->async_pending = false;
+        return RES_OK;
+    }
+
+    double t0 = now_ms();
+
+    /* ---- Phase 1: wait for GPU + download ---- */
+    if (ctx->async_pending) {
+        cudaStreamSynchronize(ctx->stream);
+        ctx->async_pending = false;
+    }
+
+    unsigned int count = static_cast<unsigned int>(nrays);
+    ctx->host_mhits.resize(nrays);
+    ctx->d_multi_hits.download(ctx->host_mhits.data(), count);
+
+    double t1 = now_ms();
+    if (stats) stats->batch_time_ms = t1 - t0;
+
+    /* ---- Phase 2: CPU post-process (filter + UV fixup) ----
+     * OMP parallelized: each ray processes independently.  Thread-local
+     * retrace lists are merged after the parallel region. */
+    std::vector<size_t> retrace_list;
+    std::vector<float>  retrace_tmin;
+
+#ifdef _OPENMP
+    {
+      int pp_use_omp = 1;
+      int pp_nthreads = omp_get_max_threads();
+      {
+        const char* env = std::getenv("STARDIS_POSTPROCESS_OMP");
+        if (env && env[0] == '0') pp_use_omp = 0;
+      }
+      {
+        const char* thr_env = std::getenv("STARDIS_POSTPROCESS_THREADS");
+        if (thr_env) {
+          int ct = std::atoi(thr_env);
+          if (ct > 0) pp_nthreads = ct;
+        }
+      }
+      if ((int)nrays < 256) pp_use_omp = 0;
+      if (pp_nthreads < 2)  pp_use_omp = 0;
+
+      if (pp_use_omp) {
+        std::vector<std::vector<size_t>> tl_retrace(pp_nthreads);
+        std::vector<std::vector<float>>  tl_tmin(pp_nthreads);
+        size_t omp_accepted = 0;
+        size_t omp_rejected = 0;
+
+        #pragma omp parallel num_threads(pp_nthreads) \
+          reduction(+: omp_accepted, omp_rejected)
+        {
+          int tid = omp_get_thread_num();
+          int ii;
+          #pragma omp for schedule(static)
+          for (ii = 0; ii < (int)nrays; ii++) {
+            const MultiHitResult& mh = ctx->host_mhits[ii];
+            bool accepted_flag = false;
+            bool had_candidates = false;
+            bool filter_rejected_any = false;
+            float last_candidate_t = -1.0f;
+
+            for (unsigned k = 0; k < mh.count; k++) {
+              const HitResult& cand = mh.hits[k];
+              if (cand.t < 0.0f) continue;
+              had_candidates = true;
+              last_candidate_t = cand.t;
+
+              unsigned shape_id;
+              s3d_shape* shape = resolve_shape(sv, cand.geom_id, shape_id);
+              s3d_shape* inst  = resolve_instance(sv, cand.geom_id);
+
+              s3d_hit h;
+              hitresult_to_s3d_hit(sv, cand, shape, shape_id, cand.prim_idx,
+                                   &h, inst);
+
+              {
+                s3d_hit_filter_function_T filt = nullptr;
+                void* filt_data_snap = nullptr;
+                {
+                  auto snap = sv->find_snapshot(shape_id);
+                  if (snap) {
+                    filt = snap->filter_func;
+                    filt_data_snap = snap->filter_data;
+                  }
+                }
+                if (shape && filt) {
+                  void* fdata = requests[ii].filter_data;
+                  int rej = filt(&h,
+                    requests[ii].origin, requests[ii].direction,
+                    requests[ii].range, fdata, filt_data_snap);
+                  if (rej != 0) {
+                    filter_rejected_any = true;
+                    continue;
+                  }
+                }
+              }
+
+              hits[ii] = h;
+              accepted_flag = true;
+              omp_accepted++;
+              break;
+            }
+
+            if (!accepted_flag) {
+              hits[ii] = S3D_HIT_NULL;
+              if (had_candidates && filter_rejected_any) {
+                omp_rejected++;
+                tl_retrace[tid].push_back(static_cast<size_t>(ii));
+                tl_tmin[tid].push_back(last_candidate_t + 1e-6f);
+              } else {
+                omp_accepted++;
+              }
+            }
+          } /* end omp for */
+        } /* end omp parallel */
+
+        if (stats) {
+          stats->batch_accepted += omp_accepted;
+          stats->filter_rejected += omp_rejected;
+        }
+        for (int t = 0; t < pp_nthreads; t++) {
+          retrace_list.insert(retrace_list.end(),
+            tl_retrace[t].begin(), tl_retrace[t].end());
+          retrace_tmin.insert(retrace_tmin.end(),
+            tl_tmin[t].begin(), tl_tmin[t].end());
+        }
+        goto postprocess_done_wait;
+      }
+    }
+#endif /* _OPENMP */
+
+    for (size_t i = 0; i < nrays; i++) {
+        const MultiHitResult& mh = ctx->host_mhits[i];
+        bool accepted = false;
+        bool had_candidates = false;
+        bool filter_rejected_any = false;
+        float last_candidate_t = -1.0f;
+
+        for (unsigned k = 0; k < mh.count; k++) {
+            const HitResult& cand = mh.hits[k];
+            if (cand.t < 0.0f) continue;
+            had_candidates = true;
+            last_candidate_t = cand.t;
+
+            unsigned shape_id;
+            s3d_shape* shape = resolve_shape(sv, cand.geom_id, shape_id);
+            s3d_shape* inst  = resolve_instance(sv, cand.geom_id);
+
+            s3d_hit h;
+            hitresult_to_s3d_hit(sv, cand, shape, shape_id, cand.prim_idx, &h, inst);
+
+            /* Test filter — use build-time snapshot */
+            {
+                s3d_hit_filter_function_T filt = nullptr;
+                void* filt_data_snap = nullptr;
+                {
+                    auto snap = sv->find_snapshot(shape_id);
+                    if (snap) {
+                        filt = snap->filter_func;
+                        filt_data_snap = snap->filter_data;
+                    }
+                }
+                if (shape && filt) {
+                    void* fdata = requests[i].filter_data;
+                    int rej = filt(&h,
+                        requests[i].origin, requests[i].direction,
+                        requests[i].range, fdata, filt_data_snap);
+                    if (rej != 0) {
+                        filter_rejected_any = true;
+                        continue; /* Try next candidate */
+                    }
+                }
+            }
+
+            hits[i] = h;
+            accepted = true;
+            if (stats) stats->batch_accepted++;
+            break;
+        }
+
+        if (!accepted) {
+            hits[i] = S3D_HIT_NULL;
+            if (had_candidates && filter_rejected_any) {
+                if (stats) stats->filter_rejected++;
+                retrace_list.push_back(i);
+                retrace_tmin.push_back(last_candidate_t + 1e-6f);
+            } else {
+                if (stats) stats->batch_accepted++;
+            }
+        }
+    }
+
+postprocess_done_wait:
+    double t2 = now_ms();
+    if (stats) stats->postprocess_time_ms = t2 - t1;
+
+    /* ---- Phase 3: Batch retrace with multi-hit + iterative filter ----
+     * P1: uses per-ctx retrace buffers + ctx->stream + per-ctx params. */
+    if (!retrace_list.empty()) {
+        const size_t nr = retrace_list.size();
+#if OX_TRACE_DIAG
+        g_batch_retrace_rays += nr;
+        size_t retrace_launches = 0;
+#endif
+        /* P1: per-ctx retrace buffers — no contention with other ctx */
+        CudaBuffer<Ray>&            s_rt_d_rays  = ctx->rt_d_rays;
+        CudaBuffer<MultiHitResult>& s_rt_d_mhits = ctx->rt_d_mhits;
+        std::vector<Ray>            s_active_rays;
+        std::vector<MultiHitResult> s_active_mhits;
+        std::vector<size_t>         s_active_map;
+
+        /* Build retrace Ray buffer from ctx->host_rays (already converted) */
+        std::vector<Ray>    rt_rays(nr);
+        std::vector<size_t> rt_idx(retrace_list);
+        std::vector<bool>   rt_done(nr, false);
+
+        for (size_t r = 0; r < nr; r++) {
+            rt_rays[r] = ctx->host_rays[rt_idx[r]];
+            rt_rays[r].tmin = retrace_tmin[r];
+        }
+
+        for (int iter = 0; iter < OX_MAX_FILTER_RETRY; iter++) {
+            s_active_rays.clear();
+            s_active_map.clear();
+            s_active_rays.reserve(nr);
+            s_active_map.reserve(nr);
+            for (size_t r = 0; r < nr; r++) {
+                if (!rt_done[r]) {
+                    s_active_rays.push_back(rt_rays[r]);
+                    s_active_map.push_back(r);
+                }
+            }
+            if (s_active_rays.empty()) break;
+
+            const unsigned int act_count =
+                static_cast<unsigned int>(s_active_rays.size());
+
+            s_rt_d_rays.upload(s_active_rays.data(), act_count);
+            if (act_count > s_rt_d_mhits.count())
+                s_rt_d_mhits.alloc(act_count);
+
+            /* P1: use per-ctx params + stream for retrace launch */
+            sv->tracer.traceBatchMultiHit(
+                s_rt_d_rays.get(), s_rt_d_mhits.get(), act_count,
+                ctx->stream, ctx->params_ptr);
+            cudaStreamSynchronize(ctx->stream);
+
+            s_active_mhits.resize(act_count);
+            s_rt_d_mhits.download(s_active_mhits.data(), act_count);
+#if OX_TRACE_DIAG
+            retrace_launches++;
+#endif
+
+            for (size_t a = 0; a < s_active_rays.size(); a++) {
+                size_t ri = s_active_map[a];
+                size_t oi = rt_idx[ri];
+                const MultiHitResult& mh = s_active_mhits[a];
+
+                if (mh.count == 0) {
+                    rt_done[ri] = true;
+                    if (stats) stats->retrace_missed++;
+                    continue;
+                }
+
+                bool accepted = false;
+                float last_t = -1.0f;
+                for (unsigned k = 0; k < mh.count; k++) {
+                    const HitResult& cand = mh.hits[k];
+                    if (cand.t < 0.0f) continue;
+                    last_t = cand.t;
+
+                    unsigned shape_id;
+                    s3d_shape* shape = resolve_shape(sv, cand.geom_id, shape_id);
+                    s3d_shape* inst  = resolve_instance(sv, cand.geom_id);
+
+                    s3d_hit h;
+                    hitresult_to_s3d_hit(sv, cand, shape, shape_id,
+                                         cand.prim_idx, &h, inst);
+
+                    s3d_hit_filter_function_T filt = nullptr;
+                    void* filt_data_snap = nullptr;
+                    auto snap = sv->find_snapshot(shape_id);
+                    if (snap) {
+                        filt = snap->filter_func;
+                        filt_data_snap = snap->filter_data;
+                    }
+                    if (shape && filt) {
+                        void* fdata = requests[oi].filter_data;
+                        int rej = filt(&h,
+                            requests[oi].origin, requests[oi].direction,
+                            requests[oi].range, fdata, filt_data_snap);
+                        if (rej != 0) continue;
+                    }
+
+                    hits[oi] = h;
+                    rt_done[ri] = true;
+                    accepted = true;
+                    if (stats) stats->retrace_accepted++;
+                    break;
+                }
+
+                if (!accepted) {
+                    if (mh.count < MAX_MULTI_HITS) {
+                        rt_done[ri] = true;
+                        if (stats) stats->retrace_missed++;
+                    } else if (last_t >= 0.0f) {
+                        rt_rays[ri].tmin = last_t + 1e-6f;
+                    } else {
+                        rt_done[ri] = true;
+                        if (stats) stats->retrace_missed++;
+                    }
+                }
+            }
+
+            bool all_done = true;
+            for (size_t r = 0; r < nr; r++) {
+                if (!rt_done[r]) { all_done = false; break; }
+            }
+            if (all_done) break;
+        }
+
+        for (size_t r = 0; r < nr; r++) {
+            if (!rt_done[r]) {
+                if (stats) stats->retrace_missed++;
+            }
+        }
+#if OX_TRACE_DIAG
+        g_batch_retrace_single_calls += retrace_launches;
+#endif
+    }
+
+    double t3 = now_ms();
+    if (stats) stats->retrace_time_ms = t3 - t2;
+
+#if OX_TRACE_DIAG
+    g_batch_calls++;
+    g_batch_total_rays += nrays;
+    g_batch_retrace_ms += (t3 - t2);
+    if (g_batch_calls % OX_DIAG_INTERVAL == 0) {
+        fprintf(stderr,
+            "[OX_DIAG] batch_calls=%zu total_rays=%zu "
+            "retrace_rays=%zu (%.1f%%) retrace_batch_launches=%zu "
+            "standalone_trace=%zu standalone_retry=%zu "
+            "retrace_time=%.1fms\n",
+            g_batch_calls, g_batch_total_rays,
+            g_batch_retrace_rays,
+            g_batch_total_rays > 0
+              ? 100.0 * (double)g_batch_retrace_rays / (double)g_batch_total_rays
+              : 0.0,
+            g_batch_retrace_single_calls,
+            g_single_trace_calls,
+            g_single_retry_calls,
+            g_batch_retrace_ms);
+    }
+#endif
+
+    return RES_OK;
+}
+
 res_T s3d_scene_view_trace_rays_batch(s3d_scene_view* sv,
                                        const s3d_ray_request* requests,
                                        size_t nrays,
@@ -1502,11 +2048,34 @@ res_T s3d_scene_view_trace_rays_batch_ctx(s3d_scene_view* sv,
                                            s3d_hit* hits,
                                            s3d_batch_trace_stats* stats)
 {
-    /* Context-based version uses pre-allocated device buffers
-     * when the batch size fits within ctx->max_rays (Step 4). */
-    if (!sv || !requests || !hits) return RES_BAD_ARG;
+    /* Delegate to async + wait so the sync path exercises the same code. */
+    if (!sv || !ctx || !requests || !hits) return RES_BAD_ARG;
     if (nrays == 0) return RES_OK;
-    return batch_trace_impl(sv, ctx, requests, nrays, hits, stats);
+    res_T rc = batch_trace_async_impl(sv, ctx, requests, nrays);
+    if (rc != RES_OK) return rc;
+    return batch_trace_wait_impl(sv, ctx, requests, nrays, hits, stats);
+}
+
+/* P0: public async API */
+res_T s3d_scene_view_trace_rays_batch_ctx_async(
+    s3d_scene_view* scnview,
+    s3d_batch_trace_context* ctx,
+    const s3d_ray_request* requests, size_t nrays)
+{
+    if (!scnview || !ctx) return RES_BAD_ARG;
+    return batch_trace_async_impl(scnview, ctx, requests, nrays);
+}
+
+/* P0: public wait API */
+res_T s3d_scene_view_trace_rays_batch_ctx_wait(
+    s3d_scene_view* scnview,
+    s3d_batch_trace_context* ctx,
+    const s3d_ray_request* requests, size_t nrays,
+    s3d_hit* hits,
+    s3d_batch_trace_stats* stats)
+{
+    if (!scnview || !ctx || !hits) return RES_BAD_ARG;
+    return batch_trace_wait_impl(scnview, ctx, requests, nrays, hits, stats);
 }
 
 /* ================================================================

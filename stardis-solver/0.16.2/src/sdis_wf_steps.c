@@ -1269,7 +1269,10 @@ step_cnd_wos_closest_result(struct path_state* p, struct sdis_scene* scn)
     goto exit;
   }
 
-  /* Case 2: Outside epsilon-shell — uniform sphere sampling */
+  /* Case 2: Outside epsilon-shell — uniform sphere sampling.
+   * Compute candidate new position, then submit a batch closest_point
+   * query with limited radius (delta) to validate enclosure membership.
+   * This replaces the former synchronous wf_check_diffusion_position(). */
   {
     double pos_new[3] = {0};
     float dir_f[3] = {0};
@@ -1282,21 +1285,9 @@ step_cnd_wos_closest_result(struct path_state* p, struct sdis_scene* scn)
     d3_muld(pos_new, dir_d, (double)hit->distance);
     d3_add(pos_new, pos_new, p->rwalk.vtx.P);
 
-    /* Check diffusion position (synchronous closest_point with small radius) */
-    res = wf_check_diffusion_position(scn, p->rwalk.enc_id,
-      p->locals.cnd_wos.delta, pos_new);
-
-    if(res == RES_OK) {
-      /* Case 2a: Position valid — move directly */
-      d3_set(p->rwalk.vtx.P, pos_new);
-      p->rwalk.hit_3d = S3D_HIT_NULL;
-      p->locals.cnd_wos.last_distance = wos_distance;
-      p->phase = PATH_CND_WOS_TIME_TRAVEL;
-    } else {
-      /* Case 2b: Position invalid — need fallback trace_ray */
-      res = RES_OK; /* reset error; fallback will handle it */
-      step_cnd_wos_fallback_trace(p);
-    }
+    /* Save candidate position and submit batch CP query for validation */
+    d3_set(p->locals.cnd_wos.diffusion_pos, pos_new);
+    step_cnd_wos_diffusion_check(p);
   }
 
 exit:
@@ -1306,6 +1297,69 @@ error:
   p->active = 0;
   p->done_reason = -1;
   goto exit;
+}
+
+/* --- PATH_CND_WOS_DIFFUSION_CHECK: submit diffusion validation CP query --- */
+LOCAL_SYM void
+step_cnd_wos_diffusion_check(struct path_state* p)
+{
+  ASSERT(p);
+
+  /* Query position = candidate diffusion position, radius = delta */
+  p->locals.cnd_wos.query_pos[0] = p->locals.cnd_wos.diffusion_pos[0];
+  p->locals.cnd_wos.query_pos[1] = p->locals.cnd_wos.diffusion_pos[1];
+  p->locals.cnd_wos.query_pos[2] = p->locals.cnd_wos.diffusion_pos[2];
+  p->locals.cnd_wos.query_radius = (float)p->locals.cnd_wos.delta;
+  p->locals.cnd_wos.batch_cp2_idx = (uint32_t)-1;
+
+  p->needs_ray = 0;  /* closest_point has its own batch */
+  p->phase = PATH_CND_WOS_DIFFUSION_CHECK;
+}
+
+/* --- PATH_CND_WOS_DIFFUSION_CHECK_RESULT: process validation CP result ---- */
+LOCAL_SYM res_T
+step_cnd_wos_diffusion_check_result(struct path_state* p, struct sdis_scene* scn)
+{
+  const struct s3d_hit* hit = &p->locals.cnd_wos.cached_hit;
+  const unsigned expected_enc_id = p->rwalk.enc_id;
+  const double delta = p->locals.cnd_wos.delta;
+  const double* pos = p->locals.cnd_wos.diffusion_pos;
+  res_T res = RES_OK;
+  int position_valid = 1;
+
+  ASSERT(p && scn);
+
+  /* Replicate wf_check_diffusion_position logic using batch CP result */
+  if(!S3D_HIT_NONE(hit)) {
+    unsigned enc_ids[2] = {ENCLOSURE_ID_NULL, ENCLOSURE_ID_NULL};
+    enum sdis_side side = SDIS_SIDE_NULL__;
+
+    scene_get_enclosure_ids(scn, hit->prim.prim_id, enc_ids);
+    side = wf_compute_hit_side_3d(hit, delta, pos);
+
+    if(side != SDIS_SIDE_NULL__ && enc_ids[side] != expected_enc_id) {
+      position_valid = 0;
+    }
+    if(side == SDIS_SIDE_NULL__
+    && enc_ids[SDIS_FRONT] != expected_enc_id
+    && enc_ids[SDIS_BACK]  != expected_enc_id) {
+      position_valid = 0;
+    }
+  }
+  /* S3D_HIT_NONE → no nearby surface → position OK */
+
+  if(position_valid) {
+    /* Position valid — move directly */
+    d3_set(p->rwalk.vtx.P, pos);
+    p->rwalk.hit_3d = S3D_HIT_NULL;
+    /* last_distance already set by step_cnd_wos_closest_result */
+    p->phase = PATH_CND_WOS_TIME_TRAVEL;
+  } else {
+    /* Position invalid — need fallback trace_ray */
+    step_cnd_wos_fallback_trace(p);
+  }
+
+  return res;
 }
 
 /* --- PATH_CND_WOS_FALLBACK_TRACE: emit fallback ray ---------------------- */
@@ -5332,6 +5386,7 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
 
   /* B-4 M9: cp-pending — cannot advance without closest_point result */
   case PATH_CND_WOS_CLOSEST:
+  case PATH_CND_WOS_DIFFUSION_CHECK:
     break;
 
   /* B-4 M10: enc_locate-pending — cannot advance without enc_locate result */
@@ -5441,6 +5496,10 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
     break;
   case PATH_CND_WOS_CLOSEST_RESULT:
     res = step_cnd_wos_closest_result(p, scn);
+    *advanced = 1;
+    break;
+  case PATH_CND_WOS_DIFFUSION_CHECK_RESULT:
+    res = step_cnd_wos_diffusion_check_result(p, scn);
     *advanced = 1;
     break;
   case PATH_CND_WOS_TIME_TRAVEL:

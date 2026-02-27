@@ -84,6 +84,45 @@ teardown_test_pool(struct wavefront_pool* pool)
   memset(pool, 0, sizeof(*pool));
 }
 
+/* Test-only: lightweight pool_view setup (no GPU batch contexts) */
+static void
+setup_test_pool_view(struct wavefront_pool* pool, size_t pool_size)
+{
+  struct pool_view* pv = &pool->views[0];
+  size_t max_rays = pool_size * 6;
+  memset(pv, 0, sizeof(*pv));
+  pv->base = 0;
+  pv->view_size = pool_size;
+  pv->capacity = pool_size;
+  pv->max_rays = max_rays;
+  pv->active_indices   = (uint32_t*)calloc(pool_size, sizeof(uint32_t));
+  pv->need_ray_indices = (uint32_t*)calloc(pool_size, sizeof(uint32_t));
+  pv->done_indices     = (uint32_t*)calloc(pool_size, sizeof(uint32_t));
+  pv->bucket_radiative = (uint32_t*)calloc(pool_size, sizeof(uint32_t));
+  pv->bucket_conductive= (uint32_t*)calloc(pool_size, sizeof(uint32_t));
+  pv->ray_requests = (struct s3d_ray_request*)calloc(max_rays, sizeof(struct s3d_ray_request));
+  pv->ray_to_slot  = (uint32_t*)calloc(max_rays, sizeof(uint32_t));
+  pv->ray_slot_sub = (uint32_t*)calloc(max_rays, sizeof(uint32_t));
+  pv->ray_hits     = (struct s3d_hit*)calloc(max_rays, sizeof(struct s3d_hit));
+  pool->num_active_views = 1;
+}
+
+static void
+teardown_test_pool_view(struct wavefront_pool* pool)
+{
+  struct pool_view* pv = &pool->views[0];
+  free(pv->active_indices);
+  free(pv->need_ray_indices);
+  free(pv->done_indices);
+  free(pv->bucket_radiative);
+  free(pv->bucket_conductive);
+  free(pv->ray_requests);
+  free(pv->ray_to_slot);
+  free(pv->ray_slot_sub);
+  free(pv->ray_hits);
+  memset(pv, 0, sizeof(*pv));
+}
+
 /* ========================================================================
  * Helper: configure a path slot as a specific ray type
  * ======================================================================== */
@@ -184,12 +223,15 @@ static void
 test_bucket_counts(void)
 {
   struct wavefront_pool pool;
+  struct pool_view* pv;
   size_t pool_size = 30;
   size_t i;
 
   printf("  T2.1: bucket count verification... ");
 
   setup_test_pool(&pool, pool_size);
+  setup_test_pool_view(&pool, pool_size);
+  pv = &pool.views[0];
 
   /* Configure 20 radiative */
   for(i = 0; i < 20; i++)
@@ -199,27 +241,28 @@ test_bucket_counts(void)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
 
   /* Build need_ray_indices manually (compact_active_paths equivalent) */
-  pool.need_ray_count = 0;
+  pv->need_ray_count = 0;
   for(i = 0; i < pool_size; i++) {
     struct path_state* p = &pool.slots[i];
     if(p->active && p->needs_ray && p->ray_req.ray_count >= 1) {
-      pool.need_ray_indices[pool.need_ray_count++] = (uint32_t)i;
+      pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
     }
   }
-  CHK(pool.need_ray_count == 30);
+  CHK(pv->need_ray_count == 30);
 
   /* Run bucketed collect */
-  pool_collect_ray_requests_bucketed(&pool);
+  pool_collect_ray_requests_bucketed(&pool, pv);
 
   /* Verify bucket counts */
-  CHK(pool.bucket_counts[RAY_BUCKET_RADIATIVE] == 20);
-  CHK(pool.bucket_counts[RAY_BUCKET_STEP_PAIR] == 20);
-  CHK(pool.bucket_counts[RAY_BUCKET_SHADOW]    == 0);
-  CHK(pool.bucket_counts[RAY_BUCKET_STARTUP]   == 0);
+  CHK(pv->bucket_counts[RAY_BUCKET_RADIATIVE] == 20);
+  CHK(pv->bucket_counts[RAY_BUCKET_STEP_PAIR] == 20);
+  CHK(pv->bucket_counts[RAY_BUCKET_SHADOW]    == 0);
+  CHK(pv->bucket_counts[RAY_BUCKET_STARTUP]   == 0);
 
   /* Verify total ray count */
-  CHK(pool.ray_count == 40);
+  CHK(pv->ray_count == 40);
 
+  teardown_test_pool_view(&pool);
   teardown_test_pool(&pool);
   printf("PASS\n");
 }
@@ -233,12 +276,15 @@ static void
 test_bucket_offset_continuity(void)
 {
   struct wavefront_pool pool;
+  struct pool_view* pv;
   size_t pool_size = 30;
   size_t i, b;
 
   printf("  T2.2: bucket offset continuity... ");
 
   setup_test_pool(&pool, pool_size);
+  setup_test_pool_view(&pool, pool_size);
+  pv = &pool.views[0];
 
   /* Same configuration as T2.1 */
   for(i = 0; i < 20; i++)
@@ -246,29 +292,30 @@ test_bucket_offset_continuity(void)
   for(i = 20; i < 30; i++)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
 
-  pool.need_ray_count = 0;
+  pv->need_ray_count = 0;
   for(i = 0; i < pool_size; i++) {
     struct path_state* p = &pool.slots[i];
     if(p->active && p->needs_ray && p->ray_req.ray_count >= 1)
-      pool.need_ray_indices[pool.need_ray_count++] = (uint32_t)i;
+      pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
   }
 
-  pool_collect_ray_requests_bucketed(&pool);
+  pool_collect_ray_requests_bucketed(&pool, pv);
 
   /* Monotonically non-decreasing */
   for(b = 0; b < RAY_BUCKET_COUNT; b++) {
-    CHK(pool.bucket_offsets[b + 1] >= pool.bucket_offsets[b]);
+    CHK(pv->bucket_offsets[b + 1] >= pv->bucket_offsets[b]);
   }
 
   /* Final offset == total ray count */
-  CHK(pool.bucket_offsets[RAY_BUCKET_COUNT] == pool.ray_count);
+  CHK(pv->bucket_offsets[RAY_BUCKET_COUNT] == pv->ray_count);
 
   /* Each bucket's size matches count */
   for(b = 0; b < RAY_BUCKET_COUNT; b++) {
-    size_t bucket_size = pool.bucket_offsets[b + 1] - pool.bucket_offsets[b];
-    CHK(bucket_size == pool.bucket_counts[b]);
+    size_t bucket_size = pv->bucket_offsets[b + 1] - pv->bucket_offsets[b];
+    CHK(bucket_size == pv->bucket_counts[b]);
   }
 
+  teardown_test_pool_view(&pool);
   teardown_test_pool(&pool);
   printf("PASS\n");
 }
@@ -282,34 +329,38 @@ static void
 test_ray_to_slot_mapping(void)
 {
   struct wavefront_pool pool;
+  struct pool_view* pv;
   size_t pool_size = 30;
   size_t i;
 
   printf("  T2.3: ray_to_slot mapping completeness... ");
 
   setup_test_pool(&pool, pool_size);
+  setup_test_pool_view(&pool, pool_size);
+  pv = &pool.views[0];
 
   for(i = 0; i < 20; i++)
     configure_path_radiative(&pool.slots[i], (uint32_t)i);
   for(i = 20; i < 30; i++)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
 
-  pool.need_ray_count = 0;
+  pv->need_ray_count = 0;
   for(i = 0; i < pool_size; i++) {
     struct path_state* p = &pool.slots[i];
     if(p->active && p->needs_ray && p->ray_req.ray_count >= 1)
-      pool.need_ray_indices[pool.need_ray_count++] = (uint32_t)i;
+      pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
   }
 
-  pool_collect_ray_requests_bucketed(&pool);
+  pool_collect_ray_requests_bucketed(&pool, pv);
 
   /* Every ray must map to a valid slot */
-  for(i = 0; i < pool.ray_count; i++) {
-    CHK(pool.ray_to_slot[i] < (uint32_t)pool_size);
+  for(i = 0; i < pv->ray_count; i++) {
+    CHK(pv->ray_to_slot[i] < (uint32_t)pool_size);
     /* The slot must be active and was requesting rays */
-    CHK(pool.slots[pool.ray_to_slot[i]].active == 1);
+    CHK(pool.slots[pv->ray_to_slot[i]].active == 1);
   }
 
+  teardown_test_pool_view(&pool);
   teardown_test_pool(&pool);
   printf("PASS\n");
 }
@@ -324,26 +375,29 @@ static void
 test_batch_idx_roundtrip(void)
 {
   struct wavefront_pool pool;
+  struct pool_view* pv;
   size_t pool_size = 30;
   size_t i;
 
   printf("  T2.3b: batch_idx roundtrip... ");
 
   setup_test_pool(&pool, pool_size);
+  setup_test_pool_view(&pool, pool_size);
+  pv = &pool.views[0];
 
   for(i = 0; i < 20; i++)
     configure_path_radiative(&pool.slots[i], (uint32_t)i);
   for(i = 20; i < 30; i++)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
 
-  pool.need_ray_count = 0;
+  pv->need_ray_count = 0;
   for(i = 0; i < pool_size; i++) {
     struct path_state* p = &pool.slots[i];
     if(p->active && p->needs_ray && p->ray_req.ray_count >= 1)
-      pool.need_ray_indices[pool.need_ray_count++] = (uint32_t)i;
+      pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
   }
 
-  pool_collect_ray_requests_bucketed(&pool);
+  pool_collect_ray_requests_bucketed(&pool, pv);
 
   /* For every path, verify batch_idx roundtrips */
   for(i = 0; i < pool_size; i++) {
@@ -351,18 +405,19 @@ test_batch_idx_roundtrip(void)
     if(!p->active || !p->needs_ray) continue;
 
     /* Ray 0 */
-    CHK(p->ray_req.batch_idx < (uint32_t)pool.ray_count);
-    CHK(pool.ray_to_slot[p->ray_req.batch_idx] == (uint32_t)i);
-    CHK(pool.ray_slot_sub[p->ray_req.batch_idx] == 0);
+    CHK(p->ray_req.batch_idx < (uint32_t)pv->ray_count);
+    CHK(pv->ray_to_slot[p->ray_req.batch_idx] == (uint32_t)i);
+    CHK(pv->ray_slot_sub[p->ray_req.batch_idx] == 0);
 
     /* Ray 1 (delta_sphere) */
     if(p->ray_req.ray_count >= 2) {
-      CHK(p->ray_req.batch_idx2 < (uint32_t)pool.ray_count);
-      CHK(pool.ray_to_slot[p->ray_req.batch_idx2] == (uint32_t)i);
-      CHK(pool.ray_slot_sub[p->ray_req.batch_idx2] == 1);
+      CHK(p->ray_req.batch_idx2 < (uint32_t)pv->ray_count);
+      CHK(pv->ray_to_slot[p->ray_req.batch_idx2] == (uint32_t)i);
+      CHK(pv->ray_slot_sub[p->ray_req.batch_idx2] == 1);
     }
   }
 
+  teardown_test_pool_view(&pool);
   teardown_test_pool(&pool);
   printf("PASS\n");
 }
@@ -377,38 +432,42 @@ static void
 test_bucket_contiguity(void)
 {
   struct wavefront_pool pool;
+  struct pool_view* pv;
   size_t pool_size = 30;
   size_t i, b;
 
   printf("  T2.4b: bucket contiguity... ");
 
   setup_test_pool(&pool, pool_size);
+  setup_test_pool_view(&pool, pool_size);
+  pv = &pool.views[0];
 
   for(i = 0; i < 20; i++)
     configure_path_radiative(&pool.slots[i], (uint32_t)i);
   for(i = 20; i < 30; i++)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
 
-  pool.need_ray_count = 0;
+  pv->need_ray_count = 0;
   for(i = 0; i < pool_size; i++) {
     struct path_state* p = &pool.slots[i];
     if(p->active && p->needs_ray && p->ray_req.ray_count >= 1)
-      pool.need_ray_indices[pool.need_ray_count++] = (uint32_t)i;
+      pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
   }
 
-  pool_collect_ray_requests_bucketed(&pool);
+  pool_collect_ray_requests_bucketed(&pool, pv);
 
   /* Verify contiguity: rays in each bucket range belong to that bucket type */
   for(b = 0; b < RAY_BUCKET_COUNT; b++) {
-    size_t start = pool.bucket_offsets[b];
-    size_t end   = pool.bucket_offsets[b + 1];
+    size_t start = pv->bucket_offsets[b];
+    size_t end   = pv->bucket_offsets[b + 1];
     for(i = start; i < end; i++) {
-      uint32_t slot_idx = pool.ray_to_slot[i];
+      uint32_t slot_idx = pv->ray_to_slot[i];
       struct path_state* p = &pool.slots[slot_idx];
       CHK((int)p->ray_bucket == (int)b);
     }
   }
 
+  teardown_test_pool_view(&pool);
   teardown_test_pool(&pool);
   printf("PASS\n");
 }
@@ -422,12 +481,15 @@ static void
 test_all_bucket_types(void)
 {
   struct wavefront_pool pool;
+  struct pool_view* pv;
   size_t pool_size = 40;
   size_t i;
 
   printf("  T2.5b: all 4 bucket types... ");
 
   setup_test_pool(&pool, pool_size);
+  setup_test_pool_view(&pool, pool_size);
+  pv = &pool.views[0];
 
   /* 10 of each type */
   for(i = 0; i < 10; i++)
@@ -439,36 +501,37 @@ test_all_bucket_types(void)
   for(i = 30; i < 40; i++)
     configure_path_startup(&pool.slots[i], (uint32_t)i);
 
-  pool.need_ray_count = 0;
+  pv->need_ray_count = 0;
   for(i = 0; i < pool_size; i++) {
     struct path_state* p = &pool.slots[i];
     if(p->active && p->needs_ray && p->ray_req.ray_count >= 1)
-      pool.need_ray_indices[pool.need_ray_count++] = (uint32_t)i;
+      pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
   }
-  CHK(pool.need_ray_count == 40);
+  CHK(pv->need_ray_count == 40);
 
-  pool_collect_ray_requests_bucketed(&pool);
+  pool_collect_ray_requests_bucketed(&pool, pv);
 
   /* RAD=10, DS=20, SHADOW=10, STARTUP=10 = 50 total */
-  CHK(pool.bucket_counts[RAY_BUCKET_RADIATIVE] == 10);
-  CHK(pool.bucket_counts[RAY_BUCKET_STEP_PAIR] == 20);
-  CHK(pool.bucket_counts[RAY_BUCKET_SHADOW]    == 10);
-  CHK(pool.bucket_counts[RAY_BUCKET_STARTUP]   == 10);
-  CHK(pool.ray_count == 50);
+  CHK(pv->bucket_counts[RAY_BUCKET_RADIATIVE] == 10);
+  CHK(pv->bucket_counts[RAY_BUCKET_STEP_PAIR] == 20);
+  CHK(pv->bucket_counts[RAY_BUCKET_SHADOW]    == 10);
+  CHK(pv->bucket_counts[RAY_BUCKET_STARTUP]   == 10);
+  CHK(pv->ray_count == 50);
 
   /* Verify contiguity for all buckets */
   {
     size_t b;
     for(b = 0; b < RAY_BUCKET_COUNT; b++) {
-      size_t start = pool.bucket_offsets[b];
-      size_t end   = pool.bucket_offsets[b + 1];
+      size_t start = pv->bucket_offsets[b];
+      size_t end   = pv->bucket_offsets[b + 1];
       for(i = start; i < end; i++) {
-        uint32_t slot_idx = pool.ray_to_slot[i];
+        uint32_t slot_idx = pv->ray_to_slot[i];
         CHK((int)pool.slots[slot_idx].ray_bucket == (int)b);
       }
     }
   }
 
+  teardown_test_pool_view(&pool);
   teardown_test_pool(&pool);
   printf("PASS\n");
 }
@@ -480,23 +543,27 @@ static void
 test_empty_pool(void)
 {
   struct wavefront_pool pool;
+  struct pool_view* pv;
   size_t pool_size = 10;
   size_t b;
 
   printf("  T2.6: empty pool (no ray requests)... ");
 
   setup_test_pool(&pool, pool_size);
-  pool.need_ray_count = 0;
+  setup_test_pool_view(&pool, pool_size);
+  pv = &pool.views[0];
+  pv->need_ray_count = 0;
 
-  pool_collect_ray_requests_bucketed(&pool);
+  pool_collect_ray_requests_bucketed(&pool, pv);
 
-  CHK(pool.ray_count == 0);
+  CHK(pv->ray_count == 0);
   for(b = 0; b < RAY_BUCKET_COUNT; b++) {
-    CHK(pool.bucket_counts[b] == 0);
-    CHK(pool.bucket_offsets[b] == 0);
+    CHK(pv->bucket_counts[b] == 0);
+    CHK(pv->bucket_offsets[b] == 0);
   }
-  CHK(pool.bucket_offsets[RAY_BUCKET_COUNT] == 0);
+  CHK(pv->bucket_offsets[RAY_BUCKET_COUNT] == 0);
 
+  teardown_test_pool_view(&pool);
   teardown_test_pool(&pool);
   printf("PASS\n");
 }
@@ -508,29 +575,33 @@ static void
 test_single_bucket_only(void)
 {
   struct wavefront_pool pool;
+  struct pool_view* pv;
   size_t pool_size = 100;
   size_t i;
 
   printf("  T2.7: single bucket only (100 radiative)... ");
 
   setup_test_pool(&pool, pool_size);
+  setup_test_pool_view(&pool, pool_size);
+  pv = &pool.views[0];
   for(i = 0; i < pool_size; i++)
     configure_path_radiative(&pool.slots[i], (uint32_t)i);
 
-  pool.need_ray_count = 0;
+  pv->need_ray_count = 0;
   for(i = 0; i < pool_size; i++)
-    pool.need_ray_indices[pool.need_ray_count++] = (uint32_t)i;
+    pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
 
-  pool_collect_ray_requests_bucketed(&pool);
+  pool_collect_ray_requests_bucketed(&pool, pv);
 
-  CHK(pool.bucket_counts[RAY_BUCKET_RADIATIVE] == 100);
-  CHK(pool.bucket_counts[RAY_BUCKET_STEP_PAIR] == 0);
-  CHK(pool.ray_count == 100);
+  CHK(pv->bucket_counts[RAY_BUCKET_RADIATIVE] == 100);
+  CHK(pv->bucket_counts[RAY_BUCKET_STEP_PAIR] == 0);
+  CHK(pv->ray_count == 100);
 
   /* All rays in the radiative bucket range */
-  CHK(pool.bucket_offsets[RAY_BUCKET_RADIATIVE] == 0);
-  CHK(pool.bucket_offsets[RAY_BUCKET_RADIATIVE + 1] == 100);
+  CHK(pv->bucket_offsets[RAY_BUCKET_RADIATIVE] == 0);
+  CHK(pv->bucket_offsets[RAY_BUCKET_RADIATIVE + 1] == 100);
 
+  teardown_test_pool_view(&pool);
   teardown_test_pool(&pool);
   printf("PASS\n");
 }
@@ -542,23 +613,26 @@ static void
 test_diagnostic_stats(void)
 {
   struct wavefront_pool pool;
+  struct pool_view* pv;
   size_t pool_size = 30;
   size_t i;
 
   printf("  T2.8: diagnostic stats... ");
 
   setup_test_pool(&pool, pool_size);
+  setup_test_pool_view(&pool, pool_size);
+  pv = &pool.views[0];
 
   for(i = 0; i < 20; i++)
     configure_path_radiative(&pool.slots[i], (uint32_t)i);
   for(i = 20; i < 30; i++)
     configure_path_delta_sphere(&pool.slots[i], (uint32_t)i);
 
-  pool.need_ray_count = 0;
+  pv->need_ray_count = 0;
   for(i = 0; i < pool_size; i++) {
     struct path_state* p = &pool.slots[i];
     if(p->active && p->needs_ray && p->ray_req.ray_count >= 1)
-      pool.need_ray_indices[pool.need_ray_count++] = (uint32_t)i;
+      pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
   }
 
   /* Reset stats */
@@ -567,13 +641,14 @@ test_diagnostic_stats(void)
   pool.rays_shadow = 0;
   pool.rays_startup = 0;
 
-  pool_collect_ray_requests_bucketed(&pool);
+  pool_collect_ray_requests_bucketed(&pool, pv);
 
   CHK(pool.rays_radiative == 20);
   CHK(pool.rays_conductive_ds == 20);
   CHK(pool.rays_shadow == 0);
   CHK(pool.rays_startup == 0);
 
+  teardown_test_pool_view(&pool);
   teardown_test_pool(&pool);
   printf("PASS\n");
 }

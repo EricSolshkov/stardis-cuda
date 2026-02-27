@@ -75,6 +75,76 @@ struct pixel_task {
 #define PERSISTENT_WF_DEFAULT_POOL_SIZE  32768
 
 /*******************************************************************************
+ * pool_view — unified pool view (P2: 2-stream pipeline)
+ *
+ * Represents a view over slots[base .. base+view_size) within the pool.
+ * Single-buffer mode: views[0] covers the entire pool (base=0, view_size=pool_size).
+ * Dual-buffer mode:   views[0] covers the first half, views[1] the second half.
+ *
+ * All pool operation functions will be unified to accept (pool, pv) in P3.
+ ******************************************************************************/
+struct pool_view {
+  size_t base;              /* slot start offset: 0 or view_size          */
+  size_t view_size;         /* number of slots this view covers           */
+  size_t capacity;          /* allocated capacity (>= view_size)          */
+
+  /* ---- Stream compaction indices ---- */
+  uint32_t* active_indices;
+  size_t    active_compact;
+
+  uint32_t* need_ray_indices;
+  size_t    need_ray_count;
+
+  uint32_t* done_indices;
+  size_t    done_count;
+
+  /* ---- Path type buckets ---- */
+  uint32_t* bucket_radiative;
+  size_t    bucket_radiative_n;
+  uint32_t* bucket_conductive;
+  size_t    bucket_conductive_n;
+
+  /* ---- Ray buffers ---- */
+  struct s3d_ray_request* ray_requests;
+  uint32_t*               ray_to_slot;
+  uint32_t*               ray_slot_sub;
+  struct s3d_hit*          ray_hits;
+  size_t                   ray_count;
+  size_t                   max_rays;      /* capacity * 6 */
+
+  /* ---- Ray bucket offsets ---- */
+  size_t bucket_offsets[RAY_BUCKET_COUNT + 1];
+  size_t bucket_counts[RAY_BUCKET_COUNT];
+
+  /* ---- GPU batch contexts ---- */
+  struct s3d_batch_trace_context* batch_ctx;
+  struct s3d_batch_enc_context*   enc_batch_ctx;
+  struct s3d_batch_cp_context*    cp_batch_ctx;
+
+  /* ---- enc_locate buffers ---- */
+  struct s3d_enc_locate_request* enc_locate_requests;
+  struct s3d_enc_locate_result*  enc_locate_results;
+  uint32_t*                      enc_locate_to_slot;
+  size_t                         enc_locate_count;
+  size_t                         max_enc_locates;  /* capacity */
+
+  /* ---- closest_point buffers ---- */
+  struct s3d_cp_request* cp_requests;
+  struct s3d_hit*        cp_hits;
+  uint32_t*              cp_to_slot;
+  size_t                 cp_count;
+  size_t                 max_cps;         /* capacity */
+
+  /* ---- Async tracking (P4) ---- */
+  int gpu_pending;           /* 1 = async GPU trace in flight        */
+
+  /* ---- View statistics ---- */
+  size_t total_rays_traced;
+  size_t paths_completed;
+  size_t paths_failed;
+};
+
+/*******************************************************************************
  * wavefront_pool — persistent pool holding all active paths
  ******************************************************************************/
 struct wavefront_pool {
@@ -151,6 +221,10 @@ struct wavefront_pool {
   uint32_t*                    cp_to_slot;   /* cp index → slot mapping */
   size_t                       cp_count;     /* queries this step */
   size_t                       max_cps;      /* pool_size */
+
+  /* --- P2: Unified pool views (2-stream pipeline) --- */
+  struct pool_view    views[2];
+  int                 num_active_views;   /* 1 = single-buffer, 2 = dual-buffer */
 
   /* --- Drain phase control (M2) --- */
   int                 in_drain_phase;  /* 1 = task_queue exhausted          */
@@ -231,6 +305,12 @@ struct wavefront_pool {
   size_t trace_retrace_accepted_sum;
   size_t trace_retrace_missed_sum;
   size_t trace_filter_rejected_sum;
+
+  /* === P2: Pipeline timing (2-stream) === */
+  double time_pipeline_wait_s;
+  double time_pipeline_cpu_pre_s;
+  double time_pipeline_cpu_between_s;
+  double time_pipeline_gpu_idle_s;
 };
 
 /*******************************************************************************
@@ -252,19 +332,23 @@ count_path_rays(const struct path_state* p)
 }
 
 extern LOCAL_SYM res_T
-pool_collect_ray_requests_bucketed(struct wavefront_pool* pool);
+pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
+                                    struct pool_view* pv);
 
 /* B-4 M10: Collect enc_locate requests from paths in PATH_ENC_LOCATE_PENDING */
 extern LOCAL_SYM res_T
-pool_collect_enc_locate_requests(struct wavefront_pool* pool);
+pool_collect_enc_locate_requests(struct wavefront_pool* pool,
+                                  struct pool_view* pv);
 
 /* B-4 M9: Collect closest_point requests from WoS paths in PATH_CND_WOS_CLOSEST */
 extern LOCAL_SYM res_T
-pool_collect_cp_requests(struct wavefront_pool* pool);
+pool_collect_cp_requests(struct wavefront_pool* pool,
+                          struct pool_view* pv);
 
 /* B-4 M9: Distribute closest_point results to WoS paths */
 extern LOCAL_SYM res_T
-pool_distribute_cp_results(struct wavefront_pool* pool);
+pool_distribute_cp_results(struct wavefront_pool* pool,
+                            struct pool_view* pv);
 
 /* ============================================================================
  * Public API
