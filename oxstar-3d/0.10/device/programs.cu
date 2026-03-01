@@ -303,10 +303,12 @@ extern "C" __global__ void __anyhit__mh()
         }
         if (t_new < max_t) {
             result.hits[farthest] = new_hit;
-        } else {
-            optixIgnoreIntersection();
         }
     }
+
+    /* Always ignore: we manage Top-K ourselves, never let OptiX
+       accept a hit (which would shrink tMax and truncate BVH traversal). */
+    optixIgnoreIntersection();
 }
 
 /* ===========================================================================

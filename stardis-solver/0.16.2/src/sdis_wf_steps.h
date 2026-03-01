@@ -95,7 +95,8 @@ step_boundary(struct path_state* p, struct sdis_scene* scn);
 
 /* PATH_COUPLED_CONDUCTIVE: delta_sphere entry / loop */
 extern LOCAL_SYM res_T
-step_conductive(struct path_state* p, struct sdis_scene* scn);
+step_conductive(struct path_state* p, struct sdis_scene* scn,
+                struct path_enc_data* enc);
 
 /* PATH_COUPLED_COND_DS_PENDING: process 2-ray delta sphere results */
 extern LOCAL_SYM res_T
@@ -103,7 +104,8 @@ step_conductive_ds_process
   (struct path_state* p,
    struct sdis_scene* scn,
    const struct s3d_hit* hit0,
-   const struct s3d_hit* hit1);
+   const struct s3d_hit* hit1,
+   struct path_enc_data* enc);
 
 /* PATH_COUPLED_CONVECTIVE: convective_path (may need startup ray) */
 extern LOCAL_SYM res_T
@@ -119,9 +121,11 @@ step_coupled_radiative_begin(struct path_state* p, struct sdis_scene* scn);
 
 /* Submit a point-in-enclosure query via the BVH closest primitive kernel.
  * Sets enc_locate.query_pos and transitions to PATH_ENC_LOCATE_PENDING.
- * The wavefront pool will collect these requests into a batch. */
+ * The wavefront pool will collect these requests into a batch.
+ * P1: enc_locate fields moved to pool->enc_arr[slot_idx]. */
 extern LOCAL_SYM void
 step_enc_locate_submit(struct path_state* p,
+                       struct path_enc_data* enc,
                        const double pos[3],
                        enum path_phase return_state);
 
@@ -129,7 +133,8 @@ step_enc_locate_submit(struct path_state* p,
  * Resolves prim_id + side → enc_id via scene prim_props and transitions
  * to the saved return_state. */
 extern LOCAL_SYM res_T
-step_enc_locate_result(struct path_state* p, struct sdis_scene* scn);
+step_enc_locate_result(struct path_state* p, struct sdis_scene* scn,
+                       struct path_enc_data* enc);
 
 /*******************************************************************************
  * B-4 M1-v2: 6-ray enclosure query (replaces M10 at call sites)
@@ -141,9 +146,11 @@ step_enc_locate_result(struct path_state* p, struct sdis_scene* scn);
  ******************************************************************************/
 
 /* Submit: build 6 PI/4-rotated axis-aligned directions + set up ray request.
- * Transitions to PATH_ENC_QUERY_EMIT (ray-pending). */
+ * Transitions to PATH_ENC_QUERY_EMIT (ray-pending).
+ * P1: enc_query fields moved to pool->enc_arr[slot_idx]. */
 extern LOCAL_SYM void
 step_enc_query_emit(struct path_state* p,
+                    struct path_enc_data* enc,
                     const double pos[3],
                     enum path_phase return_state);
 
@@ -151,13 +158,15 @@ step_enc_query_emit(struct path_state* p,
  * Called from advance_one_step_with_ray when phase==PATH_ENC_QUERY_EMIT.
  * If resolved → return_state; if all invalid → PATH_ENC_QUERY_FB_EMIT. */
 extern LOCAL_SYM res_T
-step_enc_query_resolve(struct path_state* p, struct sdis_scene* scn);
+step_enc_query_resolve(struct path_state* p, struct sdis_scene* scn,
+                       struct path_enc_data* enc);
 
 /* Fallback resolve: process 1 fallback hit result.
  * Called from advance_one_step_with_ray when phase==PATH_ENC_QUERY_FB_EMIT.
  * If resolved → return_state; if still invalid → synchronous fallback. */
 extern LOCAL_SYM res_T
-step_enc_query_fb_resolve(struct path_state* p, struct sdis_scene* scn);
+step_enc_query_fb_resolve(struct path_state* p, struct sdis_scene* scn,
+                          struct path_enc_data* enc);
 
 /*******************************************************************************
  * B-4 M3: Solid/solid reinjection batch state machine
@@ -182,7 +191,8 @@ resolve_reinjection_from_hits
    float* out_dst,
    struct s3d_hit* out_hit);
 
-/* Process 4-ray results for solid/solid reinjection */
+/* Process 4-ray results for solid/solid reinjection.
+ * P1: enc_query fields moved to pool->enc_arr[slot_idx]. */
 extern LOCAL_SYM res_T
 step_bnd_ss_reinject_process
   (struct path_state* p,
@@ -190,11 +200,14 @@ step_bnd_ss_reinject_process
    const struct s3d_hit* hit_frt0,
    const struct s3d_hit* hit_frt1,
    const struct s3d_hit* hit_bck0,
-   const struct s3d_hit* hit_bck1);
+   const struct s3d_hit* hit_bck1,
+   struct path_enc_data* enc);
 
-/* ENC query result for reinjection verification */
+/* ENC query result for reinjection verification.
+ * P1: enc_query fields moved to pool->enc_arr[slot_idx]. */
 extern LOCAL_SYM res_T
-step_bnd_ss_reinject_enc_result(struct path_state* p, struct sdis_scene* scn);
+step_bnd_ss_reinject_enc_result(struct path_state* p, struct sdis_scene* scn,
+                               struct path_enc_data* enc);
 
 /* Probability choice + solid_reinjection */
 extern LOCAL_SYM res_T
@@ -212,21 +225,27 @@ setup_sf_reinject_rays(struct path_state* p);
 extern LOCAL_SYM res_T
 step_bnd_sf_reinject_sample(struct path_state* p, struct sdis_scene* scn);
 
-/* Process 2-ray results for solid/fluid reinjection */
+/* Process 2-ray results for solid/fluid reinjection.
+ * P1: may call step_enc_query_emit, needs enc. */
 extern LOCAL_SYM res_T
 step_bnd_sf_reinject_process
   (struct path_state* p,
    struct sdis_scene* scn,
    const struct s3d_hit* hit0,
-   const struct s3d_hit* hit1);
+   const struct s3d_hit* hit1,
+   struct path_enc_data* enc);
 
-/* PATH_BND_SF_REINJECT_ENC: ENC query result for reinjection verification */
+/* PATH_BND_SF_REINJECT_ENC: ENC query result for reinjection verification.
+ * P1: enc_query fields moved to pool->enc_arr[slot_idx]. */
 extern LOCAL_SYM res_T
-step_bnd_sf_reinject_enc_result(struct path_state* p, struct sdis_scene* scn);
+step_bnd_sf_reinject_enc_result(struct path_state* p, struct sdis_scene* scn,
+                               struct path_enc_data* enc);
 
-/* PATH_BND_SF_PROB_DISPATCH: compute probabilities + null-collision dispatch */
+/* PATH_BND_SF_PROB_DISPATCH: compute probabilities + null-collision dispatch.
+ * P1: ext_flux fields moved to pool->ext_arr[slot_idx]. */
 extern LOCAL_SYM res_T
-step_bnd_sf_prob_dispatch(struct path_state* p, struct sdis_scene* scn);
+step_bnd_sf_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
+                         struct path_ext_data* ext);
 
 /* PATH_BND_SF_NULLCOLL_RAD_TRACE: process radiative trace hit in sub-path */
 extern LOCAL_SYM res_T
@@ -245,9 +264,11 @@ step_bnd_sf_nullcoll_decide(struct path_state* p, struct sdis_scene* scn);
 
 /* PATH_BND_SFN_PROB_DISPATCH: picardN null-collision probability dispatch.
  * Reuses bnd_sf reinjection data.  h_hat==0 → first entry (compute coeffs),
- * h_hat>0 → null-collision dispatch (conv/cond/rad). */
+ * h_hat>0 → null-collision dispatch (conv/cond/rad).
+ * P1: sfn_stack fields moved to pool->sfn_arr[slot_idx]. */
 extern LOCAL_SYM res_T
-step_bnd_sfn_prob_dispatch(struct path_state* p, struct sdis_scene* scn);
+step_bnd_sfn_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
+                          struct path_sfn_data* sfn);
 
 /* PATH_BND_SFN_RAD_TRACE: process radiative sub-path trace hit.
  * Functionally identical to step_bnd_sf_nullcoll_rad_trace but transitions
@@ -258,41 +279,55 @@ step_bnd_sfn_rad_trace(struct path_state* p, struct sdis_scene* scn,
 
 /* PATH_BND_SFN_RAD_DONE: radiative sub-path completed.
  * Saves rwalk_s/T_s, computes initial h_radi_min check, then starts the
- * COMPUTE_TEMPERATURE chain or early-accepts. */
+ * COMPUTE_TEMPERATURE chain or early-accepts.
+ * P1: sfn_stack fields moved to pool->sfn_arr[slot_idx]. */
 extern LOCAL_SYM res_T
-step_bnd_sfn_rad_done(struct path_state* p, struct sdis_scene* scn);
+step_bnd_sfn_rad_done(struct path_state* p, struct sdis_scene* scn,
+                      struct path_sfn_data* sfn);
 
 /* PATH_BND_SFN_COMPUTE_Ti: compute i-th temperature sample.
- * If T.done → use value directly, else push stack and start sub-path. */
+ * If T.done → use value directly, else push stack and start sub-path.
+ * P1: sfn_stack fields moved to pool->sfn_arr[slot_idx]. */
 extern LOCAL_SYM res_T
-step_bnd_sfn_compute_Ti(struct path_state* p, struct sdis_scene* scn);
+step_bnd_sfn_compute_Ti(struct path_state* p, struct sdis_scene* scn,
+                        struct path_sfn_data* sfn);
 
-/* PATH_BND_SFN_COMPUTE_Ti_RESUME: sub-path returned, pop stack frame. */
+/* PATH_BND_SFN_COMPUTE_Ti_RESUME: sub-path returned, pop stack frame.
+ * P1: sfn_stack fields moved to pool->sfn_arr[slot_idx]. */
 extern LOCAL_SYM res_T
-step_bnd_sfn_compute_Ti_resume(struct path_state* p, struct sdis_scene* scn);
+step_bnd_sfn_compute_Ti_resume(struct path_state* p, struct sdis_scene* scn,
+                               struct path_sfn_data* sfn);
 
-/* PATH_BND_SFN_CHECK_PMIN_PMAX: early accept/reject based on h_radi bounds. */
+/* PATH_BND_SFN_CHECK_PMIN_PMAX: early accept/reject based on h_radi bounds.
+ * P1: sfn_stack fields moved to pool->sfn_arr[slot_idx]. */
 extern LOCAL_SYM res_T
-step_bnd_sfn_check_pmin_pmax(struct path_state* p, struct sdis_scene* scn);
+step_bnd_sfn_check_pmin_pmax(struct path_state* p, struct sdis_scene* scn,
+                             struct path_sfn_data* sfn);
 
 /*******************************************************************************
  * B-4 M4: Delta-sphere conductive fine-grained state machine
  ******************************************************************************/
 
 /* PATH_CND_DS_CHECK_TEMP: finalize init (once) + check known temp + emit DS
- * rays -> PATH_CND_DS_STEP_TRACE */
+ * rays -> PATH_CND_DS_STEP_TRACE.
+ * P1: enc_query fields moved to pool->enc_arr[slot_idx]. */
 extern LOCAL_SYM res_T
-step_cnd_ds_check_temp(struct path_state* p, struct sdis_scene* scn);
+step_cnd_ds_check_temp(struct path_state* p, struct sdis_scene* scn,
+                       struct path_enc_data* enc);
 
 /* PATH_CND_DS_STEP_ENC_VERIFY: set up enc_locate for enclosure verify at
- * pos_next.  Calls step_enc_locate_submit -> PATH_ENC_LOCATE_PENDING. */
+ * pos_next.  Calls step_enc_query_emit -> PATH_ENC_QUERY_EMIT.
+ * P1: enc_query fields moved to pool->enc_arr[slot_idx]. */
 extern LOCAL_SYM void
-step_cnd_ds_step_enc_verify(struct path_state* p);
+step_cnd_ds_step_enc_verify(struct path_state* p,
+                            struct path_enc_data* enc);
 
 /* PATH_CND_DS_STEP_ADVANCE: check enc result + volumic power + time rewind +
  * position update + loop condition check */
+/* P1: enc_query fields moved to pool->enc_arr[slot_idx]. */
 extern LOCAL_SYM res_T
-step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn);
+step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn,
+                         struct path_enc_data* enc);
 
 /*******************************************************************************
  * B-4 M9: Walk on Spheres (WoS) conductive path state machine
@@ -356,29 +391,39 @@ step_cnd_wos_time_travel(struct path_state* p, struct sdis_scene* scn);
  * B-4 M7: External net flux batch state machine
  ******************************************************************************/
 
-/* PATH_BND_EXT_CHECK: check if external flux is needed, set up shared state */
+/* PATH_BND_EXT_CHECK: check if external flux is needed, set up shared state.
+ * P1: ext_flux fields moved to pool->ext_arr[slot_idx]. */
 extern LOCAL_SYM res_T
-step_bnd_ext_check(struct path_state* p, struct sdis_scene* scn);
+step_bnd_ext_check(struct path_state* p, struct sdis_scene* scn,
+                   struct path_ext_data* ext);
 
-/* PATH_BND_EXT_DIRECT_TRACE: process shadow ray result (direct contribution) */
+/* PATH_BND_EXT_DIRECT_TRACE: process shadow ray result (direct contribution).
+ * P1: ext_flux fields moved to pool->ext_arr[slot_idx]. */
 extern LOCAL_SYM res_T
 step_bnd_ext_direct_result(struct path_state* p, struct sdis_scene* scn,
-                           const struct s3d_hit* hit);
+                           const struct s3d_hit* hit,
+                           struct path_ext_data* ext);
 
-/* PATH_BND_EXT_DIFFUSE_RESULT: process diffuse bounce ray result */
+/* PATH_BND_EXT_DIFFUSE_RESULT: process diffuse bounce ray result.
+ * P1: ext_flux fields moved to pool->ext_arr[slot_idx]. */
 extern LOCAL_SYM res_T
 step_bnd_ext_diffuse_result(struct path_state* p, struct sdis_scene* scn,
-                            const struct s3d_hit* hit);
+                            const struct s3d_hit* hit,
+                            struct path_ext_data* ext);
 
-/* PATH_BND_EXT_DIFFUSE_SHADOW_RESULT: process bounce shadow ray result */
+/* PATH_BND_EXT_DIFFUSE_SHADOW_RESULT: process bounce shadow ray result.
+ * P1: ext_flux fields moved to pool->ext_arr[slot_idx]. */
 extern LOCAL_SYM res_T
 step_bnd_ext_diffuse_shadow_result(struct path_state* p,
                                    struct sdis_scene* scn,
-                                   const struct s3d_hit* hit);
+                                   const struct s3d_hit* hit,
+                                   struct path_ext_data* ext);
 
-/* PATH_BND_EXT_FINALIZE: sum flux contributions, apply to T, return to caller */
+/* PATH_BND_EXT_FINALIZE: sum flux contributions, apply to T, return to caller.
+ * P1: ext_flux fields moved to pool->ext_arr[slot_idx]. */
 extern LOCAL_SYM res_T
-step_bnd_ext_finalize(struct path_state* p, struct sdis_scene* scn);
+step_bnd_ext_finalize(struct path_state* p, struct sdis_scene* scn,
+                      struct path_ext_data* ext);
 
 /*******************************************************************************
  * B-4 M6: Convective path + boundary dispatch + Robin post-check
@@ -412,7 +457,8 @@ step_bnd_post_robin_check(struct path_state* p, struct sdis_scene* scn);
 /* Advance without ray.  Returns *advanced=1 if the path was advanced. */
 extern LOCAL_SYM res_T
 advance_one_step_no_ray
-  (struct path_state* p, struct sdis_scene* scn, int* advanced);
+  (struct path_state* p, struct sdis_scene* scn, int* advanced,
+   struct wavefront_pool* pool, size_t slot_idx);
 
 /* Advance after receiving ray trace result(s) */
 extern LOCAL_SYM res_T
@@ -420,6 +466,7 @@ advance_one_step_with_ray
   (struct path_state* p,
    struct sdis_scene* scn,
    const struct s3d_hit* hit0,
-   const struct s3d_hit* hit1);
+   const struct s3d_hit* hit1,
+   struct wavefront_pool* pool, size_t slot_idx);
 
 #endif /* SDIS_WF_STEPS_H */

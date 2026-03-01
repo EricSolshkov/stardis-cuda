@@ -66,11 +66,15 @@ setup_test_pool(struct wavefront_pool* pool, size_t pool_size)
   pool->done_indices     = (uint32_t*)malloc(pool_size * sizeof(uint32_t));
   pool->bucket_radiative  = (uint32_t*)malloc(pool_size * sizeof(uint32_t));
   pool->bucket_conductive = (uint32_t*)malloc(pool_size * sizeof(uint32_t));
+
+  /* P1 SoA mirror — collect reads from dsoa */
+  dispatch_soa_alloc(&pool->dsoa, pool_size);
 }
 
 static void
 teardown_test_pool(struct wavefront_pool* pool)
 {
+  dispatch_soa_free(&pool->dsoa);
   free(pool->slots);
   free(pool->ray_requests);
   free(pool->ray_to_slot);
@@ -82,6 +86,15 @@ teardown_test_pool(struct wavefront_pool* pool)
   free(pool->bucket_radiative);
   free(pool->bucket_conductive);
   memset(pool, 0, sizeof(*pool));
+}
+
+/* P1 SoA helper: sync all configured slots into dsoa arrays before collect */
+static void
+sync_test_dsoa(struct wavefront_pool* pool)
+{
+  size_t i;
+  for(i = 0; i < pool->pool_size; i++)
+    dispatch_soa_sync_from_path(&pool->dsoa, (uint32_t)i, &pool->slots[i]);
 }
 
 /* Test-only: lightweight pool_view setup (no GPU batch contexts) */
@@ -250,6 +263,9 @@ test_bucket_counts(void)
   }
   CHK(pv->need_ray_count == 30);
 
+  /* Sync SoA before collect (P1) */
+  sync_test_dsoa(&pool);
+
   /* Run bucketed collect */
   pool_collect_ray_requests_bucketed(&pool, pv);
 
@@ -299,6 +315,7 @@ test_bucket_offset_continuity(void)
       pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
   }
 
+  sync_test_dsoa(&pool);
   pool_collect_ray_requests_bucketed(&pool, pv);
 
   /* Monotonically non-decreasing */
@@ -351,6 +368,7 @@ test_ray_to_slot_mapping(void)
       pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
   }
 
+  sync_test_dsoa(&pool);
   pool_collect_ray_requests_bucketed(&pool, pv);
 
   /* Every ray must map to a valid slot */
@@ -397,6 +415,7 @@ test_batch_idx_roundtrip(void)
       pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
   }
 
+  sync_test_dsoa(&pool);
   pool_collect_ray_requests_bucketed(&pool, pv);
 
   /* For every path, verify batch_idx roundtrips */
@@ -454,6 +473,7 @@ test_bucket_contiguity(void)
       pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
   }
 
+  sync_test_dsoa(&pool);
   pool_collect_ray_requests_bucketed(&pool, pv);
 
   /* Verify contiguity: rays in each bucket range belong to that bucket type */
@@ -509,6 +529,7 @@ test_all_bucket_types(void)
   }
   CHK(pv->need_ray_count == 40);
 
+  sync_test_dsoa(&pool);
   pool_collect_ray_requests_bucketed(&pool, pv);
 
   /* RAD=10, DS=20, SHADOW=10, STARTUP=10 = 50 total */
@@ -554,6 +575,7 @@ test_empty_pool(void)
   pv = &pool.views[0];
   pv->need_ray_count = 0;
 
+  sync_test_dsoa(&pool);
   pool_collect_ray_requests_bucketed(&pool, pv);
 
   CHK(pv->ray_count == 0);
@@ -591,6 +613,7 @@ test_single_bucket_only(void)
   for(i = 0; i < pool_size; i++)
     pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
 
+  sync_test_dsoa(&pool);
   pool_collect_ray_requests_bucketed(&pool, pv);
 
   CHK(pv->bucket_counts[RAY_BUCKET_RADIATIVE] == 100);
@@ -641,6 +664,7 @@ test_diagnostic_stats(void)
   pool.rays_shadow = 0;
   pool.rays_startup = 0;
 
+  sync_test_dsoa(&pool);
   pool_collect_ray_requests_bucketed(&pool, pv);
 
   CHK(pool.rays_radiative == 20);

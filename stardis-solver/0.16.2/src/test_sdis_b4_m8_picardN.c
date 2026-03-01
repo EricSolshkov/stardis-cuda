@@ -353,7 +353,7 @@ init_path_on_sf_boundary(struct path_state* p, size_t picard_order)
   p->T.func = boundary_path_3d;
 
   p->coupled_nbranchings = 0;
-  p->sfn_stack_depth = 0;
+  /* sfn_stack_depth moved to path_sfn_data; caller zeroes via memset(&sfn,0) */
 
   p->filter_data_storage = HIT_FILTER_DATA_NULL;
 }
@@ -365,6 +365,7 @@ static void
 test_sfn_stack_depth_management(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn;
 
   printf("  T8.1: Stack depth management... ");
 
@@ -373,30 +374,31 @@ test_sfn_stack_depth_management(void)
 
   /* Initialise path at sfn_stack_depth = 0 */
   memset(&p, 0, sizeof(p));
-  p.sfn_stack_depth = 0;
-  CHK(p.sfn_stack_depth >= 0);
-  CHK(p.sfn_stack_depth < MAX_PICARD_DEPTH);
+  memset(&sfn, 0, sizeof(sfn));
+  sfn.depth = 0;
+  CHK(sfn.depth >= 0);
+  CHK(sfn.depth < MAX_PICARD_DEPTH);
 
   /* Simulate push */
-  p.sfn_stack_depth++;
-  CHK(p.sfn_stack_depth == 1);
-  CHK(p.sfn_stack_depth >= 0 && p.sfn_stack_depth < MAX_PICARD_DEPTH);
+  sfn.depth++;
+  CHK(sfn.depth == 1);
+  CHK(sfn.depth >= 0 && sfn.depth < MAX_PICARD_DEPTH);
 
   /* Simulate push again */
-  p.sfn_stack_depth++;
-  CHK(p.sfn_stack_depth == 2);
-  CHK(p.sfn_stack_depth >= 0 && p.sfn_stack_depth < MAX_PICARD_DEPTH);
+  sfn.depth++;
+  CHK(sfn.depth == 2);
+  CHK(sfn.depth >= 0 && sfn.depth < MAX_PICARD_DEPTH);
 
   /* Cannot push further (depth + 1 >= MAX_PICARD_DEPTH) */
-  CHK(p.sfn_stack_depth + 1 >= MAX_PICARD_DEPTH);
+  CHK(sfn.depth + 1 >= MAX_PICARD_DEPTH);
 
   /* Pop */
-  p.sfn_stack_depth--;
-  CHK(p.sfn_stack_depth == 1);
+  sfn.depth--;
+  CHK(sfn.depth == 1);
 
   /* Pop again */
-  p.sfn_stack_depth--;
-  CHK(p.sfn_stack_depth == 0);
+  sfn.depth--;
+  CHK(sfn.depth == 0);
 
   printf("PASS\n");
 }
@@ -408,6 +410,7 @@ static void
 test_sfn_stack_overflow(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn;
 
   printf("  T8.2: Stack overflow protection... ");
 
@@ -424,16 +427,16 @@ test_sfn_stack_overflow(void)
   init_path_on_sf_boundary(&p, 2);
 
   /* Depth 0: push is OK (0 + 1 = 1 < 3) */
-  p.sfn_stack_depth = 0;
-  CHK(!(p.sfn_stack_depth + 1 >= MAX_PICARD_DEPTH));
+  sfn.depth = 0;
+  CHK(!(sfn.depth + 1 >= MAX_PICARD_DEPTH));
 
   /* Depth 1: push is OK (1 + 1 = 2 < 3) */
-  p.sfn_stack_depth = 1;
-  CHK(!(p.sfn_stack_depth + 1 >= MAX_PICARD_DEPTH));
+  sfn.depth = 1;
+  CHK(!(sfn.depth + 1 >= MAX_PICARD_DEPTH));
 
   /* Depth 2: push overflows (2 + 1 = 3 >= 3) */
-  p.sfn_stack_depth = MAX_PICARD_DEPTH - 1;
-  CHK(  p.sfn_stack_depth + 1 >= MAX_PICARD_DEPTH);
+  sfn.depth = MAX_PICARD_DEPTH - 1;
+  CHK(  sfn.depth + 1 >= MAX_PICARD_DEPTH);
 
   /* Depth MAX-1 is the last valid index into sfn_stack[] */
   CHK(MAX_PICARD_DEPTH - 1 >= 0);
@@ -444,12 +447,12 @@ test_sfn_stack_overflow(void)
   {
     res_T res;
     p.phase = PATH_BND_SFN_COMPUTE_Ti;
-    p.sfn_stack_depth = MAX_PICARD_DEPTH - 1;
+    sfn.depth = MAX_PICARD_DEPTH - 1;
     p.locals.bnd_sf.is_picardn = 1;
     p.locals.bnd_sf.h_hat = 100.0;
-    p.sfn_stack[p.sfn_stack_depth].T_count = 0;
-    p.sfn_stack[p.sfn_stack_depth].rwalk_saved = p.rwalk;
-    p.sfn_stack[p.sfn_stack_depth].T_saved = p.T;
+    sfn.stack[sfn.depth].T_count = 0;
+    sfn.stack[sfn.depth].rwalk_saved = p.rwalk;
+    sfn.stack[sfn.depth].T_saved = p.T;
 
     /* Make T_s done so the fast path is taken (no overflow) */
     p.locals.bnd_sf.rwalk_s = p.rwalk;
@@ -457,14 +460,14 @@ test_sfn_stack_overflow(void)
     p.locals.bnd_sf.T_s.done = 1;
     p.locals.bnd_sf.T_s.value = 350.0;
 
-    res = step_bnd_sfn_compute_Ti(&p, g_scn_sfn);
+    res = step_bnd_sfn_compute_Ti(&p, g_scn_sfn, &sfn);
     CHK(res == RES_OK);
     /* T value should have been stored without push */
-    CHK(p.sfn_stack[MAX_PICARD_DEPTH - 1].T_values[0] == 350.0);
-    CHK(p.sfn_stack[MAX_PICARD_DEPTH - 1].T_count == 1);
+    CHK(sfn.stack[MAX_PICARD_DEPTH - 1].T_values[0] == 350.0);
+    CHK(sfn.stack[MAX_PICARD_DEPTH - 1].T_count == 1);
     CHK(p.phase == PATH_BND_SFN_CHECK_PMIN_PMAX);
     /* Depth unchanged — no push */
-    CHK(p.sfn_stack_depth == MAX_PICARD_DEPTH - 1);
+    CHK(sfn.depth == MAX_PICARD_DEPTH - 1);
   }
 
   printf("PASS\n");
@@ -477,6 +480,7 @@ static void
 test_sfn_compute_Ti_push(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn;
   struct rwalk saved_rwalk;
   res_T res;
 
@@ -485,13 +489,13 @@ test_sfn_compute_Ti_push(void)
   init_path_on_sf_boundary(&p, 2);
 
   p.phase = PATH_BND_SFN_COMPUTE_Ti;
-  p.sfn_stack_depth = 0;
+  sfn.depth = 0;
   p.locals.bnd_sf.is_picardn = 1;
 
   /* Set up sfn_stack frame */
-  p.sfn_stack[0].T_count = 0;      /* i = 0 → T0 */
-  p.sfn_stack[0].rwalk_saved = p.rwalk;
-  p.sfn_stack[0].T_saved = p.T;
+  sfn.stack[0].T_count = 0;      /* i = 0 → T0 */
+  sfn.stack[0].rwalk_saved = p.rwalk;
+  sfn.stack[0].T_saved = p.T;
 
   /* rwalk_s for T0 (i < 3 → sample from rwalk_s) */
   p.locals.bnd_sf.rwalk_s = p.rwalk;
@@ -502,11 +506,11 @@ test_sfn_compute_Ti_push(void)
   saved_rwalk = p.rwalk;
 
   /* Call step_bnd_sfn_compute_Ti */
-  res = step_bnd_sfn_compute_Ti(&p, g_scn_sfn);
+  res = step_bnd_sfn_compute_Ti(&p, g_scn_sfn, &sfn);
   CHK(res == RES_OK);
 
   /* Should have pushed stack: depth increased */
-  CHK(p.sfn_stack_depth == 1);
+  CHK(sfn.depth == 1);
 
   /* Should enter COUPLED_BOUNDARY for the sub-path */
   CHK(p.phase == PATH_COUPLED_BOUNDARY);
@@ -524,18 +528,20 @@ static void
 test_sfn_subpath_done_intercept(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn;
 
   printf("  T8.4: Sub-path completion pop... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&sfn, 0, sizeof(sfn));
   p.active = 1;
   p.phase = PATH_DONE;
-  p.sfn_stack_depth = 1; /* sub-path finished, parent still active */
+  sfn.depth = 1; /* sub-path finished, parent still active */
 
   /* Simulate the interception logic from pool_cascade:
    * if (p->phase == PATH_DONE && p->sfn_stack_depth > 0) →
    *   p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME */
-  if(p.phase == PATH_DONE && p.sfn_stack_depth > 0) {
+  if(p.phase == PATH_DONE && sfn.depth > 0) {
     p.phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
     p.active = 1;
   }
@@ -553,6 +559,7 @@ static void
 test_sfn_check_pmin_pmax_early_accept(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn;
   res_T res;
 
   printf("  T8.5: CHECK_PMIN_PMAX early accept... ");
@@ -560,17 +567,17 @@ test_sfn_check_pmin_pmax_early_accept(void)
   init_path_on_sf_boundary(&p, 2);
 
   p.phase = PATH_BND_SFN_CHECK_PMIN_PMAX;
-  p.sfn_stack_depth = 0;
+  sfn.depth = 0;
   p.locals.bnd_sf.is_picardn = 1;
   p.locals.bnd_sf.epsilon = 0.9;
 
   /* Set up probabilities so that r < p_conv + p_cond + p_radi_min */
-  p.sfn_stack[0].p_conv = 0.1;
-  p.sfn_stack[0].p_cond = 0.1;
-  p.sfn_stack[0].h_hat = 100.0;
-  p.sfn_stack[0].r = 0.15;  /* small r, will be < p_conv+p_cond+p_radi_min */
-  p.sfn_stack[0].T_count = 1;
-  p.sfn_stack[0].T_values[0] = 300.0; /* T0 */
+  sfn.stack[0].p_conv = 0.1;
+  sfn.stack[0].p_cond = 0.1;
+  sfn.stack[0].h_hat = 100.0;
+  sfn.stack[0].r = 0.15;  /* small r, will be < p_conv+p_cond+p_radi_min */
+  sfn.stack[0].T_count = 1;
+  sfn.stack[0].T_values[0] = 300.0; /* T0 */
 
   /* Set up rwalk_s/T_s for sfn_switch_in_radiative */
   p.locals.bnd_sf.rwalk_s = p.rwalk;
@@ -583,13 +590,13 @@ test_sfn_check_pmin_pmax_early_accept(void)
     double h_radi_min = BOLTZMANN_CONSTANT *
       (p.ctx.Tmin3 + 3.0 * p.ctx.Tmin2 * 300.0);
     double p_radi_min = h_radi_min * p.locals.bnd_sf.epsilon
-                      / p.sfn_stack[0].h_hat;
+                      / sfn.stack[0].h_hat;
     /* Ensure r falls in accept range */
-    p.sfn_stack[0].r = p.sfn_stack[0].p_conv + p.sfn_stack[0].p_cond
+    sfn.stack[0].r = sfn.stack[0].p_conv + sfn.stack[0].p_cond
                      + p_radi_min * 0.5; /* below threshold */
   }
 
-  res = step_bnd_sfn_check_pmin_pmax(&p, g_scn_sfn);
+  res = step_bnd_sfn_check_pmin_pmax(&p, g_scn_sfn, &sfn);
   CHK(res == RES_OK);
 
   /* Early accept → sfn_switch_in_radiative → PATH_BND_POST_ROBIN_CHECK */
@@ -605,6 +612,7 @@ static void
 test_sfn_check_pmin_pmax_early_reject(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn;
   res_T res;
 
   printf("  T8.6: CHECK_PMIN_PMAX early reject... ");
@@ -612,18 +620,18 @@ test_sfn_check_pmin_pmax_early_reject(void)
   init_path_on_sf_boundary(&p, 2);
 
   p.phase = PATH_BND_SFN_CHECK_PMIN_PMAX;
-  p.sfn_stack_depth = 0;
+  sfn.depth = 0;
   p.locals.bnd_sf.is_picardn = 1;
   p.locals.bnd_sf.epsilon = 0.9;
   p.locals.bnd_sf.h_hat = 100.0;
 
   /* Set up for reject: r > p_conv + p_cond + p_radi_max, with i < 6 */
-  p.sfn_stack[0].h_hat = 100.0;
-  p.sfn_stack[0].p_conv = 0.05;
-  p.sfn_stack[0].p_cond = 0.05;
-  p.sfn_stack[0].r = 0.99;  /* very high r → beyond p_radi_max */
-  p.sfn_stack[0].T_count = 1;
-  p.sfn_stack[0].T_values[0] = 300.0;
+  sfn.stack[0].h_hat = 100.0;
+  sfn.stack[0].p_conv = 0.05;
+  sfn.stack[0].p_cond = 0.05;
+  sfn.stack[0].r = 0.99;  /* very high r → beyond p_radi_max */
+  sfn.stack[0].T_count = 1;
+  sfn.stack[0].T_values[0] = 300.0;
 
   /* Save snapshot for null_collision restore */
   p.locals.bnd_sf.rwalk_snapshot = p.rwalk;
@@ -632,7 +640,7 @@ test_sfn_check_pmin_pmax_early_reject(void)
   p.locals.bnd_sf.ihvtx_radi_begin = 0;
   p.locals.bnd_sf.ihvtx_radi_end = 0;
 
-  res = step_bnd_sfn_check_pmin_pmax(&p, g_scn_sfn);
+  res = step_bnd_sfn_check_pmin_pmax(&p, g_scn_sfn, &sfn);
   CHK(res == RES_OK);
 
   /* Early reject → sfn_null_collision → PATH_BND_SFN_PROB_DISPATCH */
@@ -648,74 +656,76 @@ static void
 test_sfn_multilayer_stack_frames(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn;
 
   printf("  T8.7: Multi-layer recursion (stack frame independence)... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&sfn, 0, sizeof(sfn));
 
   /* Set up 3 independent stack frames and verify they don't interfere */
-  p.sfn_stack[0].T_count = 2;
-  p.sfn_stack[0].T_values[0] = 300.0;
-  p.sfn_stack[0].T_values[1] = 310.0;
-  p.sfn_stack[0].rwalk_saved.vtx.P[0] = 1.0;
-  p.sfn_stack[0].rwalk_saved.vtx.P[1] = 2.0;
-  p.sfn_stack[0].rwalk_saved.vtx.P[2] = 3.0;
-  p.sfn_stack[0].h_hat = 100.0;
-  p.sfn_stack[0].r = 0.5;
-  p.sfn_stack[0].p_conv = 0.1;
-  p.sfn_stack[0].p_cond = 0.3;
+  sfn.stack[0].T_count = 2;
+  sfn.stack[0].T_values[0] = 300.0;
+  sfn.stack[0].T_values[1] = 310.0;
+  sfn.stack[0].rwalk_saved.vtx.P[0] = 1.0;
+  sfn.stack[0].rwalk_saved.vtx.P[1] = 2.0;
+  sfn.stack[0].rwalk_saved.vtx.P[2] = 3.0;
+  sfn.stack[0].h_hat = 100.0;
+  sfn.stack[0].r = 0.5;
+  sfn.stack[0].p_conv = 0.1;
+  sfn.stack[0].p_cond = 0.3;
 
-  p.sfn_stack[1].T_count = 1;
-  p.sfn_stack[1].T_values[0] = 320.0;
-  p.sfn_stack[1].rwalk_saved.vtx.P[0] = 4.0;
-  p.sfn_stack[1].rwalk_saved.vtx.P[1] = 5.0;
-  p.sfn_stack[1].rwalk_saved.vtx.P[2] = 6.0;
-  p.sfn_stack[1].h_hat = 200.0;
-  p.sfn_stack[1].r = 0.7;
-  p.sfn_stack[1].p_conv = 0.2;
-  p.sfn_stack[1].p_cond = 0.2;
+  sfn.stack[1].T_count = 1;
+  sfn.stack[1].T_values[0] = 320.0;
+  sfn.stack[1].rwalk_saved.vtx.P[0] = 4.0;
+  sfn.stack[1].rwalk_saved.vtx.P[1] = 5.0;
+  sfn.stack[1].rwalk_saved.vtx.P[2] = 6.0;
+  sfn.stack[1].h_hat = 200.0;
+  sfn.stack[1].r = 0.7;
+  sfn.stack[1].p_conv = 0.2;
+  sfn.stack[1].p_cond = 0.2;
 
-  p.sfn_stack[2].T_count = 0;
-  p.sfn_stack[2].rwalk_saved.vtx.P[0] = 7.0;
-  p.sfn_stack[2].rwalk_saved.vtx.P[1] = 8.0;
-  p.sfn_stack[2].rwalk_saved.vtx.P[2] = 9.0;
-  p.sfn_stack[2].h_hat = 300.0;
+  sfn.stack[2].T_count = 0;
+  sfn.stack[2].rwalk_saved.vtx.P[0] = 7.0;
+  sfn.stack[2].rwalk_saved.vtx.P[1] = 8.0;
+  sfn.stack[2].rwalk_saved.vtx.P[2] = 9.0;
+  sfn.stack[2].h_hat = 300.0;
 
   /* Verify each frame is independent */
-  CHK(p.sfn_stack[0].T_count == 2);
-  CHK(p.sfn_stack[1].T_count == 1);
-  CHK(p.sfn_stack[2].T_count == 0);
+  CHK(sfn.stack[0].T_count == 2);
+  CHK(sfn.stack[1].T_count == 1);
+  CHK(sfn.stack[2].T_count == 0);
 
-  CHK(fabs(p.sfn_stack[0].T_values[0] - 300.0) < 1e-10);
-  CHK(fabs(p.sfn_stack[0].T_values[1] - 310.0) < 1e-10);
-  CHK(fabs(p.sfn_stack[1].T_values[0] - 320.0) < 1e-10);
+  CHK(fabs(sfn.stack[0].T_values[0] - 300.0) < 1e-10);
+  CHK(fabs(sfn.stack[0].T_values[1] - 310.0) < 1e-10);
+  CHK(fabs(sfn.stack[1].T_values[0] - 320.0) < 1e-10);
 
-  CHK(fabs(p.sfn_stack[0].rwalk_saved.vtx.P[0] - 1.0) < 1e-10);
-  CHK(fabs(p.sfn_stack[1].rwalk_saved.vtx.P[0] - 4.0) < 1e-10);
-  CHK(fabs(p.sfn_stack[2].rwalk_saved.vtx.P[0] - 7.0) < 1e-10);
+  CHK(fabs(sfn.stack[0].rwalk_saved.vtx.P[0] - 1.0) < 1e-10);
+  CHK(fabs(sfn.stack[1].rwalk_saved.vtx.P[0] - 4.0) < 1e-10);
+  CHK(fabs(sfn.stack[2].rwalk_saved.vtx.P[0] - 7.0) < 1e-10);
 
-  CHK(fabs(p.sfn_stack[0].h_hat - 100.0) < 1e-10);
-  CHK(fabs(p.sfn_stack[1].h_hat - 200.0) < 1e-10);
-  CHK(fabs(p.sfn_stack[2].h_hat - 300.0) < 1e-10);
+  CHK(fabs(sfn.stack[0].h_hat - 100.0) < 1e-10);
+  CHK(fabs(sfn.stack[1].h_hat - 200.0) < 1e-10);
+  CHK(fabs(sfn.stack[2].h_hat - 300.0) < 1e-10);
 
   /* Simulate push/pop cycle: write to frame 2, then verify frame 0/1
    * are still intact */
-  p.sfn_stack_depth = 2;
-  p.sfn_stack[2].T_values[0] = 999.0;
-  p.sfn_stack[2].T_count = 1;
+  sfn.depth = 2;
+  sfn.stack[2].T_values[0] = 999.0;
+  sfn.stack[2].T_count = 1;
 
   /* Pop: verify frame 1 is intact */
-  p.sfn_stack_depth = 1;
-  CHK(p.sfn_stack[1].T_count == 1);
-  CHK(fabs(p.sfn_stack[1].T_values[0] - 320.0) < 1e-10);
-  CHK(fabs(p.sfn_stack[1].h_hat - 200.0) < 1e-10);
+  sfn.depth = 1;
+  CHK(sfn.stack[1].T_count == 1);
+  CHK(fabs(sfn.stack[1].T_values[0] - 320.0) < 1e-10);
+  CHK(fabs(sfn.stack[1].h_hat - 200.0) < 1e-10);
 
   /* Pop: verify frame 0 is intact */
-  p.sfn_stack_depth = 0;
-  CHK(p.sfn_stack[0].T_count == 2);
-  CHK(fabs(p.sfn_stack[0].T_values[0] - 300.0) < 1e-10);
-  CHK(fabs(p.sfn_stack[0].T_values[1] - 310.0) < 1e-10);
-  CHK(fabs(p.sfn_stack[0].h_hat - 100.0) < 1e-10);
+  sfn.depth = 0;
+  CHK(sfn.stack[0].T_count == 2);
+  CHK(fabs(sfn.stack[0].T_values[0] - 300.0) < 1e-10);
+  CHK(fabs(sfn.stack[0].T_values[1] - 310.0) < 1e-10);
+  CHK(fabs(sfn.stack[0].h_hat - 100.0) < 1e-10);
 
   printf("PASS\n");
 }
@@ -727,6 +737,7 @@ static void
 test_sfn_picard1_no_sfn_states(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn;
   res_T res;
 
   printf("  T8.9: PicardN vs Picard1 degenerate... ");
@@ -768,6 +779,7 @@ test_sfn_hradi_bounds_formula(void)
    *
    * h_radi(exact) = sigma * (T3*T4*T5 + T0*T3*T4 + T0*T1*T3 + T0*T1*T2) */
   struct path_state p;
+  struct path_sfn_data sfn;
   double T0 = 300.0, T1 = 310.0, T2 = 320.0;
   double T3 = 330.0, T4 = 340.0, T5 = 350.0;
   double h_radi_exact;
@@ -788,24 +800,24 @@ test_sfn_hradi_bounds_formula(void)
   /* Set up path at CHECK_PMIN_PMAX with all 6 T values to get exact decision */
   init_path_on_sf_boundary(&p, 2);
   p.phase = PATH_BND_SFN_CHECK_PMIN_PMAX;
-  p.sfn_stack_depth = 0;
+  sfn.depth = 0;
   p.locals.bnd_sf.is_picardn = 1;
   p.locals.bnd_sf.epsilon = epsilon;
   p.locals.bnd_sf.h_hat = h_hat;
 
-  p.sfn_stack[0].h_hat = h_hat;
-  p.sfn_stack[0].p_conv = 0.1;
-  p.sfn_stack[0].p_cond = 0.1;
-  p.sfn_stack[0].T_count = 6;
-  p.sfn_stack[0].T_values[0] = T0;
-  p.sfn_stack[0].T_values[1] = T1;
-  p.sfn_stack[0].T_values[2] = T2;
-  p.sfn_stack[0].T_values[3] = T3;
-  p.sfn_stack[0].T_values[4] = T4;
-  p.sfn_stack[0].T_values[5] = T5;
+  sfn.stack[0].h_hat = h_hat;
+  sfn.stack[0].p_conv = 0.1;
+  sfn.stack[0].p_cond = 0.1;
+  sfn.stack[0].T_count = 6;
+  sfn.stack[0].T_values[0] = T0;
+  sfn.stack[0].T_values[1] = T1;
+  sfn.stack[0].T_values[2] = T2;
+  sfn.stack[0].T_values[3] = T3;
+  sfn.stack[0].T_values[4] = T4;
+  sfn.stack[0].T_values[5] = T5;
 
   /* Set r just below the accept threshold to trigger accept */
-  p.sfn_stack[0].r = 0.1 + 0.1 + p_radi_exact * 0.5;
+  sfn.stack[0].r = 0.1 + 0.1 + p_radi_exact * 0.5;
 
   /* Save snapshot for possible null_collision */
   p.locals.bnd_sf.rwalk_s = p.rwalk;
@@ -818,7 +830,7 @@ test_sfn_hradi_bounds_formula(void)
   p.locals.bnd_sf.ihvtx_radi_end = 0;
 
   {
-    res_T res = step_bnd_sfn_check_pmin_pmax(&p, g_scn_sfn);
+    res_T res = step_bnd_sfn_check_pmin_pmax(&p, g_scn_sfn, &sfn);
     CHK(res == RES_OK);
     /* r < p_conv+p_cond+p_radi → accept (POST_ROBIN_CHECK) */
     CHK(p.phase == PATH_BND_POST_ROBIN_CHECK);
@@ -834,6 +846,7 @@ static void
 test_sfn_rad_done_init_stack(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn;
   res_T res;
 
   printf("  T8.extra: SFN_RAD_DONE initialises stack frame... ");
@@ -841,7 +854,7 @@ test_sfn_rad_done_init_stack(void)
   init_path_on_sf_boundary(&p, 2);
 
   p.phase = PATH_BND_SFN_RAD_DONE;
-  p.sfn_stack_depth = 0;
+  sfn.depth = 0;
   p.locals.bnd_sf.is_picardn = 1;
   p.locals.bnd_sf.h_hat = 100.0;
   p.locals.bnd_sf.epsilon = 0.9;
@@ -855,15 +868,15 @@ test_sfn_rad_done_init_stack(void)
   /* Set a high r to avoid early accept */
   p.locals.bnd_sf.r = 0.99;
 
-  res = step_bnd_sfn_rad_done(&p, g_scn_sfn);
+  res = step_bnd_sfn_rad_done(&p, g_scn_sfn, &sfn);
   CHK(res == RES_OK);
 
   /* Should have moved to COMPUTE_Ti to start Ti chain */
   CHK(p.phase == PATH_BND_SFN_COMPUTE_Ti);
-  CHK(p.sfn_stack_depth == 0);
+  CHK(sfn.depth == 0);
 
   /* Stack frame [0] should be initialised */
-  CHK(p.sfn_stack[0].T_count == 0);
+  CHK(sfn.stack[0].T_count == 0);
 
   printf("PASS\n");
 }
@@ -875,6 +888,7 @@ static void
 test_sfn_compute_Ti_done_direct(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn;
   res_T res;
 
   printf("  T8.extra: COMPUTE_Ti with T.done = direct value... ");
@@ -882,27 +896,27 @@ test_sfn_compute_Ti_done_direct(void)
   init_path_on_sf_boundary(&p, 2);
 
   p.phase = PATH_BND_SFN_COMPUTE_Ti;
-  p.sfn_stack_depth = 0;
+  sfn.depth = 0;
   p.locals.bnd_sf.is_picardn = 1;
 
   /* Stack frame: i=0 */
-  p.sfn_stack[0].T_count = 0;
-  p.sfn_stack[0].rwalk_saved = p.rwalk;
-  p.sfn_stack[0].T_saved = p.T;
+  sfn.stack[0].T_count = 0;
+  sfn.stack[0].rwalk_saved = p.rwalk;
+  sfn.stack[0].T_saved = p.T;
 
   /* rwalk_s has T_s.done = 1 → use directly */
   p.locals.bnd_sf.rwalk_s = p.rwalk;
   p.locals.bnd_sf.T_s.done = 1;
   p.locals.bnd_sf.T_s.value = 350.0;
 
-  res = step_bnd_sfn_compute_Ti(&p, g_scn_sfn);
+  res = step_bnd_sfn_compute_Ti(&p, g_scn_sfn, &sfn);
   CHK(res == RES_OK);
 
   /* T.done → use directly → go to CHECK_PMIN_PMAX without push */
   CHK(p.phase == PATH_BND_SFN_CHECK_PMIN_PMAX);
-  CHK(p.sfn_stack_depth == 0); /* no push */
-  CHK(p.sfn_stack[0].T_count == 1);
-  CHK(fabs(p.sfn_stack[0].T_values[0] - 350.0) < 1e-10);
+  CHK(sfn.depth == 0); /* no push */
+  CHK(sfn.stack[0].T_count == 1);
+  CHK(fabs(sfn.stack[0].T_values[0] - 350.0) < 1e-10);
 
   printf("PASS\n");
 }
@@ -914,6 +928,7 @@ static void
 test_sfn_compute_Ti_resume_pop(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn;
   res_T res;
 
   printf("  T8.extra: COMPUTE_Ti_RESUME pops and records T... ");
@@ -921,28 +936,28 @@ test_sfn_compute_Ti_resume_pop(void)
   init_path_on_sf_boundary(&p, 2);
 
   p.phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
-  p.sfn_stack_depth = 1;
+  sfn.depth = 1;
   p.locals.bnd_sf.is_picardn = 1;
   p.locals.bnd_sf.coupled_nbranchings_saved = 0;
 
   /* Parent frame at depth 0: waiting for T_values[0] */
-  p.sfn_stack[0].T_count = 0;
-  p.sfn_stack[0].rwalk_saved = p.rwalk;
-  p.sfn_stack[0].T_saved = p.T;
+  sfn.stack[0].T_count = 0;
+  sfn.stack[0].rwalk_saved = p.rwalk;
+  sfn.stack[0].T_saved = p.T;
 
   /* Sub-path result: temperature done */
   p.T.done = 1;
   p.T.value = 325.0;
 
-  res = step_bnd_sfn_compute_Ti_resume(&p, g_scn_sfn);
+  res = step_bnd_sfn_compute_Ti_resume(&p, g_scn_sfn, &sfn);
   CHK(res == RES_OK);
 
   /* Stack should have been popped */
-  CHK(p.sfn_stack_depth == 0);
+  CHK(sfn.depth == 0);
 
   /* T_values[0] should now contain the sub-path result */
-  CHK(p.sfn_stack[0].T_count == 1);
-  CHK(fabs(p.sfn_stack[0].T_values[0] - 325.0) < 1e-10);
+  CHK(sfn.stack[0].T_count == 1);
+  CHK(fabs(sfn.stack[0].T_values[0] - 325.0) < 1e-10);
 
   /* Should transition to CHECK_PMIN_PMAX */
   CHK(p.phase == PATH_BND_SFN_CHECK_PMIN_PMAX);
@@ -957,6 +972,7 @@ static void
 test_sfn_dispatch_routes_picardn(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn;
   res_T res;
 
   printf("  T8.extra: BND_DISPATCH routes to picardN... ");

@@ -68,8 +68,16 @@ set(SDIS_SOURCES
     src/sdis_solve.c
     src/sdis_solve_camera.c
     src/sdis_solve_wavefront.c
-    src/sdis_wf_steps.c
+    src/sdis_wf_steps_core.c
+    src/sdis_wf_steps_enc.c
+    src/sdis_wf_steps_cnd.c
+    src/sdis_wf_steps_bnd_ss.c
+    src/sdis_wf_steps_bnd_sf.c
+    src/sdis_wf_steps_bnd_sfn.c
+    src/sdis_wf_steps_bnd_ext.c
+    src/sdis_wf_steps_cnv.c
     src/sdis_solve_persistent_wavefront.c
+    src/sdis_wf_soa.c
     src/sdis_wf_rng_adapter.cpp
     src/sdis_source.c
     src/sdis_tile.c
@@ -328,6 +336,15 @@ if(ENABLE_TESTS)
              COMMAND test_sdis_wavefront_benchmark)
     set_tests_properties(test_sdis_wavefront_benchmark PROPERTIES TIMEOUT 1200)
 
+    # ---- P1 dispatch SoA unit tests ----
+    add_executable(test_sdis_dispatch_soa
+        src/test_sdis_dispatch_soa.c)
+    target_link_libraries(test_sdis_dispatch_soa PRIVATE sdis_obj)
+    add_test(NAME test_sdis_dispatch_soa COMMAND test_sdis_dispatch_soa)
+    set_tests_properties(test_sdis_dispatch_soa PROPERTIES
+        TIMEOUT 60
+        LABELS "wf;p1;soa")
+
     # ---- P0 wavefront numerical correctness tests ----
     # Links sdis_obj (OBJECT lib) for LOCAL_SYM access, same as B-4 tests.
     set(WF_P0_TESTS
@@ -440,6 +457,7 @@ if(ENABLE_TESTS)
         deploy_runtime_dependencies(test_sdis_b4_e2e)
         deploy_runtime_dependencies(test_sdis_b4_integration)
         deploy_runtime_dependencies(test_sdis_wavefront_benchmark)
+        deploy_runtime_dependencies(test_sdis_dispatch_soa)
         foreach(p0test ${WF_P0_TESTS})
             deploy_runtime_dependencies(${p0test})
         endforeach()

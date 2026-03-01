@@ -49,6 +49,7 @@
 
 #include "sdis.h"
 #include "sdis_solve_wavefront.h"  /* path_state, path_phase, ray_request */
+#include "sdis_wf_soa.h"              /* P1: dispatch_soa */
 
 #include <star/s3d.h>
 #include <star/ssp.h>
@@ -222,6 +223,14 @@ struct wavefront_pool {
   size_t                       cp_count;     /* queries this step */
   size_t                       max_cps;      /* pool_size */
 
+  /* --- P1: Dispatch-layer SoA mirror --- */
+  struct dispatch_soa  dsoa;
+
+  /* --- P1: Cold-block SoA arrays (separated from path_state slots) --- */
+  struct path_sfn_data *sfn_arr;     /* [pool_size], PicardN stack        */
+  struct path_enc_data *enc_arr;     /* [pool_size], enclosure query       */
+  struct path_ext_data *ext_arr;     /* [pool_size], external net flux     */
+
   /* --- P2: Unified pool views (2-stream pipeline) --- */
   struct pool_view    views[2];
   int                 num_active_views;   /* 1 = single-buffer, 2 = dual-buffer */
@@ -327,6 +336,17 @@ count_path_rays(const struct path_state* p)
 {
   /* B-4 M1-v2: 6-ray enc_query uses ray_count_ext for extra rays */
   if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6)
+    return 6;
+  return (size_t)p->ray_req.ray_count;
+}
+
+/* P1: SoA-friendly variant — reads phase + ray_count_ext from SoA,
+ * falls back to AoS ray_req.ray_count for the common (non-ENC) case. */
+static INLINE size_t
+count_path_rays_soa(enum path_phase phase, int ray_count_ext,
+                    const struct path_state* p)
+{
+  if(phase == PATH_ENC_QUERY_EMIT && ray_count_ext == 6)
     return 6;
   return (size_t)p->ray_req.ray_count;
 }

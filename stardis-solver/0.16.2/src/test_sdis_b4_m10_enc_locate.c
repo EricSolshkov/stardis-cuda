@@ -71,20 +71,22 @@ static void
 test_t10_2_submit_fields(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   const double pos[3] = {0.25, 0.5, 0.75};
 
   printf("  T10.2: enc_locate_submit field assignment... ");
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.phase = PATH_CND_DS_STEP_ENC_VERIFY;
   p.active = 1;
 
-  step_enc_locate_submit(&p, pos, PATH_CND_DS_STEP_ADVANCE);
+  step_enc_locate_submit(&p, &enc, pos, PATH_CND_DS_STEP_ADVANCE);
 
   CHK(p.phase == PATH_ENC_LOCATE_PENDING);
-  CHK(fabs(p.enc_locate.query_pos[0] - 0.25) < 1e-12);
-  CHK(fabs(p.enc_locate.query_pos[1] - 0.5)  < 1e-12);
-  CHK(fabs(p.enc_locate.query_pos[2] - 0.75) < 1e-12);
-  CHK(p.enc_locate.return_state == PATH_CND_DS_STEP_ADVANCE);
+  CHK(fabs(enc.locate.query_pos[0] - 0.25) < 1e-12);
+  CHK(fabs(enc.locate.query_pos[1] - 0.5)  < 1e-12);
+  CHK(fabs(enc.locate.query_pos[2] - 0.75) < 1e-12);
+  CHK(enc.locate.return_state == PATH_CND_DS_STEP_ADVANCE);
 
   printf("PASS\n");
 }
@@ -96,6 +98,7 @@ static void
 test_t10_3_result_advance(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   struct sdis_device* dev = NULL;
   struct sdis_scene* scn = NULL;
   struct sdis_scene_create_args scn_args = SDIS_SCENE_CREATE_ARGS_DEFAULT;
@@ -128,19 +131,20 @@ test_t10_3_result_advance(void)
 
   /* Simulate: kernel returned prim_id=0, side=0 (front) */
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.phase = PATH_ENC_LOCATE_RESULT;
-  p.enc_locate.return_state = PATH_CND_DS_STEP_ADVANCE;
-  p.enc_locate.prim_id = 0;
-  p.enc_locate.side = 0; /* front */
-  p.enc_locate.distance = 0.1f;
+  enc.locate.return_state = PATH_CND_DS_STEP_ADVANCE;
+  enc.locate.prim_id = 0;
+  enc.locate.side = 0; /* front */
+  enc.locate.distance = 0.1f;
   p.active = 1;
 
-  OK(step_enc_locate_result(&p, scn));
+  OK(step_enc_locate_result(&p, scn, &enc));
 
   /* After result processing, phase should be the return_state */
   CHK(p.phase == PATH_CND_DS_STEP_ADVANCE);
   /* resolved_enc_id should be set by the scene's prim_props */
-  CHK(p.enc_locate.resolved_enc_id != (unsigned)-1);
+  CHK(enc.locate.resolved_enc_id != (unsigned)-1);
 
   OK(sdis_interface_ref_put(interf));
   OK(sdis_scene_ref_put(scn));
@@ -156,20 +160,22 @@ static void
 test_t10_10_collect_distribute_flow(void)
 {
   struct path_state paths[10];
+  struct path_enc_data encs[10];
   size_t i;
   size_t enc_count = 0, ray_count = 0;
 
   printf("  T10.10: Collect/distribute flow (mixed ENC+RAY)... ");
   memset(paths, 0, sizeof(paths));
+  memset(encs, 0, sizeof(encs));
 
   /* Set up 5 ENC_LOCATE_PENDING paths and 5 RAD_TRACE_PENDING paths */
   for(i = 0; i < 5; i++) {
     paths[i].phase = PATH_ENC_LOCATE_PENDING;
     paths[i].active = 1;
-    paths[i].enc_locate.query_pos[0] = (double)i * 0.1;
-    paths[i].enc_locate.query_pos[1] = 0.5;
-    paths[i].enc_locate.query_pos[2] = 0.5;
-    paths[i].enc_locate.return_state = PATH_CND_DS_STEP_ADVANCE;
+    encs[i].locate.query_pos[0] = (double)i * 0.1;
+    encs[i].locate.query_pos[1] = 0.5;
+    encs[i].locate.query_pos[2] = 0.5;
+    encs[i].locate.return_state = PATH_CND_DS_STEP_ADVANCE;
   }
   for(i = 5; i < 10; i++) {
     paths[i].phase = PATH_RAD_TRACE_PENDING;
@@ -199,15 +205,16 @@ test_t10_10_collect_distribute_flow(void)
 static void
 test_t10_13_sizeof_comparison(void)
 {
-  struct path_state p;
+  struct path_enc_data enc;
   size_t enc_locate_sz;
 
   printf("  T10.13: enc_locate sizeof comparison... ");
+  memset(&enc, 0, sizeof(enc));
 
   /* enc_locate should be compact: query_pos(24) + return_state(4) +
    * resolved_enc_id(4) + prim_id(4) + side(4) + distance(4) + batch_idx(4)
    * = ~48 bytes.  Much smaller than the old enc_query with 6 ray results. */
-  enc_locate_sz = sizeof(p.enc_locate);
+  enc_locate_sz = sizeof(enc.locate);
   fprintf(stdout, "(enc_locate = %lu bytes) ", (unsigned long)enc_locate_sz);
 
   /* Verify it's reasonably small (< 100 bytes) */

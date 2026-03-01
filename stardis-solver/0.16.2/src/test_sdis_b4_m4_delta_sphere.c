@@ -121,12 +121,14 @@ static void
 test_init_enc_query_chain(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
 
   printf("  T4.1: init ENC query chain (conductive entry -> ENC -> CHECK_TEMP)...\n");
 
   /* ---- Part A: step_conductive with ds_initialized=0 must dispatch
    *              to ENC sub-state via step_enc_query_emit ---- */
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.ctx.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
   p.ds_initialized = 0;
@@ -134,32 +136,33 @@ test_init_enc_query_chain(void)
   p.rwalk.vtx.P[1] = 0.5;
   p.rwalk.vtx.P[2] = 0.5;
 
-  step_conductive(&p, g_scn);
+  step_conductive(&p, g_scn, &enc);
 
   /* Should have called step_enc_query_emit:
    *   phase = PATH_ENC_QUERY_EMIT, needs_ray = 1
    *   enc_query.return_state = PATH_CND_DS_CHECK_TEMP */
   CHK(p.phase == PATH_ENC_QUERY_EMIT);
   CHK(p.needs_ray == 1);
-  CHK(p.enc_query.return_state == PATH_CND_DS_CHECK_TEMP);
+  CHK(enc.return_state == PATH_CND_DS_CHECK_TEMP);
   CHK(p.ray_count_ext == 6);
   CHK(p.ray_bucket == RAY_BUCKET_ENCLOSURE);
 
   /* Verify query position matches rwalk position */
-  CHK(fabs(p.enc_query.query_pos[0] - 0.5) < 1.e-10);
-  CHK(fabs(p.enc_query.query_pos[1] - 0.5) < 1.e-10);
-  CHK(fabs(p.enc_query.query_pos[2] - 0.5) < 1.e-10);
+  CHK(fabs(enc.query_pos[0] - 0.5) < 1.e-10);
+  CHK(fabs(enc.query_pos[1] - 0.5) < 1.e-10);
+  CHK(fabs(enc.query_pos[2] - 0.5) < 1.e-10);
 
   printf("    Part A: step_conductive -> PATH_ENC_QUERY_EMIT  PASS\n");
 
   /* ---- Part B: step_conductive with ds_initialized=1 goes directly
    *              to PATH_CND_DS_CHECK_TEMP ---- */
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.ctx.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
   p.ds_initialized = 1;
 
-  step_conductive(&p, g_scn);
+  step_conductive(&p, g_scn, &enc);
 
   CHK(p.phase == PATH_CND_DS_CHECK_TEMP);
   CHK(p.needs_ray == 0);
@@ -179,10 +182,12 @@ static void
 test_ds_step_ray_count_and_bucket(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
 
   printf("  T4.2: DS step emits 2 rays (RAY_BUCKET_STEP_PAIR)... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.rng = g_rng;
   p.rwalk.vtx.P[0] = 0.5;
@@ -239,12 +244,14 @@ static void
 test_ds_enc_verify_trigger(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   struct s3d_hit hit0, hit1;
   res_T res;
 
   printf("  T4.3: hit0 miss -> PATH_CND_DS_STEP_ENC_VERIFY... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.ds_delta_solid_param = 0.1f;
   p.rwalk.vtx.P[0] = 0.5;
@@ -258,7 +265,7 @@ test_ds_enc_verify_trigger(void)
   hit0 = S3D_HIT_NULL;
   hit1 = S3D_HIT_NULL;
 
-  res = step_conductive_ds_process(&p, g_scn, &hit0, &hit1);
+  res = step_conductive_ds_process(&p, g_scn, &hit0, &hit1, &enc);
   CHK(res == RES_OK);
 
   /* Both miss -> delta = delta_solid = 0.1.
@@ -267,9 +274,9 @@ test_ds_enc_verify_trigger(void)
   CHK(p.needs_ray == 0);
 
   /* Verify pos_next was computed correctly (P + dir0 * delta) */
-  CHK(fabs(p.enc_query.query_pos[0] - 0.5) < 1.e-6);
-  CHK(fabs(p.enc_query.query_pos[1] - 0.5) < 1.e-6);
-  CHK(fabs(p.enc_query.query_pos[2] - (0.5 + 0.1)) < 1.e-6);
+  CHK(fabs(enc.query_pos[0] - 0.5) < 1.e-6);
+  CHK(fabs(enc.query_pos[1] - 0.5) < 1.e-6);
+  CHK(fabs(enc.query_pos[2] - (0.5 + 0.1)) < 1.e-6);
 
   printf("PASS\n");
 }
@@ -284,12 +291,14 @@ static void
 test_ds_enc_verify_far_hit(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   struct s3d_hit hit0, hit1;
   res_T res;
 
   printf("  T4.3b: hit0.distance > delta (far hit) -> ENC_VERIFY... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.ds_delta_solid_param = 0.01f; /* small: avoids snap-to-boundary swap */
   p.rwalk.vtx.P[0] = 0.5;
@@ -310,7 +319,7 @@ test_ds_enc_verify_far_hit(void)
   hit1.prim.prim_id = 11;
   hit1.normal[0] = 1.0f;
 
-  res = step_conductive_ds_process(&p, g_scn, &hit0, &hit1);
+  res = step_conductive_ds_process(&p, g_scn, &hit0, &hit1, &enc);
   CHK(res == RES_OK);
 
   /* delta = min(0.3, 0.05) = 0.05.  hit0.distance (0.3) > delta (0.05)
@@ -332,6 +341,7 @@ static void
 test_ds_enc_verify_skip(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   struct s3d_hit hit0, hit1;
   res_T res;
   unsigned encs[2];
@@ -342,6 +352,7 @@ test_ds_enc_verify_skip(void)
   scene_get_enclosure_ids(g_scn, 0, encs);
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.ds_delta_solid_param = 0.5f;
   p.rwalk.vtx.P[0] = 0.5;
@@ -366,7 +377,7 @@ test_ds_enc_verify_skip(void)
 
   hit1 = S3D_HIT_NULL;
 
-  res = step_conductive_ds_process(&p, g_scn, &hit0, &hit1);
+  res = step_conductive_ds_process(&p, g_scn, &hit0, &hit1, &enc);
   CHK(res == RES_OK);
 
   /* hit0.distance (0.08) == delta -> direct enc path (no ENC_VERIFY).
@@ -377,7 +388,7 @@ test_ds_enc_verify_skip(void)
 
   /* If match -> STEP_ADVANCE with resolved_enc_id set */
   if(p.phase == PATH_CND_DS_STEP_ADVANCE)
-    CHK(p.enc_query.resolved_enc_id == g_inner_enc);
+    CHK(enc.resolved_enc_id == g_inner_enc);
 
   printf("PASS\n");
 }
@@ -389,6 +400,7 @@ static void
 test_ds_enc_mismatch_retry(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   struct s3d_hit hit0, hit1;
   res_T res;
   unsigned encs[2];
@@ -401,6 +413,7 @@ test_ds_enc_mismatch_retry(void)
   scene_get_enclosure_ids(g_scn, 0, encs);
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.ds_delta_solid_param = 0.5f;
   p.rwalk.vtx.P[0] = 0.5;
@@ -423,7 +436,7 @@ test_ds_enc_mismatch_retry(void)
 
   hit1 = S3D_HIT_NULL;
 
-  res = step_conductive_ds_process(&p, g_scn, &hit0, &hit1);
+  res = step_conductive_ds_process(&p, g_scn, &hit0, &hit1, &enc);
   CHK(res == RES_OK);
 
   /* Mismatch -> retry via CHECK_TEMP, robust_attempt incremented */
@@ -440,29 +453,31 @@ static void
 test_ds_enc_verify_setup(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
 
   printf("  T4.5a: step_cnd_ds_step_enc_verify -> ENC -> STEP_ADVANCE... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
-  p.enc_query.query_pos[0] = 0.6;
-  p.enc_query.query_pos[1] = 0.5;
-  p.enc_query.query_pos[2] = 0.7;
+  enc.query_pos[0] = 0.6;
+  enc.query_pos[1] = 0.5;
+  enc.query_pos[2] = 0.7;
 
-  step_cnd_ds_step_enc_verify(&p);
+  step_cnd_ds_step_enc_verify(&p, &enc);
 
   /* Should have set return_state = PATH_CND_DS_STEP_ADVANCE
    * and called step_enc_query_emit */
-  CHK(p.enc_query.return_state == PATH_CND_DS_STEP_ADVANCE);
+  CHK(enc.return_state == PATH_CND_DS_STEP_ADVANCE);
   CHK(p.phase == PATH_ENC_QUERY_EMIT);
   CHK(p.needs_ray == 1);
   CHK(p.ray_count_ext == 6);
   CHK(p.ray_bucket == RAY_BUCKET_ENCLOSURE);
 
   /* Verify query position preserved */
-  CHK(fabs(p.enc_query.query_pos[0] - 0.6) < 1.e-10);
-  CHK(fabs(p.enc_query.query_pos[1] - 0.5) < 1.e-10);
-  CHK(fabs(p.enc_query.query_pos[2] - 0.7) < 1.e-10);
+  CHK(fabs(enc.query_pos[0] - 0.6) < 1.e-10);
+  CHK(fabs(enc.query_pos[1] - 0.5) < 1.e-10);
+  CHK(fabs(enc.query_pos[2] - 0.7) < 1.e-10);
 
   printf("PASS\n");
 }
@@ -477,6 +492,7 @@ static void
 test_ds_advance_loop_continue(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
 
   printf("  T4.5b: advance loop (structural -- HIT_NONE -> CHECK_TEMP)... ");
 
@@ -486,9 +502,10 @@ test_ds_advance_loop_continue(void)
    *   -> should set phase = PATH_CND_DS_CHECK_TEMP (continue loop) */
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
 
   /* Simulate conditions at advance end */
-  p.enc_query.resolved_enc_id = g_inner_enc;
+  enc.resolved_enc_id = g_inner_enc;
   p.ds_enc_id = g_inner_enc; /* match */
   p.ds_hit0 = S3D_HIT_NULL;
   p.ds_delta = 0.1f;
@@ -513,10 +530,12 @@ static void
 test_ds_advance_loop_exit(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
 
   printf("  T4.5c: advance loop exit (!HIT_NONE -> COUPLED_BOUNDARY)... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
 
   /* Simulate conditions: hit found */
   p.rwalk.hit_3d.distance = 0.05f;
@@ -538,19 +557,21 @@ static void
 test_ds_advance_enc_mismatch(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
 
   printf("  T4.5d: advance ENC mismatch -> retry (CHECK_TEMP)... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
 
   /* step_cnd_ds_step_advance checks:
    *   enc_query.resolved_enc_id != ds_enc_id -> retry */
-  p.enc_query.resolved_enc_id = 99999;
+  enc.resolved_enc_id = 99999;
   p.ds_enc_id = g_inner_enc; /* mismatch */
   p.ds_robust_attempt = 0;
 
   /* Verify mismatch condition */
-  CHK(p.enc_query.resolved_enc_id != p.ds_enc_id);
+  CHK(enc.resolved_enc_id != p.ds_enc_id);
 
   /* Under 100 -> retry */
   p.ds_robust_attempt++;
@@ -631,12 +652,14 @@ static void
 test_ds_process_both_miss_delta(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   struct s3d_hit hit0, hit1;
   res_T res;
 
   printf("  DS process both-miss: delta = delta_solid... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.ds_delta_solid_param = 0.15f;
   p.ds_enc_id = g_inner_enc;
@@ -649,7 +672,7 @@ test_ds_process_both_miss_delta(void)
   hit0 = S3D_HIT_NULL;
   hit1 = S3D_HIT_NULL;
 
-  res = step_conductive_ds_process(&p, g_scn, &hit0, &hit1);
+  res = step_conductive_ds_process(&p, g_scn, &hit0, &hit1, &enc);
   CHK(res == RES_OK);
 
   /* Verify delta = delta_solid = 0.15 */
@@ -668,12 +691,14 @@ static void
 test_ds_process_single_hit_delta(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   struct s3d_hit hit0, hit1;
   res_T res;
 
   printf("  DS process single forward hit: delta = hit0.distance... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.ds_delta_solid_param = 0.5f;
   p.ds_enc_id = g_inner_enc;
@@ -693,7 +718,7 @@ test_ds_process_single_hit_delta(void)
 
   hit1 = S3D_HIT_NULL;
 
-  res = step_conductive_ds_process(&p, g_scn, &hit0, &hit1);
+  res = step_conductive_ds_process(&p, g_scn, &hit0, &hit1, &enc);
   CHK(res == RES_OK);
 
   /* hit0.distance (0.08) == delta -> direct enc path (no ENC_VERIFY).
@@ -785,17 +810,19 @@ static void
 test_ds_initialized_lifecycle(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
 
   printf("  ds_initialized flag lifecycle... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.ctx.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
 
   /* Initially not initialized */
   CHK(p.ds_initialized == 0);
 
   /* After step_conductive dispatches ENC -> still 0 */
-  step_conductive(&p, g_scn);
+  step_conductive(&p, g_scn, &enc);
   CHK(p.ds_initialized == 0);
   CHK(p.phase == PATH_ENC_QUERY_EMIT);
 
@@ -803,7 +830,7 @@ test_ds_initialized_lifecycle(void)
    * state.  Verify the flag is used correctly at conductive re-entry. */
   p.ds_initialized = 1;
   p.phase = PATH_COUPLED_CONDUCTIVE;
-  step_conductive(&p, g_scn);
+  step_conductive(&p, g_scn, &enc);
   CHK(p.phase == PATH_CND_DS_CHECK_TEMP);
 
   printf("PASS\n");

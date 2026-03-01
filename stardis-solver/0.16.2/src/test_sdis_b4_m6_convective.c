@@ -30,6 +30,7 @@
  */
 
 #include "sdis_solve_wavefront.h"
+#include "sdis_solve_persistent_wavefront.h"
 #include "sdis_wf_steps.h"
 #include "sdis_scene_c.h"
 
@@ -994,10 +995,19 @@ static void
 test_advance_no_ray_cnv_init(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn0 = {{{0}},0};
+  struct path_enc_data enc0 = {{0}};
+  struct path_ext_data ext0 = {{0}};
+  struct wavefront_pool pool0;
   int advanced = 0;
   res_T res;
 
   printf("  T6.misc: advance_no_ray dispatches CNV_INIT... ");
+
+  memset(&pool0, 0, sizeof(pool0));
+  pool0.sfn_arr = &sfn0;
+  pool0.enc_arr = &enc0;
+  pool0.ext_arr = &ext0;
 
   memset(&p, 0, sizeof(p));
   p.active = 1;
@@ -1009,7 +1019,7 @@ test_advance_no_ray_cnv_init(void)
   p.rwalk.hit_3d = S3D_HIT_NULL;
   p.rwalk.enc_id = g_fluid_enc_sf;
 
-  res = advance_one_step_no_ray(&p, g_scn_sf, &advanced);
+  res = advance_one_step_no_ray(&p, g_scn_sf, &advanced, &pool0, 0);
   CHK(res == RES_OK);
   CHK(advanced == 1);
 
@@ -1027,10 +1037,19 @@ static void
 test_advance_no_ray_bnd_dispatch(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn0 = {{{0}},0};
+  struct path_enc_data enc0 = {{0}};
+  struct path_ext_data ext0 = {{0}};
+  struct wavefront_pool pool0;
   int advanced = 0;
   res_T res;
 
   printf("  T6.misc: advance_no_ray dispatches BND_DISPATCH... ");
+
+  memset(&pool0, 0, sizeof(pool0));
+  pool0.sfn_arr = &sfn0;
+  pool0.enc_arr = &enc0;
+  pool0.ext_arr = &ext0;
 
   memset(&p, 0, sizeof(p));
   p.active = 1;
@@ -1045,7 +1064,7 @@ test_advance_no_ray_bnd_dispatch(void)
   p.rwalk.hit_3d.normal[2] = -1.0f;
   p.rwalk.hit_side = SDIS_FRONT;
 
-  res = advance_one_step_no_ray(&p, g_scn_dirichlet, &advanced);
+  res = advance_one_step_no_ray(&p, g_scn_dirichlet, &advanced, &pool0, 0);
   CHK(res == RES_OK);
   CHK(advanced == 1);
 
@@ -1063,10 +1082,19 @@ static void
 test_advance_with_ray_cnv_startup(void)
 {
   struct path_state p;
+  struct path_sfn_data sfn0 = {{{0}},0};
+  struct path_enc_data enc0 = {{0}};
+  struct path_ext_data ext0 = {{0}};
+  struct wavefront_pool pool0;
   struct s3d_hit hit0;
   res_T res;
 
   printf("  T6.misc: advance_with_ray dispatches CNV_STARTUP_TRACE... ");
+
+  memset(&pool0, 0, sizeof(pool0));
+  pool0.sfn_arr = &sfn0;
+  pool0.enc_arr = &enc0;
+  pool0.ext_arr = &ext0;
 
   memset(&p, 0, sizeof(p));
   p.active = 1;
@@ -1083,7 +1111,7 @@ test_advance_with_ray_cnv_startup(void)
   hit0.prim.prim_id = 0;
   hit0.normal[2] = 1.0f;
 
-  res = advance_one_step_with_ray(&p, g_scn_sf, &hit0, NULL);
+  res = advance_one_step_with_ray(&p, g_scn_sf, &hit0, NULL, &pool0, 0);
   CHK(res == RES_OK);
 
   /* Should have called step_cnv_startup_result -> SAMPLE_LOOP */

@@ -37,6 +37,7 @@
 /* Forward declarations (pointer-only usage in path_state) */
 struct sdis_medium;
 struct green_path_handle;
+struct wavefront_pool;  /* P1: forward-declared for cold-block pool pointer */
 
 /*******************************************************************************
  * Per-ray request descriptor (wavefront internal)
@@ -59,15 +60,153 @@ struct path_ray_request {
 /*******************************************************************************
  * struct path_state — fully externalised state of one MC path
  *
- * B-4 expansion: ~600 B (original) + ~600 B (locals union) + ~200 B
- * (ext_flux) + ~200 B (enc_query) + ~600 B (sfn_stack x 3) ~ 2.2 KB/path.
- * 32K paths x 2.2 KB = 70 MB, well within CPU memory budget.
+ * B-4 expansion (original estimate):
+ *   ~600 B (original) + ~600 B (locals union) + ~200 B (ext_flux)
+ *   + ~200 B (enc_query) + ~600 B (sfn_stack x 3) ≈ 2.2 KB/path.
+ * Actual size after M5 bnd_sf snapshot fields (rwalk_snapshot,
+ * hvtx_saved etc.): ~4 KB/path (see test_path_state_size, limit 4096).
+ * 32K paths × 4 KB = 128 MB, within CPU memory budget.
  ******************************************************************************/
 
 /* Maximum recursion depth for picardN COMPUTE_TEMPERATURE stack.
  * 3 = up to 3 nested boundary sub-paths.  If the depth is exceeded during
  * a recursive Ti sampling, the path falls back to synchronous execution. */
 #define MAX_PICARD_DEPTH 3
+
+/*******************************************************************************
+ * P1: Cold-block structures — SoA-separated from path_state.
+ *
+ * These three data blocks account for ~70% of the per-path slot size
+ * (~4648B out of ~6688B) but are only accessed by specific step functions.
+ * Moving them to parallel SoA arrays indexed by slot_idx reduces the
+ * cache working set of the cascade hot loop from 6.7KB/slot to ~2KB/slot.
+ ******************************************************************************/
+
+/* Forward-declared here so path_sfn_data can embed it; the full definition
+ * of path_bnd_sf_locals also appears as locals.bnd_sf inside path_state. */
+struct path_bnd_sf_locals {
+    double  p_conv, p_cond, p_radi;
+    double  h_hat, h_conv, h_cond;
+    double  h_radi_hat;
+    double  epsilon, Tref;
+    double  lambda;
+    double  delta_boundary;
+    double  delta_m;
+    float   reinject_dir[2][3];
+    struct s3d_hit reinject_hit[2];
+    float   chosen_dir[3];
+    float   chosen_dst;
+    struct s3d_hit chosen_hit;
+    unsigned solid_enc_id;
+    unsigned enc_ids[2];
+    unsigned enc0_id, enc1_id;
+    enum sdis_side solid_side;
+    enum sdis_side fluid_side;
+    int     need_enc;
+    int     retry_count;
+    double  rwalk_pos_backup[3];
+    double  r;
+    float   rad_sub_direction[3];
+    int     rad_sub_bounce_count;
+    int     rad_sub_retry_count;
+    struct rwalk      rwalk_snapshot;
+    struct temperature T_snapshot;
+    struct sdis_heat_vertex hvtx_saved;
+    size_t  ihvtx_radi_begin;
+    int     is_picardn;
+    struct rwalk rwalk_s;
+    struct temperature T_s;
+    struct sdis_heat_vertex hvtx_s;
+    size_t  ihvtx_radi_end;
+    int     coupled_nbranchings_saved;
+};
+
+/* PicardN recursive stack — only accessed by BND_SFN step functions and
+ * cascade intercept (sfn_stack_depth > 0 test). ~3700B */
+struct path_sfn_data {
+    struct {
+        enum path_phase return_state;
+        double  partial_temperature;
+        struct rwalk rwalk_saved;
+        struct temperature T_saved;
+        double  T_values[6];
+        int     T_count;
+        double  r, p_conv, p_cond, h_hat;
+        struct path_bnd_sf_locals bnd_sf_backup;
+    } stack[MAX_PICARD_DEPTH];
+    int depth;  /* was sfn_stack_depth */
+};
+
+/* 6-ray enclosure query + enc_locate state — only accessed by ENC step
+ * functions, DS enc_verify, and collect/distribute. ~596B */
+struct path_enc_data {
+    /* M1-v2: 6-ray enclosure query */
+    double   query_pos[3];
+    enum path_phase return_state;
+    unsigned resolved_enc_id;
+    float    directions[6][3];
+    struct s3d_hit dir_hits[6];
+    uint32_t batch_indices[6];
+    float    fb_direction[3];
+    struct s3d_hit fb_hit;
+    uint32_t fb_batch_idx;
+
+    /* M10: point-in-enclosure via BVH */
+    struct {
+        double   query_pos[3];
+        enum path_phase return_state;
+        unsigned resolved_enc_id;
+        int32_t  prim_id;
+        int32_t  side;
+        float    distance;
+        uint32_t batch_idx;
+    } locate;
+};
+
+/* M7 external net flux sub-chain state — only accessed by BND_EXT step
+ * functions and step_bnd_sf_prob_dispatch. ~360B */
+struct path_ext_data {
+    /* Ray data for current shadow / diffuse ray */
+    float   pos[3];
+    float   dir[3];
+    float   range;
+    struct s3d_hit hit;
+
+    /* Accumulated flux components */
+    double  flux_direct;
+    double  flux_diffuse_reflected;
+    double  flux_scattered;
+    double  scattered_dir[3];
+    int     nbounces;
+
+    /* Persistent state across suspend points */
+    double  emissivity;
+    double  sum_h;
+    double  cos_theta;
+    double  N[3];
+    unsigned enc_id_fluid;
+    struct source_props  src_props;
+    struct source_sample src_sample;
+
+    /* Fragment info for BRDF at bounce */
+    double  frag_time;
+    double  frag_P[3];
+
+    /* Green function handle (non-owning pointer) */
+    struct green_path_handle* green_path;
+
+    /* Return state after flux computation is done */
+    enum path_phase return_state;
+};
+
+/*******************************************************************************
+ * struct path_state — fully externalised state of one MC path
+ *
+ * P1: Cold blocks (sfn_stack, enc_query, enc_locate, ext_flux) moved to
+ * separate SoA arrays (struct path_sfn_data/path_enc_data/path_ext_data).
+ * Access via pool->sfn_arr[slot_idx] etc.
+ * Remaining size: ~2040B/path.
+ ******************************************************************************/
 struct path_state {
   /* --- Identity --- */
   uint32_t  path_id;                   /* global unique id within the tile   */
@@ -180,46 +319,7 @@ struct path_state {
       uint32_t batch_idx_bck0, batch_idx_bck1;
     } bnd_ss;
 
-    struct path_bnd_sf_locals {         /* solid/fluid picard1/N           */
-      double  p_conv, p_cond, p_radi;
-      double  h_hat, h_conv, h_cond;
-      double  h_radi_hat;              /* radiative coeff upper bound      */
-      double  epsilon, Tref;
-      double  lambda;                  /* solid thermal conductivity       */
-      double  delta_boundary;          /* sqrt(DIM)*delta                  */
-      double  delta_m;                 /* delta in meters                  */
-      float   reinject_dir[2][3];      /* 2 candidate directions           */
-      struct s3d_hit reinject_hit[2];  /* 2 hit results                    */
-      float   chosen_dir[3];          /* resolved reinjection direction    */
-      float   chosen_dst;             /* resolved reinjection distance     */
-      struct s3d_hit chosen_hit;      /* resolved reinjection hit          */
-      unsigned solid_enc_id;
-      unsigned enc_ids[2];            /* [FRONT] and [BACK] enclosure ids  */
-      unsigned enc0_id, enc1_id;      /* enclosure ids at ray endpoints    */
-      enum sdis_side solid_side;      /* which side is solid               */
-      enum sdis_side fluid_side;      /* which side is fluid               */
-      int     need_enc;               /* whether ENC query is needed       */
-      int     retry_count;            /* reinjection retry counter         */
-      double  rwalk_pos_backup[3];    /* position backup for retry logic   */
-      double  r;                       /* saved random number              */
-      /* null-collision radiative sub-path state */
-      float   rad_sub_direction[3];   /* current radiative direction       */
-      int     rad_sub_bounce_count;   /* bounce counter                    */
-      int     rad_sub_retry_count;    /* find_next_fragment retries        */
-      struct rwalk      rwalk_snapshot;
-      struct temperature T_snapshot;
-      /* heat path restart vertex saved before null-collision loop */
-      struct sdis_heat_vertex hvtx_saved;
-      size_t  ihvtx_radi_begin;       /* radiative sub-path vertex start   */
-
-      /* === PicardN-specific fields (M8) === */
-      int     is_picardn;             /* 1 when in picardN mode            */
-      struct rwalk rwalk_s;            /* radiative endpoint rwalk (SFN)    */
-      struct temperature T_s;          /* radiative endpoint temperature    */
-      struct sdis_heat_vertex hvtx_s;  /* heat vertex at radiative endpoint */
-      size_t  ihvtx_radi_end;          /* vertex index after rad sub-path   */
-      int     coupled_nbranchings_saved; /* saved nbranchings at push       */
-    } bnd_sf;
+    struct path_bnd_sf_locals bnd_sf;   /* solid/fluid picard1/N           */
 
     struct {                            /* WoS conductive                  */
       double  query_pos[3];
@@ -251,78 +351,10 @@ struct path_state {
     } cnv;
   } locals;
 
-  /* --- B-4 M7: External net flux (independent, co-active with picard) --- */
-  struct {
-    /* Ray data for current shadow / diffuse ray */
-    float   pos[3];                    /* current bounce position (float)  */
-    float   dir[3];                    /* current diffuse bounce direction  */
-    float   range;                     /* ray range (shadow: src dist)     */
-    struct s3d_hit hit;                /* current hit from boundary/bounce  */
-
-    /* Accumulated flux components */
-    double  flux_direct;               /* incident_flux_direct [W/m^2]     */
-    double  flux_diffuse_reflected;    /* sum of L contributions [W/m^2/sr]*/
-    double  flux_scattered;            /* PI if miss (scattered component) */
-    double  scattered_dir[3];          /* direction of scattered component  */
-    int     nbounces;                  /* bounce counter                    */
-
-    /* Persistent state across suspend points */
-    double  emissivity;                /* interface emissivity for source   */
-    double  sum_h;                     /* h_cond + h_conv + h_radi          */
-    double  cos_theta;                 /* N . src_sample.dir                */
-    double  N[3];                      /* outward normal (toward fluid)     */
-    unsigned enc_id_fluid;             /* enclosure id on fluid side        */
-    struct source_props  src_props;    /* source properties at frag.time    */
-    struct source_sample src_sample;   /* sampled direction toward source   */
-
-    /* Fragment info for BRDF at bounce */
-    double  frag_time;                 /* fragment time [s]                 */
-    double  frag_P[3];                 /* original fragment position        */
-
-    /* Green function handle (non-owning pointer) */
-    struct green_path_handle* green_path;
-
-    /* Return state after flux computation is done */
-    enum path_phase return_state;      /* resume state after flux done     */
-  } ext_flux;
-
-  /* --- B-4 M10: Point-in-enclosure via BVH closest primitive --- */
-  struct {
-    double   query_pos[3];            /* position for enclosure locate     */
-    enum path_phase return_state;     /* resume state after locate done    */
-    unsigned resolved_enc_id;         /* result enclosure id               */
-    int32_t  prim_id;                 /* closest prim from GPU kernel      */
-    int32_t  side;                    /* 0=front, 1=back, -1=degenerate    */
-    float    distance;                /* distance to closest surface       */
-    uint32_t batch_idx;               /* index in enc_locate batch         */
-  } enc_locate;
-
-  /* --- B-4 M1-v2: 6-ray enclosure query (replaces M10 at call sites) --- */
-  struct {
-    double   query_pos[3];            /* query position                    */
-    enum path_phase return_state;     /* resume state after resolve done   */
-    unsigned resolved_enc_id;         /* result enclosure id               */
-    float    directions[6][3];        /* PI/4 rotated axis-aligned dirs    */
-    struct s3d_hit dir_hits[6];       /* hit results for 6 rays            */
-    uint32_t batch_indices[6];        /* batch indices for each ray        */
-    /* Fallback ray (when all 6 primary rays invalid) */
-    float    fb_direction[3];         /* fallback ray direction            */
-    struct s3d_hit fb_hit;            /* fallback ray hit result           */
-    uint32_t fb_batch_idx;            /* fallback ray batch index          */
-  } enc_query;
-
-  /* --- B-4: PicardN recursive stack --- */
-  struct {
-    enum path_phase return_state;
-    double  partial_temperature;
-    struct rwalk rwalk_saved;
-    struct temperature T_saved;
-    double  T_values[6];
-    int     T_count;
-    double  r, p_conv, p_cond, h_hat;
-    struct path_bnd_sf_locals bnd_sf_backup;
-  } sfn_stack[MAX_PICARD_DEPTH];        /* recursive COMPUTE_TEMPERATURE    */
-  int sfn_stack_depth;
+  /* --- B-4 M7/M10/M1-v2/M8: Cold blocks moved to SoA arrays (P1) ---
+   * Access via pool->ext_arr[slot_idx], pool->enc_arr[slot_idx],
+   * pool->sfn_arr[slot_idx].  See struct path_ext_data, path_enc_data,
+   * path_sfn_data defined above. */
 
   /* --- B-4: Ray type tag --- */
   enum ray_bucket_type ray_bucket;     /* bucket for current ray request   */

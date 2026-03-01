@@ -57,6 +57,15 @@ struct wavefront_context {
   size_t              total_paths;
   size_t              active_count;
 
+  /* P1: Cold-block SoA arrays (parallel to paths[]) */
+  struct path_sfn_data* sfn_arr;
+  struct path_enc_data* enc_arr;
+  struct path_ext_data* ext_arr;
+
+  /* P1: Lightweight pool proxy for dispatch cold-block access.
+   * Only sfn_arr/enc_arr/ext_arr are set; other fields are zero. */
+  struct wavefront_pool* cold_pool;
+
   /* Ray request collection */
   struct s3d_ray_request*  ray_requests;   /* indexed by ray_count           */
   uint32_t*               ray_to_path;    /* ray→path mapping               */

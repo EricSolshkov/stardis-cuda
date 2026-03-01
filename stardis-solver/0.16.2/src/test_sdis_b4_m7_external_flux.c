@@ -333,7 +333,8 @@ teardown_test_scenes(void)
 /* Helper: set up a path_state at a solid/fluid boundary ready for ext_check  */
 /* ========================================================================== */
 static void
-init_path_at_boundary(struct path_state* p, struct ssp_rng* rng)
+init_path_at_boundary(struct path_state* p, struct ssp_rng* rng,
+                      struct path_ext_data* ext)
 {
   memset(p, 0, sizeof(*p));
   p->active = 1;
@@ -369,7 +370,7 @@ init_path_at_boundary(struct path_state* p, struct ssp_rng* rng)
   p->T.done = 0;
 
   /* Return state: after ext flux completes, return to picard1 dispatch */
-  p->ext_flux.return_state = PATH_BND_SF_PROB_DISPATCH;
+  ext->return_state = PATH_BND_SF_PROB_DISPATCH;
 }
 
 /* ========================================================================== */
@@ -379,25 +380,26 @@ static void
 test_ext_no_source_bypass(void)
 {
   struct path_state p;
+  struct path_ext_data ext;
   res_T res;
 
   printf("  T7.10: No-source bypass... ");
-  init_path_at_boundary(&p, g_rng);
+  init_path_at_boundary(&p, g_rng, &ext);
 
-  p.ext_flux.return_state = PATH_BND_SF_PROB_DISPATCH;
+  ext.return_state = PATH_BND_SF_PROB_DISPATCH;
   p.phase = PATH_BND_EXT_CHECK;
 
   /* Call step_bnd_ext_check with a scene that has no source */
-  res = step_bnd_ext_check(&p, g_scn_nosrc);
+  res = step_bnd_ext_check(&p, g_scn_nosrc, &ext);
   OK(res);
 
   /* Should skip directly to return_state */
   CHK(p.phase == PATH_BND_SF_PROB_DISPATCH);
   CHK(p.needs_ray == 0);
   /* No flux accumulated */
-  CHK(p.ext_flux.flux_direct == 0);
-  CHK(p.ext_flux.flux_diffuse_reflected == 0);
-  CHK(p.ext_flux.flux_scattered == 0);
+  CHK(ext.flux_direct == 0);
+  CHK(ext.flux_diffuse_reflected == 0);
+  CHK(ext.flux_scattered == 0);
 
   printf("PASS\n");
 }
@@ -409,16 +411,17 @@ static void
 test_ext_no_handle_flux_bypass(void)
 {
   struct path_state p;
+  struct path_ext_data ext;
   res_T res;
 
   printf("  T7.10b: handle_flux=0 bypass... ");
-  init_path_at_boundary(&p, g_rng);
+  init_path_at_boundary(&p, g_rng, &ext);
 
-  p.ext_flux.return_state = PATH_BND_SF_PROB_DISPATCH;
+  ext.return_state = PATH_BND_SF_PROB_DISPATCH;
   p.phase = PATH_BND_EXT_CHECK;
 
   /* Scene has source but handle_external_flux=0 */
-  res = step_bnd_ext_check(&p, g_scn_noflux);
+  res = step_bnd_ext_check(&p, g_scn_noflux, &ext);
   OK(res);
 
   CHK(p.phase == PATH_BND_SF_PROB_DISPATCH);
@@ -457,6 +460,7 @@ static void
 test_ext_shadow_ray_emission(void)
 {
   struct path_state p;
+  struct path_ext_data ext;
   res_T res;
 
   printf("  T7.1: Shadow ray emission (cos>0)... ");
@@ -465,11 +469,11 @@ test_ext_shadow_ray_emission(void)
   OK(ssp_rng_ref_put(g_rng));
   OK(ssp_rng_create(NULL, SSP_RNG_KISS, &g_rng));
 
-  init_path_at_boundary(&p, g_rng);
+  init_path_at_boundary(&p, g_rng, &ext);
   p.phase = PATH_BND_EXT_CHECK;
-  p.ext_flux.return_state = PATH_BND_SF_PROB_DISPATCH;
+  ext.return_state = PATH_BND_SF_PROB_DISPATCH;
 
-  res = step_bnd_ext_check(&p, g_scn);
+  res = step_bnd_ext_check(&p, g_scn, &ext);
 
   if(res != RES_OK) {
     printf("SKIP (source API returned error)\n");
@@ -477,7 +481,7 @@ test_ext_shadow_ray_emission(void)
   }
 
   /* Check structural correctness */
-  if(p.ext_flux.cos_theta > 0) {
+  if(ext.cos_theta > 0) {
     /* Source above surface -> shadow ray */
     CHK(p.phase == PATH_BND_EXT_DIRECT_TRACE);
     CHK(p.needs_ray == 1);
@@ -503,6 +507,7 @@ static void
 test_ext_no_shadow_when_below(void)
 {
   struct path_state p;
+  struct path_ext_data ext;
   res_T res;
 
   printf("  T7.7: No shadow when cos<=0... ");
@@ -510,9 +515,9 @@ test_ext_no_shadow_when_below(void)
   OK(ssp_rng_ref_put(g_rng));
   OK(ssp_rng_create(NULL, SSP_RNG_KISS, &g_rng));
 
-  init_path_at_boundary(&p, g_rng);
+  init_path_at_boundary(&p, g_rng, &ext);
   p.phase = PATH_BND_EXT_CHECK;
-  p.ext_flux.return_state = PATH_BND_SF_PROB_DISPATCH;
+  ext.return_state = PATH_BND_SF_PROB_DISPATCH;
 
   /* Flip the normal so source is behind the surface.
    * Source is at (0,0,2).  Surface position is (0.5, 0.5, 1.0).
@@ -521,18 +526,18 @@ test_ext_no_shadow_when_below(void)
   p.rwalk.hit_3d.normal[1] = -1.0f;
   p.rwalk.hit_3d.normal[2] = 0.0f;
 
-  res = step_bnd_ext_check(&p, g_scn);
+  res = step_bnd_ext_check(&p, g_scn, &ext);
   if(res != RES_OK) {
     printf("SKIP (source API returned error)\n");
     return;
   }
 
   /* If cos_theta <= 0, should go to diffuse trace, not direct */
-  if(p.ext_flux.cos_theta <= 0) {
+  if(ext.cos_theta <= 0) {
     CHK(p.phase == PATH_BND_EXT_DIFFUSE_TRACE);
     CHK(p.needs_ray == 1);
     CHK(p.ray_bucket == RAY_BUCKET_RADIATIVE);
-    CHK(p.ext_flux.flux_direct == 0);
+    CHK(ext.flux_direct == 0);
     printf("PASS\n");
   } else {
     /* Edge case: source direction might still give positive cos
@@ -549,6 +554,7 @@ static void
 test_ext_diffuse_bounce_ray(void)
 {
   struct path_state p;
+  struct path_ext_data ext;
   struct s3d_hit miss = S3D_HIT_NULL; /* Shadow ray miss = source visible */
   res_T res;
 
@@ -557,28 +563,28 @@ test_ext_diffuse_bounce_ray(void)
   OK(ssp_rng_ref_put(g_rng));
   OK(ssp_rng_create(NULL, SSP_RNG_KISS, &g_rng));
 
-  init_path_at_boundary(&p, g_rng);
+  init_path_at_boundary(&p, g_rng, &ext);
 
   /* Simulate PATH_BND_EXT_DIRECT_TRACE having received a shadow miss
    * (= source visible, direct contribution will be computed). */
   p.phase = PATH_BND_EXT_DIRECT_TRACE;
 
   /* Set up ext_flux state as if step_bnd_ext_check had run */
-  p.ext_flux.frag_P[0] = 0.5;
-  p.ext_flux.frag_P[1] = 0.5;
-  p.ext_flux.frag_P[2] = 1.0;
-  p.ext_flux.frag_time = 0.0;
-  p.ext_flux.N[0] = 0.0;
-  p.ext_flux.N[1] = 0.0;
-  p.ext_flux.N[2] = 1.0;
-  p.ext_flux.cos_theta = 0.5;
-  p.ext_flux.src_sample.radiance_term = 1.0;
-  p.ext_flux.src_sample.pdf = 0.1;
-  p.ext_flux.src_sample.dst = 1.0;
-  p.ext_flux.enc_id_fluid = g_fluid_enc;
+  ext.frag_P[0] = 0.5;
+  ext.frag_P[1] = 0.5;
+  ext.frag_P[2] = 1.0;
+  ext.frag_time = 0.0;
+  ext.N[0] = 0.0;
+  ext.N[1] = 0.0;
+  ext.N[2] = 1.0;
+  ext.cos_theta = 0.5;
+  ext.src_sample.radiance_term = 1.0;
+  ext.src_sample.pdf = 0.1;
+  ext.src_sample.dst = 1.0;
+  ext.enc_id_fluid = g_fluid_enc;
 
   /* Process shadow ray miss -> direct contribution computed, then diffuse */
-  res = step_bnd_ext_direct_result(&p, g_scn, &miss);
+  res = step_bnd_ext_direct_result(&p, g_scn, &miss, &ext);
   OK(res);
 
   /* After direct result, should emit first diffuse bounce ray */
@@ -590,7 +596,7 @@ test_ext_diffuse_bounce_ray(void)
   CHK(p.ray_req.range[1] == FLT_MAX);
 
   /* Direct contribution should be non-zero (source visible, cos > 0) */
-  CHK(p.ext_flux.flux_direct > 0);
+  CHK(ext.flux_direct > 0);
 
   printf("PASS\n");
 }
@@ -602,30 +608,32 @@ static void
 test_ext_diffuse_miss_scattered(void)
 {
   struct path_state p;
+  struct path_ext_data ext;
   struct s3d_hit miss = S3D_HIT_NULL;
   res_T res;
 
   printf("  T7.extra: Diffuse miss -> scattered=PI... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&ext, 0, sizeof(ext));
   p.active = 1;
   p.rng = g_rng;
   p.phase = PATH_BND_EXT_DIFFUSE_TRACE;
 
   /* Set up diffuse direction */
-  p.ext_flux.dir[0] = 0.0f;
-  p.ext_flux.dir[1] = 0.0f;
-  p.ext_flux.dir[2] = 1.0f;
-  p.ext_flux.enc_id_fluid = g_fluid_enc;
+  ext.dir[0] = 0.0f;
+  ext.dir[1] = 0.0f;
+  ext.dir[2] = 1.0f;
+  ext.enc_id_fluid = g_fluid_enc;
 
-  res = step_bnd_ext_diffuse_result(&p, g_scn, &miss);
+  res = step_bnd_ext_diffuse_result(&p, g_scn, &miss, &ext);
   OK(res);
 
   /* Miss -> scattered = PI, go to FINALIZE */
   CHK(p.phase == PATH_BND_EXT_FINALIZE);
   CHK(p.needs_ray == 0);
-  CHK(fabs(p.ext_flux.flux_scattered - 3.14159265358979323846) < 1.e-10);
-  CHK((float)fabs(p.ext_flux.scattered_dir[2] - 1.0) < 1.e-6f);
+  CHK(fabs(ext.flux_scattered - 3.14159265358979323846) < 1.e-10);
+  CHK((float)fabs(ext.scattered_dir[2] - 1.0) < 1.e-6f);
 
   printf("PASS\n");
 }
@@ -637,29 +645,31 @@ static void
 test_ext_finalize_return_state(void)
 {
   struct path_state p;
+  struct path_ext_data ext;
   res_T res;
 
   printf("  T7.8: Finalize return state... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&ext, 0, sizeof(ext));
   p.active = 1;
   p.rng = g_rng;
   p.phase = PATH_BND_EXT_FINALIZE;
 
   /* Set up ext_flux with accumulated values */
-  p.ext_flux.flux_direct = 10.0;            /* [W/m^2] */
-  p.ext_flux.flux_diffuse_reflected = 2.0;  /* [W/m^2/sr] (pre-PI multiply) */
-  p.ext_flux.flux_scattered = 0;
-  p.ext_flux.emissivity = 0.8;
-  p.ext_flux.sum_h = 17.0; /* h_cond + h_conv + h_radi */
-  p.ext_flux.src_props.power = 100.0;
-  p.ext_flux.frag_time = 0;
-  p.ext_flux.green_path = NULL; /* no green function in test */
-  p.ext_flux.return_state = PATH_BND_SF_PROB_DISPATCH;
+  ext.flux_direct = 10.0;            /* [W/m^2] */
+  ext.flux_diffuse_reflected = 2.0;  /* [W/m^2/sr] (pre-PI multiply) */
+  ext.flux_scattered = 0;
+  ext.emissivity = 0.8;
+  ext.sum_h = 17.0; /* h_cond + h_conv + h_radi */
+  ext.src_props.power = 100.0;
+  ext.frag_time = 0;
+  ext.green_path = NULL; /* no green function in test */
+  ext.return_state = PATH_BND_SF_PROB_DISPATCH;
 
   p.T.value = 0;
 
-  res = step_bnd_ext_finalize(&p, g_scn);
+  res = step_bnd_ext_finalize(&p, g_scn, &ext);
   OK(res);
 
   /* Phase should return to the saved return state */
@@ -692,14 +702,16 @@ static void
 test_ext_struct_independence(void)
 {
   struct path_state p;
+  struct path_ext_data ext;
 
   printf("  T7.extra2: ext_flux struct independence... ");
   memset(&p, 0, sizeof(p));
+  memset(&ext, 0, sizeof(ext));
 
   /* Write to ext_flux */
-  p.ext_flux.emissivity = 0.8;
-  p.ext_flux.sum_h = 17.0;
-  p.ext_flux.cos_theta = 0.5;
+  ext.emissivity = 0.8;
+  ext.sum_h = 17.0;
+  ext.cos_theta = 0.5;
 
   /* Write to locals.bnd_sf (picard1 state) */
   p.locals.bnd_sf.h_cond = 10.0;
@@ -707,9 +719,9 @@ test_ext_struct_independence(void)
   p.locals.bnd_sf.h_radi_hat = 2.0;
 
   /* Verify ext_flux is NOT corrupted by locals write */
-  CHK(p.ext_flux.emissivity == 0.8);
-  CHK(p.ext_flux.sum_h == 17.0);
-  CHK(p.ext_flux.cos_theta == 0.5);
+  CHK(ext.emissivity == 0.8);
+  CHK(ext.sum_h == 17.0);
+  CHK(ext.cos_theta == 0.5);
 
   /* Vice versa */
   CHK(p.locals.bnd_sf.h_cond == 10.0);

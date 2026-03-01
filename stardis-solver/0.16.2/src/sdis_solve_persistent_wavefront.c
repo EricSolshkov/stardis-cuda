@@ -387,6 +387,18 @@ pool_create(struct wavefront_pool* pool, size_t pool_size)
     return RES_MEM_ERR;
   }
 
+  /* P1: Dispatch-layer SoA arrays */
+  {
+    res_T soa_res = dispatch_soa_alloc(&pool->dsoa, pool_size);
+    if(soa_res != RES_OK) return soa_res;
+  }
+
+  /* P1: Cold-block SoA arrays (separated from path_state slots) */
+  pool->sfn_arr = (struct path_sfn_data*)calloc(pool_size, sizeof(struct path_sfn_data));
+  pool->enc_arr = (struct path_enc_data*)calloc(pool_size, sizeof(struct path_enc_data));
+  pool->ext_arr = (struct path_ext_data*)calloc(pool_size, sizeof(struct path_ext_data));
+  if(!pool->sfn_arr || !pool->enc_arr || !pool->ext_arr) return RES_MEM_ERR;
+
   /* Initialise diagnostics */
   pool->diag_min_batch = (size_t)-1; /* updated on first step with rays */
   pool->trace_batch_size_min = (size_t)-1;
@@ -475,6 +487,14 @@ pool_destroy(struct wavefront_pool* pool)
   free(pool->cp_requests);
   free(pool->cp_hits);
   free(pool->cp_to_slot);
+
+  /* P1: Dispatch-layer SoA arrays */
+  dispatch_soa_free(&pool->dsoa);
+
+  /* P1: Cold-block SoA arrays */
+  free(pool->sfn_arr);
+  free(pool->enc_arr);
+  free(pool->ext_arr);
 
   memset(pool, 0, sizeof(*pool));
 }
@@ -683,7 +703,8 @@ init_single_path(
 static res_T
 advance_path_to_first_ray(struct path_state* p,
                           struct sdis_scene* scn,
-                          struct wavefront_pool* pool)
+                          struct wavefront_pool* pool,
+                          size_t slot_idx)
 {
   res_T res = RES_OK;
   while(p->active && !p->needs_ray && p->phase != PATH_DONE
@@ -691,7 +712,7 @@ advance_path_to_first_ray(struct path_state* p,
     int advanced = 0;
     if(path_phase_is_ray_pending(p->phase)) break;
 
-    res = advance_one_step_no_ray(p, scn, &advanced);
+    res = advance_one_step_no_ray(p, scn, &advanced, pool, slot_idx);
     if(res != RES_OK && res != RES_BAD_OP
     && res != RES_BAD_OP_IRRECOVERABLE) return res;
     if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
@@ -704,7 +725,7 @@ advance_path_to_first_ray(struct path_state* p,
     }
     if(!advanced) break;
     /* M8: intercept PATH_DONE when sfn_stack_depth > 0 */
-    if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
+    if(p->phase == PATH_DONE && pool->sfn_arr[slot_idx].depth > 0) {
       p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
       p->active = 1;
     }
@@ -736,8 +757,11 @@ fill_pool(struct wavefront_pool* pool)
     if(res != RES_OK) return res;
 
     /* Advance past PATH_INIT to first ray request */
-    res = advance_path_to_first_ray(&pool->slots[i], pool->scn, pool);
+    res = advance_path_to_first_ray(&pool->slots[i], pool->scn, pool, i);
     if(res != RES_OK) return res;
+
+    /* P1 SYNC POINT C: sync new path to SoA */
+    dispatch_soa_sync_from_path(&pool->dsoa, (uint32_t)i, &pool->slots[i]);
 
     pool->task_next++;
   }
@@ -752,7 +776,11 @@ fill_pool(struct wavefront_pool* pool)
 }
 
 /*******************************************************************************
- * Stream Compaction (M2.5) -- rebuild compact index arrays each step.
+ * Stream Compaction (M2.5 + P1 SoA) -- rebuild compact index arrays each step.
+ *
+ * P1: reads phase/active/needs_ray from dsoa (SoA) instead of path_state
+ * (AoS), reducing cache footprint from ~4KB/path to 12B/path for the
+ * common case (needs_ray==0).
  *
  * After this function:
  *   active_indices[0..active_compact-1]   = indices of active, non-done slots
@@ -767,6 +795,7 @@ compact_active_paths(struct wavefront_pool* pool, struct pool_view* pv)
   size_t base = pv->base;
   size_t end  = base + pv->view_size;
   size_t i;
+  struct dispatch_soa* dsoa = &pool->dsoa;
 
   pv->active_compact      = 0;
   pv->need_ray_count      = 0;
@@ -775,37 +804,49 @@ compact_active_paths(struct wavefront_pool* pool, struct pool_view* pv)
   pv->bucket_conductive_n = 0;
 
   for(i = base; i < end; i++) {
-    struct path_state* p = &pool->slots[i];
+    enum path_phase ph = dsoa->phase[i];
+    int act = dsoa->active[i];
+    int nr  = dsoa->needs_ray[i];
 
-    if(p->phase == PATH_DONE || p->phase == PATH_ERROR
-    || p->phase == PATH_HARVESTED) {
+    if(ph == PATH_DONE || ph == PATH_ERROR
+    || ph == PATH_HARVESTED) {
       /* M8: if sfn_stack_depth > 0, the sub-path finished but the
-       * parent picardN frame still needs to resume.  Re-activate. */
-      if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
-        p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
-        p->active = 1;
+       * parent picardN frame still needs to resume.  Re-activate.
+       * Need to access AoS for sfn_stack_depth (rare path). */
+      if(ph == PATH_DONE && pool->sfn_arr[i].depth > 0) {
+        pool->slots[i].phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+        pool->slots[i].active = 1;
+        dsoa->phase[i] = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+        dsoa->active[i] = 1;
+        ph = PATH_BND_SFN_COMPUTE_Ti_RESUME;
+        act = 1;
         /* Fall through to treat as active path */
       } else {
         pv->done_indices[pv->done_count++] = (uint32_t)i;
         continue;
       }
     }
-    if(!p->active) continue;
+    if(!act) continue;
 
     pv->active_indices[pv->active_compact++] = (uint32_t)i;
 
-    if(p->needs_ray && p->ray_req.ray_count > 0) {
-      pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
+    if(nr) {
+      /* Only touch AoS when needs_ray is set (minority of paths).
+       * Still need ray_req.ray_count from AoS (P2 scope). */
+      struct path_state* p = &pool->slots[i];
+      if(p->ray_req.ray_count > 0) {
+        pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
 
-      /* Bucket by phase type */
-      if(p->phase == PATH_RAD_TRACE_PENDING) {
-        pv->bucket_radiative[pv->bucket_radiative_n++] = (uint32_t)i;
-      } else if(p->phase == PATH_COUPLED_COND_DS_PENDING
-             || p->phase == PATH_CND_DS_STEP_TRACE) {
-        pv->bucket_conductive[pv->bucket_conductive_n++] = (uint32_t)i;
+        /* Bucket by phase type */
+        if(ph == PATH_RAD_TRACE_PENDING) {
+          pv->bucket_radiative[pv->bucket_radiative_n++] = (uint32_t)i;
+        } else if(ph == PATH_COUPLED_COND_DS_PENDING
+               || ph == PATH_CND_DS_STEP_TRACE) {
+          pv->bucket_conductive[pv->bucket_conductive_n++] = (uint32_t)i;
+        }
+        /* Other ray-pending phases (boundary reinject) go into
+         * need_ray_indices but not into type-specific buckets. */
       }
-      /* Other ray-pending phases (boundary reinject) go into
-       * need_ray_indices but not into type-specific buckets. */
     }
   }
 }
@@ -984,7 +1025,7 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
 
     memset(tl_ray_counts, 0, sizeof(tl_ray_counts));
 
-    /* ---- Pass 1: Per-thread bucket counting ---- */
+    /* ---- Pass 1: Per-thread bucket counting (P1: from SoA) ---- */
     #pragma omp parallel num_threads(omp_nthreads)
     {
       int tid = omp_get_thread_num();
@@ -994,8 +1035,9 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
       for(kk = 0; kk < (int)pv->need_ray_count; kk++) {
         uint32_t i = pv->need_ray_indices[kk];
         struct path_state* p = &pool->slots[i];
-        size_t nrays = count_path_rays(p);
-        int bkt = (int)p->ray_bucket;
+        size_t nrays = count_path_rays_soa(
+          pool->dsoa.phase[i], pool->dsoa.ray_count_ext[i], p);
+        int bkt = (int)pool->dsoa.ray_bucket[i];
         tl_ray_counts[tid][bkt] += nrays;
       }
     }
@@ -1048,22 +1090,23 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
       for(kk = 0; kk < (int)pv->need_ray_count; kk++) {
         uint32_t i = pv->need_ray_indices[kk];
         struct path_state* p = &pool->slots[i];
-        int bkt = (int)p->ray_bucket;
+        int bkt = (int)pool->dsoa.ray_bucket[i];  /* P1: from SoA */
+        enum path_phase ph_i = pool->dsoa.phase[i]; /* P1: from SoA */
 
         /* Thread-local stats accumulation */
-        if(p->phase == PATH_RAD_TRACE_PENDING)
+        if(ph_i == PATH_RAD_TRACE_PENDING)
           tl_rays_radiative += (size_t)p->ray_req.ray_count;
-        else if(p->phase == PATH_COUPLED_COND_DS_PENDING
-             || p->phase == PATH_CND_DS_STEP_TRACE) {
+        else if(ph_i == PATH_COUPLED_COND_DS_PENDING
+             || ph_i == PATH_CND_DS_STEP_TRACE) {
           if(p->ds_robust_attempt > 0)
             tl_rays_cond_ds_retry += (size_t)p->ray_req.ray_count;
           else
             tl_rays_cond_ds += (size_t)p->ray_req.ray_count;
         }
         if(bkt == RAY_BUCKET_SHADOW)
-          tl_rays_shadow += count_path_rays(p);
+          tl_rays_shadow += count_path_rays_soa(ph_i, pool->dsoa.ray_count_ext[i], p);
         else if(bkt == RAY_BUCKET_STARTUP)
-          tl_rays_startup += count_path_rays(p);
+          tl_rays_startup += count_path_rays_soa(ph_i, pool->dsoa.ray_count_ext[i], p);
 
         /* --- Emit ray 0 --- */
         {
@@ -1112,11 +1155,12 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
           p->ray_req.batch_idx2 = (uint32_t)ray_idx;
         }
 
-        /* --- Rays 2..5 for 6-ray enclosure query --- */
-        if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT) {
+        /* --- Rays 2..5 for 6-ray enclosure query (P1: phase from SoA) --- */
+        if(pool->dsoa.ray_count_ext[i] == 6
+        && ph_i == PATH_ENC_QUERY_EMIT) {
           int j;
-          p->enc_query.batch_indices[0] = p->ray_req.batch_idx;
-          p->enc_query.batch_indices[1] = p->ray_req.batch_idx2;
+          pool->enc_arr[i].batch_indices[0] = p->ray_req.batch_idx;
+          pool->enc_arr[i].batch_indices[1] = p->ray_req.batch_idx2;
 
           for(j = 2; j < 6; j++) {
             size_t ray_idx = my_cursor[bkt]++;
@@ -1124,9 +1168,9 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
             rr->origin[0]    = p->ray_req.origin[0];
             rr->origin[1]    = p->ray_req.origin[1];
             rr->origin[2]    = p->ray_req.origin[2];
-            rr->direction[0] = p->enc_query.directions[j][0];
-            rr->direction[1] = p->enc_query.directions[j][1];
-            rr->direction[2] = p->enc_query.directions[j][2];
+            rr->direction[0] = pool->enc_arr[i].directions[j][0];
+            rr->direction[1] = pool->enc_arr[i].directions[j][1];
+            rr->direction[2] = pool->enc_arr[i].directions[j][2];
             rr->range[0]     = p->ray_req.range[0];
             rr->range[1]     = p->ray_req.range[1];
             rr->filter_data  = NULL;
@@ -1134,7 +1178,7 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
 
             pv->ray_to_slot[ray_idx] = i;
             pv->ray_slot_sub[ray_idx] = (uint32_t)j;
-            p->enc_query.batch_indices[j] = (uint32_t)ray_idx;
+            pool->enc_arr[i].batch_indices[j] = (uint32_t)ray_idx;
           }
         }
       } /* end omp for */
@@ -1162,11 +1206,13 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
 
     memset(pv->bucket_counts, 0, sizeof(pv->bucket_counts));
 
+    /* P1: Serial fallback Pass 1 — read bucket + ray_count from SoA */
     for(k = 0; k < pv->need_ray_count; k++) {
       uint32_t i = pv->need_ray_indices[k];
       struct path_state* p = &pool->slots[i];
-      size_t nrays = count_path_rays(p);
-      int bkt = (int)p->ray_bucket;
+      size_t nrays = count_path_rays_soa(
+        pool->dsoa.phase[i], pool->dsoa.ray_count_ext[i], p);
+      int bkt = (int)pool->dsoa.ray_bucket[i];
       ASSERT(bkt >= 0 && bkt < RAY_BUCKET_COUNT);
       pv->bucket_counts[bkt] += nrays;
     }
@@ -1183,21 +1229,22 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
     for(k = 0; k < pv->need_ray_count; k++) {
       uint32_t i = pv->need_ray_indices[k];
       struct path_state* p = &pool->slots[i];
-      int bkt = (int)p->ray_bucket;
+      int bkt = (int)pool->dsoa.ray_bucket[i];   /* P1: from SoA */
+      enum path_phase ph_i = pool->dsoa.phase[i]; /* P1: from SoA */
 
-      if(p->phase == PATH_RAD_TRACE_PENDING)
+      if(ph_i == PATH_RAD_TRACE_PENDING)
         pool->rays_radiative += (size_t)p->ray_req.ray_count;
-      else if(p->phase == PATH_COUPLED_COND_DS_PENDING
-           || p->phase == PATH_CND_DS_STEP_TRACE) {
+      else if(ph_i == PATH_COUPLED_COND_DS_PENDING
+           || ph_i == PATH_CND_DS_STEP_TRACE) {
         if(p->ds_robust_attempt > 0)
           pool->rays_conductive_ds_retry += (size_t)p->ray_req.ray_count;
         else
           pool->rays_conductive_ds += (size_t)p->ray_req.ray_count;
       }
       if(bkt == RAY_BUCKET_SHADOW)
-        pool->rays_shadow += count_path_rays(p);
+        pool->rays_shadow += count_path_rays_soa(ph_i, pool->dsoa.ray_count_ext[i], p);
       else if(bkt == RAY_BUCKET_STARTUP)
-        pool->rays_startup += count_path_rays(p);
+        pool->rays_startup += count_path_rays_soa(ph_i, pool->dsoa.ray_count_ext[i], p);
 
       {
         size_t ray_idx = ser_cursor[bkt]++;
@@ -1244,10 +1291,12 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
         p->ray_req.batch_idx2 = (uint32_t)ray_idx;
       }
 
-      if(p->ray_count_ext == 6 && p->phase == PATH_ENC_QUERY_EMIT) {
+      /* P1: read phase + ray_count_ext from SoA */
+      if(pool->dsoa.ray_count_ext[i] == 6
+      && ph_i == PATH_ENC_QUERY_EMIT) {
         int j;
-        p->enc_query.batch_indices[0] = p->ray_req.batch_idx;
-        p->enc_query.batch_indices[1] = p->ray_req.batch_idx2;
+        pool->enc_arr[i].batch_indices[0] = p->ray_req.batch_idx;
+        pool->enc_arr[i].batch_indices[1] = p->ray_req.batch_idx2;
 
         for(j = 2; j < 6; j++) {
           size_t ray_idx = ser_cursor[bkt]++;
@@ -1255,9 +1304,9 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
           rr->origin[0]    = p->ray_req.origin[0];
           rr->origin[1]    = p->ray_req.origin[1];
           rr->origin[2]    = p->ray_req.origin[2];
-          rr->direction[0] = p->enc_query.directions[j][0];
-          rr->direction[1] = p->enc_query.directions[j][1];
-          rr->direction[2] = p->enc_query.directions[j][2];
+          rr->direction[0] = pool->enc_arr[i].directions[j][0];
+          rr->direction[1] = pool->enc_arr[i].directions[j][1];
+          rr->direction[2] = pool->enc_arr[i].directions[j][2];
           rr->range[0]     = p->ray_req.range[0];
           rr->range[1]     = p->ray_req.range[1];
           rr->filter_data  = NULL;
@@ -1265,7 +1314,7 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
 
           pv->ray_to_slot[ray_idx] = i;
           pv->ray_slot_sub[ray_idx] = (uint32_t)j;
-          p->enc_query.batch_indices[j] = (uint32_t)ray_idx;
+          pool->enc_arr[i].batch_indices[j] = (uint32_t)ray_idx;
         }
       }
     }
@@ -1294,12 +1343,12 @@ pool_collect_enc_locate_requests(struct wavefront_pool* pool,
 
     if(p->phase == PATH_ENC_LOCATE_PENDING) {
       struct s3d_enc_locate_request* req = &pv->enc_locate_requests[n];
-      req->pos[0] = (float)p->enc_locate.query_pos[0];
-      req->pos[1] = (float)p->enc_locate.query_pos[1];
-      req->pos[2] = (float)p->enc_locate.query_pos[2];
+      req->pos[0] = (float)pool->enc_arr[i].locate.query_pos[0];
+      req->pos[1] = (float)pool->enc_arr[i].locate.query_pos[1];
+      req->pos[2] = (float)pool->enc_arr[i].locate.query_pos[2];
       req->user_id = i;
       pv->enc_locate_to_slot[n] = i;
-      p->enc_locate.batch_idx = (uint32_t)n;
+      pool->enc_arr[i].locate.batch_idx = (uint32_t)n;
       n++;
     }
   }
@@ -1326,9 +1375,9 @@ pool_distribute_enc_locate_results(struct wavefront_pool* pool,
     struct path_state* p = &pool->slots[slot_id];
     const struct s3d_enc_locate_result* r = &pv->enc_locate_results[k];
 
-    p->enc_locate.prim_id  = r->prim_id;
-    p->enc_locate.side     = r->side;
-    p->enc_locate.distance = r->distance;
+    pool->enc_arr[slot_id].locate.prim_id  = r->prim_id;
+    pool->enc_arr[slot_id].locate.side     = r->side;
+    pool->enc_arr[slot_id].locate.distance = r->distance;
     p->phase = PATH_ENC_LOCATE_RESULT;
   }
 
@@ -1468,7 +1517,8 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
           h1 = &pv->ray_hits[p->ray_req.batch_idx2];
 
         p->needs_ray = 0;
-        lr = step_conductive_ds_process(p, scn, h0, h1);
+        lr = step_conductive_ds_process(p, scn, h0, h1,
+                                         &pool->enc_arr[i]);
         if(lr != RES_OK && lr != RES_BAD_OP
         && lr != RES_BAD_OP_IRRECOVERABLE) { tl_fatal = 1; }
         else if(lr == RES_BAD_OP || lr == RES_BAD_OP_IRRECOVERABLE) {
@@ -1519,18 +1569,19 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
             if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6) {
               int j;
               for(j = 0; j < 6; j++) {
-                p->enc_query.dir_hits[j] =
-                  pv->ray_hits[p->enc_query.batch_indices[j]];
+                pool->enc_arr[i].dir_hits[j] =
+                  pv->ray_hits[pool->enc_arr[i].batch_indices[j]];
               }
             }
             if(p->phase == PATH_ENC_QUERY_FB_EMIT) {
-              p->enc_query.fb_hit = pv->ray_hits[p->ray_req.batch_idx];
+              pool->enc_arr[i].fb_hit = pv->ray_hits[p->ray_req.batch_idx];
             }
 
             {
               enum path_phase phase_before = p->phase;
               p->needs_ray = 0;
-              lr = advance_one_step_with_ray(p, scn, h0, h1);
+              lr = advance_one_step_with_ray(p, scn, h0, h1,
+                                             pool, (size_t)i);
               if(lr != RES_OK && lr != RES_BAD_OP
               && lr != RES_BAD_OP_IRRECOVERABLE) { tl_fatal = 1; }
               else if(lr == RES_BAD_OP || lr == RES_BAD_OP_IRRECOVERABLE) {
@@ -1591,7 +1642,8 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
         h1 = &pv->ray_hits[p->ray_req.batch_idx2];
 
       p->needs_ray = 0;
-      res = step_conductive_ds_process(p, scn, h0, h1);
+      res = step_conductive_ds_process(p, scn, h0, h1,
+                                       &pool->enc_arr[i]);
       if(res != RES_OK && res != RES_BAD_OP
       && res != RES_BAD_OP_IRRECOVERABLE) return res;
       if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
@@ -1624,18 +1676,19 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
           if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6) {
             int j;
             for(j = 0; j < 6; j++) {
-              p->enc_query.dir_hits[j] =
-                pv->ray_hits[p->enc_query.batch_indices[j]];
+              pool->enc_arr[i].dir_hits[j] =
+                pv->ray_hits[pool->enc_arr[i].batch_indices[j]];
             }
           }
           if(p->phase == PATH_ENC_QUERY_FB_EMIT) {
-            p->enc_query.fb_hit = pv->ray_hits[p->ray_req.batch_idx];
+            pool->enc_arr[i].fb_hit = pv->ray_hits[p->ray_req.batch_idx];
           }
 
           {
             enum path_phase phase_before = p->phase;
             p->needs_ray = 0;
-            res = advance_one_step_with_ray(p, scn, h0, h1);
+            res = advance_one_step_with_ray(p, scn, h0, h1,
+                                            pool, (size_t)i);
             if(res != RES_OK && res != RES_BAD_OP
             && res != RES_BAD_OP_IRRECOVERABLE) return res;
             if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
@@ -1669,6 +1722,7 @@ static int
 cascade_advance_single_path(
   struct path_state* p,
   struct sdis_scene* scn,
+  struct wavefront_pool* pool, size_t slot_idx,
   /* --- thread-local accumulators --- */
   size_t* local_iterations,
   size_t* local_advances,
@@ -1686,7 +1740,7 @@ cascade_advance_single_path(
     if(p->needs_ray) break;
     if(p->phase == PATH_DONE || p->phase == PATH_ERROR) {
       /* M8: intercept PATH_DONE when sfn_stack_depth > 0. */
-      if(p->phase == PATH_DONE && p->sfn_stack_depth > 0) {
+      if(p->phase == PATH_DONE && pool->sfn_arr[slot_idx].depth > 0) {
         p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
         p->active = 1;
         continue;
@@ -1701,7 +1755,7 @@ cascade_advance_single_path(
     phase_before = p->phase;
     time_current(&t_step0);
 
-    res = advance_one_step_no_ray(p, scn, &advanced);
+    res = advance_one_step_no_ray(p, scn, &advanced, pool, slot_idx);
 
     time_current(&t_step1);
     if((int)phase_before >= 0 && (int)phase_before < PATH_PHASE_COUNT) {
@@ -1710,7 +1764,7 @@ cascade_advance_single_path(
         += time_elapsed_sec(&t_step0, &t_step1);
     }
     if(phase_before == PATH_ENC_LOCATE_RESULT
-    && p->enc_locate.prim_id >= 0 && p->enc_locate.side < 0) {
+    && pool->enc_arr[slot_idx].locate.prim_id >= 0 && pool->enc_arr[slot_idx].locate.side < 0) {
       (*local_enc_degenerate_null)++;
     }
 
@@ -1790,7 +1844,7 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
         if(!p->active) continue;
 
         if(cascade_advance_single_path(
-              p, scn,
+              p, scn, pool, (size_t)idx,
               &tl_iterations, &tl_advances,
               &tl_paths_failed, &tl_enc_degenerate_null,
               tl_phase_count, tl_phase_time)) {
@@ -1841,7 +1895,7 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
       if(!p->active) continue;
 
       if(cascade_advance_single_path(
-            p, scn,
+            p, scn, pool, (size_t)idx,
             &tl_iterations, &tl_advances,
             &tl_paths_failed, &tl_enc_degenerate_null,
             tl_phase_count, tl_phase_time)) {
@@ -1884,11 +1938,12 @@ harvest_completed_paths(
   for(k = 0; k < pv->done_count; k++) {
     uint32_t i = pv->done_indices[k];
     struct path_state* p = &pool->slots[i];
+    enum path_phase ph = pool->dsoa.phase[i]; /* P1: from SoA */
 
     /* Skip if already harvested */
-    if(p->phase == PATH_HARVESTED)
+    if(ph == PATH_HARVESTED)
       continue;
-    if(!p->active && p->phase != PATH_DONE && p->phase != PATH_ERROR)
+    if(!pool->dsoa.active[i] && ph != PATH_DONE && ph != PATH_ERROR)
       continue;
 
     {
@@ -1907,12 +1962,12 @@ harvest_completed_paths(
     /* Per-path temperature trace */
     { FILE* tf = pixel_trace_file();
       if(tf) {
-        fprintf(tf, "%u,%u,%u,%u,%.17g,%d,%d,%lu,%d\n",
+        fprintf(tf, "%u,%u,%u,%u,%.17g,%d,%d,%llu,%d\n",
           (unsigned)p->path_id,
           (unsigned)p->ipix_image[0], (unsigned)p->ipix_image[1],
           (unsigned)p->realisation_idx,
           p->T.value, (int)p->T.done, p->done_reason,
-          (unsigned long)p->steps_taken, (int)p->phase);
+          (unsigned long long)p->steps_taken, (int)p->phase);
       }
     }
 
@@ -1937,6 +1992,9 @@ harvest_completed_paths(
      * that compact_active_paths and refill_pool recognise. */
     p->active = 0;
     p->phase  = PATH_HARVESTED;
+    /* P1: sync harvest state to SoA */
+    pool->dsoa.active[i] = 0;
+    pool->dsoa.phase[i]  = PATH_HARVESTED;
   }
 
   return RES_OK;
@@ -1982,8 +2040,11 @@ refill_pool(struct wavefront_pool* pool, struct pool_view* pv,
       if(res != RES_OK) return res;
 
       /* Advance past PATH_INIT */
-      res = advance_path_to_first_ray(p, pool->scn, pool);
+      res = advance_path_to_first_ray(p, pool->scn, pool, i);
       if(res != RES_OK) return res;
+
+      /* P1 SYNC POINT C: sync new path to SoA */
+      dispatch_soa_sync_from_path(&pool->dsoa, i, p);
 
       pool->task_next++;
       refill_count++;
@@ -2050,38 +2111,38 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
   }
   log_info(dev,
     "persistent wavefront summary:\n"
-    "  total_steps=%lu  total_rays=%lu  avg_wavefront_width=%.1f\n"
-    "  refill_phase: rays=%lu (%.1f%%)  wall=%.3fs\n"
-    "  drain_phase:  rays=%lu (%.1f%%)  steps=%lu  wall=%.3fs\n"
-    "  batch_size: min=%lu, max=%lu\n"
-    "  ray_buckets: radiative=%lu, step_pair=%lu, "
-    "shadow=%lu, startup=%lu\n"
-    "  paths: completed=%lu, failed=%lu, truncated=%lu, max_depth=%lu\n"
-    "  refills=%lu\n"
+    "  total_steps=%llu  total_rays=%llu  avg_wavefront_width=%.1f\n"
+    "  refill_phase: rays=%llu (%.1f%%)  wall=%.3fs\n"
+    "  drain_phase:  rays=%llu (%.1f%%)  steps=%llu  wall=%.3fs\n"
+    "  batch_size: min=%llu, max=%llu\n"
+    "  ray_buckets: radiative=%llu, step_pair=%llu, "
+    "shadow=%llu, startup=%llu\n"
+    "  paths: completed=%llu, failed=%llu, truncated=%llu, max_depth=%llu\n"
+    "  refills=%llu\n"
     "  timing: compact=%.3fs  collect=%.3fs  trace=%.3fs  "
     "distribute=%.3fs  cascade=%.3fs  harvest+refill=%.3fs\n",
-    (unsigned long)pool->total_steps,
-    (unsigned long)pool->total_rays_traced,
+    (unsigned long long)pool->total_steps,
+    (unsigned long long)pool->total_rays_traced,
     avg_width,
-    (unsigned long)pool->diag_refill_rays,
+    (unsigned long long)pool->diag_refill_rays,
     100.0 - drain_ray_pct,
     pool->time_refill_phase_s,
-    (unsigned long)pool->diag_drain_rays,
+    (unsigned long long)pool->diag_drain_rays,
     drain_ray_pct,
-    (unsigned long)pool->drain_step_count,
+    (unsigned long long)pool->drain_step_count,
     pool->time_drain_phase_s,
-    (unsigned long)(pool->diag_min_batch == (size_t)-1
+    (unsigned long long)(pool->diag_min_batch == (size_t)-1
                     ? 0 : pool->diag_min_batch),
-    (unsigned long)pool->diag_max_batch,
-    (unsigned long)pool->rays_radiative,
-    (unsigned long)pool->rays_conductive_ds,
-    (unsigned long)pool->rays_shadow,
-    (unsigned long)pool->rays_startup,
-    (unsigned long)pool->paths_completed,
-    (unsigned long)pool->paths_failed,
-    (unsigned long)pool->paths_truncated,
-    (unsigned long)pool->max_path_depth,
-    (unsigned long)pool->diag_refill_count,
+    (unsigned long long)pool->diag_max_batch,
+    (unsigned long long)pool->rays_radiative,
+    (unsigned long long)pool->rays_conductive_ds,
+    (unsigned long long)pool->rays_shadow,
+    (unsigned long long)pool->rays_startup,
+    (unsigned long long)pool->paths_completed,
+    (unsigned long long)pool->paths_failed,
+    (unsigned long long)pool->paths_truncated,
+    (unsigned long long)pool->max_path_depth,
+    (unsigned long long)pool->diag_refill_count,
     pool->time_compact_s,
     pool->time_collect_s,
     pool->time_trace_s,
@@ -2093,9 +2154,9 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
   if(pool->enc_query_escalated_to_m10 > 0
   || pool->enc_locate_degenerate_null > 0) {
     log_info(dev,
-      "  enc_escalation: query_fb->m10=%lu  m10_degenerate_null=%lu\n",
-      (unsigned long)pool->enc_query_escalated_to_m10,
-      (unsigned long)pool->enc_locate_degenerate_null);
+      "  enc_escalation: query_fb->m10=%llu  m10_degenerate_null=%llu\n",
+      (unsigned long long)pool->enc_query_escalated_to_m10,
+      (unsigned long long)pool->enc_locate_degenerate_null);
   }
 
   /* --- Experiment 3: Cascade per-phase top-N hotspots --- */
@@ -2121,18 +2182,18 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     }
 
     log_info(dev,
-      "cascade profiling: total_iterations=%lu  total_advances=%lu\n",
-      (unsigned long)pool->cascade_total_iterations,
-      (unsigned long)pool->cascade_total_advances);
+      "cascade profiling: total_iterations=%llu  total_advances=%llu\n",
+      (unsigned long long)pool->cascade_total_iterations,
+      (unsigned long long)pool->cascade_total_advances);
 
     for(ti = 0; ti < 10; ti++) {
       int ph = top[ti];
       if(ph < 0 || pool->cascade_phase_count[ph] == 0) break;
       log_info(dev,
-        "  cascade phase[%2d]: count=%10lu  time=%8.3fs  avg=%.3fus  "
+        "  cascade phase[%2d]: count=%10llu  time=%8.3fs  avg=%.3fus  "
         "(%.1f%% of cascade)\n",
         ph,
-        (unsigned long)pool->cascade_phase_count[ph],
+        (unsigned long long)pool->cascade_phase_count[ph],
         pool->cascade_phase_time[ph],
         pool->cascade_phase_time[ph] * 1e6
           / (double)pool->cascade_phase_count[ph],
@@ -2158,24 +2219,24 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
                       / (pool->trace_batch_time_ms_sum * 1e-3) / 1e6;
 
     log_info(dev,
-      "batch trace profiling: calls=%lu  avg_batch=%.0f  "
-      "min=%lu  max=%lu\n"
+      "batch trace profiling: calls=%llu  avg_batch=%.0f  "
+      "min=%llu  max=%llu\n"
       "  gpu_kernel+upload: total=%.1fms (%.1f%%)  avg=%.2fms/call\n"
       "  cpu_postprocess:   total=%.1fms (%.1f%%)  avg=%.2fms/call\n"
       "  fallback_retrace:  total=%.1fms (%.1f%%)  "
-      "accepted=%lu  missed=%lu  rejected=%lu\n"
+      "accepted=%llu  missed=%llu  rejected=%llu\n"
       "  gpu_throughput: %.1f Mrays/s  (kernel+upload only)\n",
-      (unsigned long)pool->trace_call_count,
+      (unsigned long long)pool->trace_call_count,
       avg_batch,
-      (unsigned long)(pool->trace_batch_size_min == (size_t)-1
+      (unsigned long long)(pool->trace_batch_size_min == (size_t)-1
                       ? 0 : pool->trace_batch_size_min),
-      (unsigned long)pool->trace_batch_size_max,
+      (unsigned long long)pool->trace_batch_size_max,
       pool->trace_batch_time_ms_sum, gpu_pct, avg_batch_ms,
       pool->trace_post_time_ms_sum, post_pct, avg_post_ms,
       pool->trace_retrace_time_ms_sum, rtrc_pct,
-      (unsigned long)pool->trace_retrace_accepted_sum,
-      (unsigned long)pool->trace_retrace_missed_sum,
-      (unsigned long)pool->trace_filter_rejected_sum,
+      (unsigned long long)pool->trace_retrace_accepted_sum,
+      (unsigned long long)pool->trace_retrace_missed_sum,
+      (unsigned long long)pool->trace_filter_rejected_sum,
       throughput);
   }
 }
@@ -2342,6 +2403,27 @@ gpu_wait_and_postprocess(struct wavefront_pool* pool,
   time_current(&t1);
   pool->time_cp_s += time_elapsed_sec(&t0, &t1);
 
+  /* ---- P1 SYNC POINT A: distribute finished — refresh dsoa for slots
+   *      that received ray/enc_locate/cp results.  Sync all slots that
+   *      had pending rays (need_ray_indices from the preceding compact). */
+  {
+    size_t k;
+    for(k = 0; k < pv->need_ray_count; k++) {
+      uint32_t idx = pv->need_ray_indices[k];
+      dispatch_soa_sync_from_path(&pool->dsoa, idx, &pool->slots[idx]);
+    }
+    /* Also sync enc_locate slots (may have transitioned phase) */
+    for(k = 0; k < pv->enc_locate_count; k++) {
+      uint32_t idx = pv->enc_locate_to_slot[k];
+      dispatch_soa_sync_from_path(&pool->dsoa, idx, &pool->slots[idx]);
+    }
+    /* Also sync closest_point slots */
+    for(k = 0; k < pv->cp_count; k++) {
+      uint32_t idx = pv->cp_to_slot[k];
+      dispatch_soa_sync_from_path(&pool->dsoa, idx, &pool->slots[idx]);
+    }
+  }
+
   return RES_OK;
 }
 
@@ -2363,6 +2445,17 @@ cpu_between(struct wavefront_pool* pool, struct pool_view* pv,
   if(res != RES_OK) return res;
   time_current(&t1);
   pool->time_cascade_s += time_elapsed_sec(&t0, &t1);
+
+  /* P1 SYNC POINT B: cascade finished — refresh dsoa for all active slots.
+   * cascade modifies phase/active/needs_ray in AoS; bulk-sync to SoA
+   * before the upcoming compact_active_paths reads from dsoa. */
+  {
+    size_t k;
+    for(k = 0; k < pv->active_compact; k++) {
+      uint32_t idx = pv->active_indices[k];
+      dispatch_soa_sync_from_path(&pool->dsoa, idx, &pool->slots[idx]);
+    }
+  }
 
   /* rebuild done_indices after cascade + harvest + refill */
   time_current(&t0);
@@ -2471,10 +2564,10 @@ solve_camera_persistent_wavefront(
       doubled = (doubled / 2) * 2;
       if(doubled < 2) doubled = 2;
       log_info(scn->dev,
-        "pipeline: dual-buffer auto-double pool_size %lu -> %lu "
-        "(per-view=%lu)\n",
-        (unsigned long)pool_size, (unsigned long)doubled,
-        (unsigned long)(doubled / 2));
+        "pipeline: dual-buffer auto-double pool_size %llu -> %llu "
+        "(per-view=%llu)\n",
+        (unsigned long long)pool_size, (unsigned long long)doubled,
+        (unsigned long long)(doubled / 2));
       pool_size = doubled;
     }
   }
@@ -2483,11 +2576,11 @@ solve_camera_persistent_wavefront(
     int sm = (scn->dev && scn->dev->s3d_dev)
            ? s3d_device_get_gpu_sm_count(scn->dev->s3d_dev) : 0;
     log_info(scn->dev,
-      "Persistent wavefront (Phase B-3 M3): %lux%lu spp=%lu, "
-      "pool_size=%lu (SM=%d), total_tasks=%lu\n",
-      (unsigned long)image_def[0], (unsigned long)image_def[1],
-      (unsigned long)spp, (unsigned long)pool_size,
-      sm, (unsigned long)total_tasks);
+      "Persistent wavefront (Phase B-3 M3): %llux%llu spp=%llu, "
+      "pool_size=%llu (SM=%d), total_tasks=%llu\n",
+      (unsigned long long)image_def[0], (unsigned long long)image_def[1],
+      (unsigned long long)spp, (unsigned long long)pool_size,
+      sm, (unsigned long long)total_tasks);
   }
 
   /* Log cascade OMP configuration */
@@ -2507,8 +2600,8 @@ solve_camera_persistent_wavefront(
   res = pool_create(&pool, pool_size);
   if(res != RES_OK) {
     log_err(scn->dev,
-      "persistent_wavefront: pool_create failed for %lu paths -- %s\n",
-      (unsigned long)pool_size, res_to_cstr(res));
+      "persistent_wavefront: pool_create failed for %llu paths -- %s\n",
+      (unsigned long long)pool_size, res_to_cstr(res));
     goto cleanup;
   }
 
@@ -2516,14 +2609,14 @@ solve_camera_persistent_wavefront(
   if(pool.num_active_views == 2) {
     log_info(scn->dev,
       "persistent_wavefront: dual-buffer pipeline, "
-      "view_size=%lu, views[0].capacity=%lu, views[1].capacity=%lu\n",
-      (unsigned long)pool.views[0].view_size,
-      (unsigned long)pool.views[0].capacity,
-      (unsigned long)pool.views[1].capacity);
+      "view_size=%llu, views[0].capacity=%llu, views[1].capacity=%llu\n",
+      (unsigned long long)pool.views[0].view_size,
+      (unsigned long long)pool.views[0].capacity,
+      (unsigned long long)pool.views[1].capacity);
   } else {
     log_info(scn->dev,
-      "persistent_wavefront: single-buffer mode, pool_size=%lu\n",
-      (unsigned long)pool.pool_size);
+      "persistent_wavefront: single-buffer mode, pool_size=%llu\n",
+      (unsigned long long)pool.pool_size);
   }
 
   /* ====== 2. Create per-path CBRNG thin wrappers ====== */
@@ -2581,8 +2674,8 @@ solve_camera_persistent_wavefront(
   res = s3d_batch_trace_context_create(&pool.batch_ctx, pool.max_rays);
   if(res != RES_OK) {
     log_err(scn->dev,
-      "persistent_wavefront: batch_ctx creation failed for %lu rays -- %s\n",
-      (unsigned long)pool.max_rays, res_to_cstr(res));
+      "persistent_wavefront: batch_ctx creation failed for %llu rays -- %s\n",
+      (unsigned long long)pool.max_rays, res_to_cstr(res));
     goto cleanup;
   }
 
@@ -2590,8 +2683,8 @@ solve_camera_persistent_wavefront(
   res = s3d_batch_enc_context_create(&pool.enc_batch_ctx, pool.max_enc_locates);
   if(res != RES_OK) {
     log_err(scn->dev,
-      "persistent_wavefront: enc_batch_ctx creation failed for %lu queries -- %s\n",
-      (unsigned long)pool.max_enc_locates, res_to_cstr(res));
+      "persistent_wavefront: enc_batch_ctx creation failed for %llu queries -- %s\n",
+      (unsigned long long)pool.max_enc_locates, res_to_cstr(res));
     goto cleanup;
   }
 
@@ -2599,8 +2692,8 @@ solve_camera_persistent_wavefront(
   res = s3d_batch_cp_context_create(&pool.cp_batch_ctx, pool.max_cps);
   if(res != RES_OK) {
     log_err(scn->dev,
-      "persistent_wavefront: cp_batch_ctx creation failed for %lu queries -- %s\n",
-      (unsigned long)pool.max_cps, res_to_cstr(res));
+      "persistent_wavefront: cp_batch_ctx creation failed for %llu queries -- %s\n",
+      (unsigned long long)pool.max_cps, res_to_cstr(res));
     goto cleanup;
   }
 
@@ -2618,11 +2711,11 @@ solve_camera_persistent_wavefront(
   if(res != RES_OK) goto cleanup;
 
   log_info(scn->dev,
-    "persistent_wavefront: %lu paths initialised (%lu/%lu tasks consumed), "
+    "persistent_wavefront: %llu paths initialised (%llu/%llu tasks consumed), "
     "starting wavefront loop\n",
-    (unsigned long)pool.active_count,
-    (unsigned long)pool.task_next,
-    (unsigned long)pool.task_count);
+    (unsigned long long)pool.active_count,
+    (unsigned long long)pool.task_next,
+    (unsigned long long)pool.task_count);
 
   /* ====== 7. Wavefront main loop ====== */
   time_current(&t_start);
@@ -2635,8 +2728,8 @@ solve_camera_persistent_wavefront(
     struct pool_view* pv_b = &pool.views[1];
 
     log_info(scn->dev,
-      "pipeline: starting dual-buffer mode, half=%lu\n",
-      (unsigned long)pv_a->view_size);
+      "pipeline: starting dual-buffer mode, half=%llu\n",
+      (unsigned long long)pv_a->view_size);
 
     /* ---- Startup: prepare A and launch first GPU ---- */
     res = cpu_pre_gpu(&pool, pv_a);
@@ -2687,10 +2780,10 @@ solve_camera_persistent_wavefront(
         time_current(&t_now);
         pool.time_refill_phase_s = time_elapsed_sec(&t_start, &t_now);
         log_info(scn->dev,
-          "persistent_wavefront: entering drain phase at step %lu, "
-          "%lu active paths remain, refill_wall=%.3fs\n",
-          (unsigned long)pool.total_steps,
-          (unsigned long)pool.active_count,
+          "persistent_wavefront: entering drain phase at step %llu, "
+          "%llu active paths remain, refill_wall=%.3fs\n",
+          (unsigned long long)pool.total_steps,
+          (unsigned long long)pool.active_count,
           pool.time_refill_phase_s);
       }
       pool_update_diagnostics(&pool, pv_a);
@@ -2711,35 +2804,35 @@ solve_camera_persistent_wavefront(
       || (pool.in_drain_phase && pool.drain_step_count % 500 == 0
        && pool.active_count > 0)) {
         log_info(scn->dev,
-          "persistent_wavefront pipeline step %lu [A]: %lu/%lu active, "
-          "%lu rays (rad=%lu ds=%lu shd=%lu st=%lu), "
-          "%lu/%lu tasks done, %s\n",
-          (unsigned long)pool.total_steps,
-          (unsigned long)pool.active_count,
-          (unsigned long)pool.pool_size,
-          (unsigned long)pv_a->ray_count,
-          (unsigned long)pv_a->bucket_counts[RAY_BUCKET_RADIATIVE],
-          (unsigned long)pv_a->bucket_counts[RAY_BUCKET_STEP_PAIR],
-          (unsigned long)pv_a->bucket_counts[RAY_BUCKET_SHADOW],
-          (unsigned long)pv_a->bucket_counts[RAY_BUCKET_STARTUP],
-          (unsigned long)(pool.paths_completed + pool.paths_failed),
-          (unsigned long)total_tasks,
+          "persistent_wavefront pipeline step %llu [A]: %llu/%llu active, "
+          "%llu rays (rad=%llu ds=%llu shd=%llu st=%llu), "
+          "%llu/%llu tasks done, %s\n",
+          (unsigned long long)pool.total_steps,
+          (unsigned long long)pool.active_count,
+          (unsigned long long)pool.pool_size,
+          (unsigned long long)pv_a->ray_count,
+          (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_RADIATIVE],
+          (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_STEP_PAIR],
+          (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_SHADOW],
+          (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_STARTUP],
+          (unsigned long long)(pool.paths_completed + pool.paths_failed),
+          (unsigned long long)total_tasks,
           pool.in_drain_phase ? "DRAIN" : "refill");
       }
       { /* STARDIS_PIPELINE_LOG */
         const char* env_log = getenv("STARDIS_PIPELINE_LOG");
         if(env_log && env_log[0] == '1') {
           log_info(scn->dev,
-            "[A] step %lu: rays=%lu, active=%lu\n",
-            (unsigned long)pool.total_steps,
-            (unsigned long)pv_a->ray_count,
-            (unsigned long)pv_a->active_compact);
+            "[A] step %llu: rays=%llu, active=%llu\n",
+            (unsigned long long)pool.total_steps,
+            (unsigned long long)pv_a->ray_count,
+            (unsigned long long)pv_a->active_compact);
         }
       }
       if(pool.total_steps > total_tasks * 1000) {
         log_err(scn->dev,
-          "pipeline: infinite loop safety break at step %lu\n",
-          (unsigned long)pool.total_steps);
+          "pipeline: infinite loop safety break at step %llu\n",
+          (unsigned long long)pool.total_steps);
         res = RES_BAD_OP;
         goto cleanup;
       }
@@ -2776,10 +2869,10 @@ solve_camera_persistent_wavefront(
         time_current(&t_now);
         pool.time_refill_phase_s = time_elapsed_sec(&t_start, &t_now);
         log_info(scn->dev,
-          "persistent_wavefront: entering drain phase at step %lu, "
-          "%lu active paths remain, refill_wall=%.3fs\n",
-          (unsigned long)pool.total_steps,
-          (unsigned long)pool.active_count,
+          "persistent_wavefront: entering drain phase at step %llu, "
+          "%llu active paths remain, refill_wall=%.3fs\n",
+          (unsigned long long)pool.total_steps,
+          (unsigned long long)pool.active_count,
           pool.time_refill_phase_s);
       }
       pool_update_diagnostics(&pool, pv_b);
@@ -2800,35 +2893,35 @@ solve_camera_persistent_wavefront(
       || (pool.in_drain_phase && pool.drain_step_count % 500 == 0
        && pool.active_count > 0)) {
         log_info(scn->dev,
-          "persistent_wavefront pipeline step %lu [B]: %lu/%lu active, "
-          "%lu rays (rad=%lu ds=%lu shd=%lu st=%lu), "
-          "%lu/%lu tasks done, %s\n",
-          (unsigned long)pool.total_steps,
-          (unsigned long)pool.active_count,
-          (unsigned long)pool.pool_size,
-          (unsigned long)pv_b->ray_count,
-          (unsigned long)pv_b->bucket_counts[RAY_BUCKET_RADIATIVE],
-          (unsigned long)pv_b->bucket_counts[RAY_BUCKET_STEP_PAIR],
-          (unsigned long)pv_b->bucket_counts[RAY_BUCKET_SHADOW],
-          (unsigned long)pv_b->bucket_counts[RAY_BUCKET_STARTUP],
-          (unsigned long)(pool.paths_completed + pool.paths_failed),
-          (unsigned long)total_tasks,
+          "persistent_wavefront pipeline step %llu [B]: %llu/%llu active, "
+          "%llu rays (rad=%llu ds=%llu shd=%llu st=%llu), "
+          "%llu/%llu tasks done, %s\n",
+          (unsigned long long)pool.total_steps,
+          (unsigned long long)pool.active_count,
+          (unsigned long long)pool.pool_size,
+          (unsigned long long)pv_b->ray_count,
+          (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_RADIATIVE],
+          (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_STEP_PAIR],
+          (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_SHADOW],
+          (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_STARTUP],
+          (unsigned long long)(pool.paths_completed + pool.paths_failed),
+          (unsigned long long)total_tasks,
           pool.in_drain_phase ? "DRAIN" : "refill");
       }
       { /* STARDIS_PIPELINE_LOG */
         const char* env_log = getenv("STARDIS_PIPELINE_LOG");
         if(env_log && env_log[0] == '1') {
           log_info(scn->dev,
-            "[B] step %lu: rays=%lu, active=%lu\n",
-            (unsigned long)pool.total_steps,
-            (unsigned long)pv_b->ray_count,
-            (unsigned long)pv_b->active_compact);
+            "[B] step %llu: rays=%llu, active=%llu\n",
+            (unsigned long long)pool.total_steps,
+            (unsigned long long)pv_b->ray_count,
+            (unsigned long long)pv_b->active_compact);
         }
       }
       if(pool.total_steps > total_tasks * 1000) {
         log_err(scn->dev,
-          "pipeline: infinite loop safety break at step %lu\n",
-          (unsigned long)pool.total_steps);
+          "pipeline: infinite loop safety break at step %llu\n",
+          (unsigned long long)pool.total_steps);
         res = RES_BAD_OP;
         goto cleanup;
       }
@@ -2846,16 +2939,16 @@ solve_camera_persistent_wavefront(
           double cpuB    = time_elapsed_sec(&t_cy[5], &t_cy[6]) * 1000.0;
           double cycle   = time_elapsed_sec(&t_cy[0], &t_cy[6]) * 1000.0;
           log_info(scn->dev,
-            "[TIMELINE] step=%lu "
+            "[TIMELINE] step=%llu "
             "|waitA=%.2fms|launchB=%.2fms|cpuA=%.2fms"
             "|waitB=%.2fms|launchA=%.2fms|cpuB=%.2fms"
-            "|cycle=%.2fms raysA=%lu raysB=%lu\n",
-            (unsigned long)pool.total_steps,
+            "|cycle=%.2fms raysA=%llu raysB=%llu\n",
+            (unsigned long long)pool.total_steps,
             waitA, launchB, cpuA,
             waitB, launchA, cpuB,
             cycle,
-            (unsigned long)pv_a->ray_count,
-            (unsigned long)pv_b->ray_count);
+            (unsigned long long)pv_a->ray_count,
+            (unsigned long long)pv_b->ray_count);
         }
       }
 
@@ -2871,11 +2964,11 @@ solve_camera_persistent_wavefront(
           if(res != RES_OK) goto cleanup;
         }
         log_info(scn->dev,
-          "pipeline: merging to single-pool at step %lu "
-          "(A.active=%lu, B.active=%lu)\n",
-          (unsigned long)pool.total_steps,
-          (unsigned long)pv_a->active_compact,
-          (unsigned long)pv_b->active_compact);
+          "pipeline: merging to single-pool at step %llu "
+          "(A.active=%llu, B.active=%llu)\n",
+          (unsigned long long)pool.total_steps,
+          (unsigned long long)pv_a->active_compact,
+          (unsigned long long)pv_b->active_compact);
         merge_to_single_pool(&pool);
         break;  /* fall through to single-pool loop */
       }
@@ -2908,12 +3001,12 @@ solve_camera_persistent_wavefront(
       if(pipeline_wall <= 0) pipeline_wall = 1e-9;
       log_info(scn->dev,
         "pipeline stats: wall=%.3fs, gpu_wait=%.3fs, cpu_between=%.3fs, "
-        "gpu_util=%.1f%%, steps=%lu\n",
+        "gpu_util=%.1f%%, steps=%llu\n",
         pipeline_wall,
         pool.time_pipeline_wait_s,
         pool.time_pipeline_cpu_between_s,
         100.0 * (1.0 - pool.time_pipeline_gpu_idle_s / pipeline_wall),
-        (unsigned long)pool.total_steps);
+        (unsigned long long)pool.total_steps);
     }
   } /* end if(num_active_views == 2) */
 
@@ -3034,12 +3127,41 @@ solve_camera_persistent_wavefront(
     time_current(&t_phase1);
     pool.time_cp_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
+    /* P1 SYNC POINT A (single-pool): distribute + enc_locate + cp finished
+     * — refresh dsoa for all modified slots before cascade and next cycle's
+     * compact/collect which read from dsoa. */
+    {
+      size_t k;
+      for(k = 0; k < pv->need_ray_count; k++) {
+        uint32_t idx = pv->need_ray_indices[k];
+        dispatch_soa_sync_from_path(&pool.dsoa, idx, &pool.slots[idx]);
+      }
+      for(k = 0; k < pv->enc_locate_count; k++) {
+        uint32_t idx = pv->enc_locate_to_slot[k];
+        dispatch_soa_sync_from_path(&pool.dsoa, idx, &pool.slots[idx]);
+      }
+      for(k = 0; k < pv->cp_count; k++) {
+        uint32_t idx = pv->cp_to_slot[k];
+        dispatch_soa_sync_from_path(&pool.dsoa, idx, &pool.slots[idx]);
+      }
+    }
+
     /* Step E: Cascade non-ray steps (compact) */
     time_current(&t_phase0);
     res = pool_cascade_non_ray_steps_compact(&pool, pv, scn);
     if(res != RES_OK) goto cleanup;
     time_current(&t_phase1);
     pool.time_cascade_s += time_elapsed_sec(&t_phase0, &t_phase1);
+
+    /* P1 SYNC POINT B (single-pool): cascade finished — refresh dsoa for
+     * all active slots before compact + harvest read from dsoa. */
+    {
+      size_t k;
+      for(k = 0; k < pv->active_compact; k++) {
+        uint32_t idx = pv->active_indices[k];
+        dispatch_soa_sync_from_path(&pool.dsoa, idx, &pool.slots[idx]);
+      }
+    }
 
     /* Step F+G: Harvest completed paths + refill (timed together) */
     time_current(&t_phase0);
@@ -3066,10 +3188,10 @@ solve_camera_persistent_wavefront(
         pool.time_refill_phase_s = time_elapsed_sec(&t_start, &t_now);
       }
       log_info(scn->dev,
-        "persistent_wavefront: entering drain phase at step %lu, "
-        "%lu active paths remain, refill_wall=%.3fs\n",
-        (unsigned long)pool.total_steps,
-        (unsigned long)pool.active_count,
+        "persistent_wavefront: entering drain phase at step %llu, "
+        "%llu active paths remain, refill_wall=%.3fs\n",
+        (unsigned long long)pool.total_steps,
+        (unsigned long long)pool.active_count,
         pool.time_refill_phase_s);
     }
 
@@ -3097,29 +3219,29 @@ solve_camera_persistent_wavefront(
     || (pool.in_drain_phase && pool.drain_step_count % 500 == 0
      && pool.active_count > 0)) {
       log_info(scn->dev,
-        "persistent_wavefront step %lu: %lu/%lu active, "
-        "%lu rays this step (rad=%lu ds=%lu shd=%lu st=%lu), "
-        "%lu/%lu tasks done, %s\n",
-        (unsigned long)pool.total_steps,
-        (unsigned long)pool.active_count,
-        (unsigned long)pool.pool_size,
-        (unsigned long)pv->ray_count,
-        (unsigned long)pv->bucket_counts[RAY_BUCKET_RADIATIVE],
-        (unsigned long)pv->bucket_counts[RAY_BUCKET_STEP_PAIR],
-        (unsigned long)pv->bucket_counts[RAY_BUCKET_SHADOW],
-        (unsigned long)pv->bucket_counts[RAY_BUCKET_STARTUP],
-        (unsigned long)(pool.paths_completed + pool.paths_failed),
-        (unsigned long)total_tasks,
+        "persistent_wavefront step %llu: %llu/%llu active, "
+        "%llu rays this step (rad=%llu ds=%llu shd=%llu st=%llu), "
+        "%llu/%llu tasks done, %s\n",
+        (unsigned long long)pool.total_steps,
+        (unsigned long long)pool.active_count,
+        (unsigned long long)pool.pool_size,
+        (unsigned long long)pv->ray_count,
+        (unsigned long long)pv->bucket_counts[RAY_BUCKET_RADIATIVE],
+        (unsigned long long)pv->bucket_counts[RAY_BUCKET_STEP_PAIR],
+        (unsigned long long)pv->bucket_counts[RAY_BUCKET_SHADOW],
+        (unsigned long long)pv->bucket_counts[RAY_BUCKET_STARTUP],
+        (unsigned long long)(pool.paths_completed + pool.paths_failed),
+        (unsigned long long)total_tasks,
         pool.in_drain_phase ? "DRAIN" : "refill");
     }
 
     /* Safety: prevent infinite loops */
     if(pool.total_steps > total_tasks * 1000) {
       log_err(scn->dev,
-        "persistent_wavefront: exceeded maximum step count (%lu). "
-        "%lu paths still active.\n",
-        (unsigned long)pool.total_steps,
-        (unsigned long)pool.active_count);
+        "persistent_wavefront: exceeded maximum step count (%llu). "
+        "%llu paths still active.\n",
+        (unsigned long long)pool.total_steps,
+        (unsigned long long)pool.active_count);
       res = RES_BAD_OP;
       goto cleanup;
     }
@@ -3143,35 +3265,35 @@ solve_camera_persistent_wavefront(
     if(pool.total_steps > 0)
       avg_width = (double)pool.diag_total_active / (double)pool.total_steps;
     log_info(scn->dev,
-      "persistent_wavefront DONE: %lux%lu spp=%lu pool=%lu "
-      "elapsed=%s  steps=%lu  rays=%lu  avg_width=%.1f  "
-      "(rad=%lu cond_ds=%lu ds_retry=%lu)  "
-      "done: rad=%lu temp=%lu bnd=%lu fail=%lu  "
-      "max_depth=%lu\n",
-      (unsigned long)image_def[0], (unsigned long)image_def[1],
-      (unsigned long)spp, (unsigned long)pool.pool_size,
+      "persistent_wavefront DONE: %llux%llu spp=%llu pool=%llu "
+      "elapsed=%s  steps=%llu  rays=%llu  avg_width=%.1f  "
+      "(rad=%llu cond_ds=%llu ds_retry=%llu)  "
+      "done: rad=%llu temp=%llu bnd=%llu fail=%llu  "
+      "max_depth=%llu\n",
+      (unsigned long long)image_def[0], (unsigned long long)image_def[1],
+      (unsigned long long)spp, (unsigned long long)pool.pool_size,
       time_str,
-      (unsigned long)pool.total_steps,
-      (unsigned long)pool.total_rays_traced,
+      (unsigned long long)pool.total_steps,
+      (unsigned long long)pool.total_rays_traced,
       avg_width,
-      (unsigned long)pool.rays_radiative,
-      (unsigned long)pool.rays_conductive_ds,
-      (unsigned long)pool.rays_conductive_ds_retry,
-      (unsigned long)pool.paths_done_radiative,
-      (unsigned long)pool.paths_done_temperature,
-      (unsigned long)pool.paths_done_boundary,
-      (unsigned long)pool.paths_failed,
-      (unsigned long)pool.max_path_depth);
+      (unsigned long long)pool.rays_radiative,
+      (unsigned long long)pool.rays_conductive_ds,
+      (unsigned long long)pool.rays_conductive_ds_retry,
+      (unsigned long long)pool.paths_done_radiative,
+      (unsigned long long)pool.paths_done_temperature,
+      (unsigned long long)pool.paths_done_boundary,
+      (unsigned long long)pool.paths_failed,
+      (unsigned long long)pool.max_path_depth);
   }
 
   /* M9: WoS closest_point batch summary */
   if(pool.cp_total > 0) {
     log_info(scn->dev,
-      "persistent_wavefront CP (WoS): %lu queries, "
-      "%lu gpu-accepted, %lu requeried, %.3fs total\n",
-      (unsigned long)pool.cp_total,
-      (unsigned long)pool.cp_accepted,
-      (unsigned long)pool.cp_requeried,
+      "persistent_wavefront CP (WoS): %llu queries, "
+      "%llu gpu-accepted, %llu requeried, %.3fs total\n",
+      (unsigned long long)pool.cp_total,
+      (unsigned long long)pool.cp_accepted,
+      (unsigned long long)pool.cp_requeried,
       pool.time_cp_s);
   }
 

@@ -150,11 +150,13 @@ static void
 test_wos_init_enc_query(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
 
   printf("  T9.1: WoS init ENC query chain ...\n");
 
   /* Part A: first entry (wos_initialized=0) -> ENC query */
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.ctx.diff_algo = SDIS_DIFFUSION_WOS;
   p.locals.cnd_wos.wos_initialized = 0;
@@ -162,26 +164,27 @@ test_wos_init_enc_query(void)
   p.rwalk.vtx.P[1] = 0.5;
   p.rwalk.vtx.P[2] = 0.5;
 
-  OK(step_conductive(&p, g_scn));
+  OK(step_conductive(&p, g_scn, &enc));
 
   CHK(p.phase == PATH_ENC_QUERY_EMIT);
   CHK(p.needs_ray == 1);
-  CHK(p.enc_query.return_state == PATH_CND_WOS_CHECK_TEMP);
+  CHK(enc.return_state == PATH_CND_WOS_CHECK_TEMP);
   CHK(p.ray_count_ext == 6);
   CHK(p.ray_bucket == RAY_BUCKET_ENCLOSURE);
-  CHK(fabs(p.enc_query.query_pos[0] - 0.5) < 1.e-10);
-  CHK(fabs(p.enc_query.query_pos[1] - 0.5) < 1.e-10);
-  CHK(fabs(p.enc_query.query_pos[2] - 0.5) < 1.e-10);
+  CHK(fabs(enc.query_pos[0] - 0.5) < 1.e-10);
+  CHK(fabs(enc.query_pos[1] - 0.5) < 1.e-10);
+  CHK(fabs(enc.query_pos[2] - 0.5) < 1.e-10);
 
   printf("    Part A: step_conductive -> PATH_ENC_QUERY_EMIT  PASS\n");
 
   /* Part B: re-entry (wos_initialized=1) -> direct CHECK_TEMP */
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.ctx.diff_algo = SDIS_DIFFUSION_WOS;
   p.locals.cnd_wos.wos_initialized = 1;
 
-  OK(step_conductive(&p, g_scn));
+  OK(step_conductive(&p, g_scn, &enc));
 
   CHK(p.phase == PATH_CND_WOS_CHECK_TEMP);
   CHK(p.needs_ray == 0);
@@ -197,6 +200,7 @@ static void
 test_wos_check_temp_known(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   res_T res;
 
   printf("  T9.2: WoS check_temp with known T -> PATH_DONE ...\n");
@@ -204,6 +208,7 @@ test_wos_check_temp_known(void)
   /* Set up a path_state at box centre with known temperature.
    * We use a temporary scene with a solid that returns T=300. */
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.rng = g_rng;
   p.rwalk.vtx.P[0] = 0.5;
@@ -243,10 +248,12 @@ static void
 test_wos_closest_submit(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
 
   printf("  T9.3: WoS closest submits batch CP request ...\n");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.rwalk.vtx.P[0] = 0.3;
   p.rwalk.vtx.P[1] = 0.4;
@@ -284,6 +291,7 @@ static void
 test_wos_closest_result_epsilon_shell(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   res_T res;
   struct s3d_hit fake_hit;
   unsigned encs[2];
@@ -291,6 +299,7 @@ test_wos_closest_result_epsilon_shell(void)
   printf("  T9.4: WoS closest_result epsilon-shell -> TIME_TRAVEL ...\n");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.rng = g_rng;
   p.rwalk.vtx.P[0] = 0.5;
@@ -340,10 +349,12 @@ static void
 test_wos_fallback_trace_emit(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
 
   printf("  T9.5: WoS fallback_trace emits 1 ray ... ");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.rwalk.vtx.P[0] = 0.5;
   p.rwalk.vtx.P[1] = 0.5;
@@ -384,6 +395,7 @@ static void
 test_wos_fallback_result_miss(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   struct s3d_hit hit_rt;
   struct s3d_hit cached;
   unsigned encs[2];
@@ -392,6 +404,7 @@ test_wos_fallback_result_miss(void)
   printf("  T9.6: WoS fallback_result miss -> snap to cached ...\n");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.rng = g_rng;
   p.rwalk.vtx.P[0] = 0.5;
@@ -438,11 +451,13 @@ static void
 test_wos_time_travel_boundary(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   res_T res;
 
   printf("  T9.7: WoS time_travel with boundary hit -> COUPLED_BOUNDARY ...\n");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.rng = g_rng;
   p.rwalk.vtx.P[0] = 0.5;
@@ -488,11 +503,13 @@ static void
 test_wos_time_travel_loop(void)
 {
   struct path_state p;
+  struct path_enc_data enc;
   res_T res;
 
   printf("  T9.7b: WoS time_travel no hit -> CHECK_TEMP (loop) ...\n");
 
   memset(&p, 0, sizeof(p));
+  memset(&enc, 0, sizeof(enc));
   p.active = 1;
   p.rng = g_rng;
   p.rwalk.vtx.P[0] = 0.5;
