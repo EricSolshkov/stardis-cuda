@@ -868,15 +868,39 @@ pool_collect_ray_requests_compact(struct wavefront_pool* pool)
 
     ASSERT(p->active && p->needs_ray && p->ray_req.ray_count >= 1);
 
-    /* Detailed stats by phase type */
-    if(p->phase == PATH_RAD_TRACE_PENDING)
-      pool->rays_radiative += (size_t)p->ray_req.ray_count;
-    else if(p->phase == PATH_COUPLED_COND_DS_PENDING
-         || p->phase == PATH_CND_DS_STEP_TRACE) {
-      if(p->ds_robust_attempt > 0)
-        pool->rays_conductive_ds_retry += (size_t)p->ray_req.ray_count;
-      else
-        pool->rays_conductive_ds += (size_t)p->ray_req.ray_count;
+    /* Detailed stats by phase — semantic layer + per-phase layer.
+     * NOTE: compact collect lacks SoA; inline count_path_rays logic. */
+    {
+      size_t nrays = (p->phase == PATH_ENC_QUERY_EMIT
+                   && p->ray_req.ray_count >= 2) ? 6
+                   : (size_t)p->ray_req.ray_count;
+      switch(p->phase) {
+      case PATH_RAD_TRACE_PENDING:
+      case PATH_BND_SF_NULLCOLL_RAD_TRACE:
+      case PATH_BND_SFN_RAD_TRACE:
+      case PATH_BND_EXT_DIFFUSE_TRACE:
+      case PATH_CND_WOS_FALLBACK_TRACE:
+      case PATH_COUPLED_BOUNDARY_REINJECT:
+      case PATH_BND_SS_REINJECT_SAMPLE:
+      case PATH_BND_SF_REINJECT_SAMPLE:
+        pool->rays_radiative += nrays; break;
+      case PATH_COUPLED_COND_DS_PENDING:
+      case PATH_CND_DS_STEP_TRACE:
+        if(p->ds_robust_attempt > 0) pool->rays_conductive_ds_retry += nrays;
+        else                         pool->rays_conductive_ds += nrays;
+        break;
+      case PATH_BND_EXT_DIRECT_TRACE:
+      case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
+        pool->rays_shadow += nrays; break;
+      case PATH_ENC_QUERY_EMIT:
+      case PATH_ENC_QUERY_FB_EMIT:
+      case PATH_CND_INIT_ENC:
+        pool->rays_enclosure += nrays; break;
+      case PATH_CNV_STARTUP_TRACE:
+        pool->rays_startup += nrays; break;
+      default:
+        pool->rays_other += nrays; break;
+      }
     }
 
     /* Ray 0 */
@@ -993,6 +1017,15 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
   /* Max OMP threads for stack-allocated per-thread arrays */
   #define COLLECT_MAX_THREADS 32
 
+  /* Zero per-view pending stats (promoted to pool after trace completes) */
+  pv->pending_rays_radiative           = 0;
+  pv->pending_rays_conductive_ds       = 0;
+  pv->pending_rays_conductive_ds_retry = 0;
+  pv->pending_rays_shadow              = 0;
+  pv->pending_rays_enclosure           = 0;
+  pv->pending_rays_startup             = 0;
+  pv->pending_rays_other               = 0;
+
   /* OMP toggle: STARDIS_COLLECT_OMP=0 disables */
   {
     const char* env = getenv("STARDIS_COLLECT_OMP");
@@ -1080,7 +1113,9 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
       size_t tl_rays_cond_ds = 0;
       size_t tl_rays_cond_ds_retry = 0;
       size_t tl_rays_shadow = 0;
+      size_t tl_rays_enclosure = 0;
       size_t tl_rays_startup = 0;
+      size_t tl_rays_other = 0;
 
       for(bb = 0; bb < RAY_BUCKET_COUNT; bb++)
         my_cursor[bb] = tl_write_base[tid][bb];
@@ -1093,20 +1128,38 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
         int bkt = (int)pool->dsoa.ray_bucket[i];  /* P1: from SoA */
         enum path_phase ph_i = pool->dsoa.phase[i]; /* P1: from SoA */
 
-        /* Thread-local stats accumulation */
-        if(ph_i == PATH_RAD_TRACE_PENDING)
-          tl_rays_radiative += (size_t)p->ray_req.ray_count;
-        else if(ph_i == PATH_COUPLED_COND_DS_PENDING
-             || ph_i == PATH_CND_DS_STEP_TRACE) {
-          if(p->ds_robust_attempt > 0)
-            tl_rays_cond_ds_retry += (size_t)p->ray_req.ray_count;
-          else
-            tl_rays_cond_ds += (size_t)p->ray_req.ray_count;
+        /* Thread-local stats accumulation — semantic + per-phase */
+        {
+          size_t nrays = count_path_rays_soa(
+            ph_i, pool->dsoa.ray_count_ext[i], p);
+          switch(ph_i) {
+          case PATH_RAD_TRACE_PENDING:
+          case PATH_BND_SF_NULLCOLL_RAD_TRACE:
+          case PATH_BND_SFN_RAD_TRACE:
+          case PATH_BND_EXT_DIFFUSE_TRACE:
+          case PATH_CND_WOS_FALLBACK_TRACE:
+          case PATH_COUPLED_BOUNDARY_REINJECT:
+          case PATH_BND_SS_REINJECT_SAMPLE:
+          case PATH_BND_SF_REINJECT_SAMPLE:
+            tl_rays_radiative += nrays; break;
+          case PATH_COUPLED_COND_DS_PENDING:
+          case PATH_CND_DS_STEP_TRACE:
+            if(p->ds_robust_attempt > 0) tl_rays_cond_ds_retry += nrays;
+            else                         tl_rays_cond_ds += nrays;
+            break;
+          case PATH_BND_EXT_DIRECT_TRACE:
+          case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
+            tl_rays_shadow += nrays; break;
+          case PATH_ENC_QUERY_EMIT:
+          case PATH_ENC_QUERY_FB_EMIT:
+          case PATH_CND_INIT_ENC:
+            tl_rays_enclosure += nrays; break;
+          case PATH_CNV_STARTUP_TRACE:
+            tl_rays_startup += nrays; break;
+          default:
+            tl_rays_other += nrays; break;
+          }
         }
-        if(bkt == RAY_BUCKET_SHADOW)
-          tl_rays_shadow += count_path_rays_soa(ph_i, pool->dsoa.ray_count_ext[i], p);
-        else if(bkt == RAY_BUCKET_STARTUP)
-          tl_rays_startup += count_path_rays_soa(ph_i, pool->dsoa.ray_count_ext[i], p);
 
         /* --- Emit ray 0 --- */
         {
@@ -1185,11 +1238,13 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
 
       #pragma omp critical
       {
-        pool->rays_radiative         += tl_rays_radiative;
-        pool->rays_conductive_ds     += tl_rays_cond_ds;
-        pool->rays_conductive_ds_retry += tl_rays_cond_ds_retry;
-        pool->rays_shadow            += tl_rays_shadow;
-        pool->rays_startup           += tl_rays_startup;
+        pv->pending_rays_radiative           += tl_rays_radiative;
+        pv->pending_rays_conductive_ds       += tl_rays_cond_ds;
+        pv->pending_rays_conductive_ds_retry += tl_rays_cond_ds_retry;
+        pv->pending_rays_shadow              += tl_rays_shadow;
+        pv->pending_rays_enclosure           += tl_rays_enclosure;
+        pv->pending_rays_startup             += tl_rays_startup;
+        pv->pending_rays_other               += tl_rays_other;
       }
     } /* end omp parallel */
 
@@ -1232,19 +1287,39 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
       int bkt = (int)pool->dsoa.ray_bucket[i];   /* P1: from SoA */
       enum path_phase ph_i = pool->dsoa.phase[i]; /* P1: from SoA */
 
-      if(ph_i == PATH_RAD_TRACE_PENDING)
-        pool->rays_radiative += (size_t)p->ray_req.ray_count;
-      else if(ph_i == PATH_COUPLED_COND_DS_PENDING
-           || ph_i == PATH_CND_DS_STEP_TRACE) {
-        if(p->ds_robust_attempt > 0)
-          pool->rays_conductive_ds_retry += (size_t)p->ray_req.ray_count;
-        else
-          pool->rays_conductive_ds += (size_t)p->ray_req.ray_count;
+      /* Semantic + per-phase stats (written to pv->pending_*,
+       * promoted to pool after trace completes) */
+      {
+        size_t nrays = count_path_rays_soa(
+          ph_i, pool->dsoa.ray_count_ext[i], p);
+        switch(ph_i) {
+        case PATH_RAD_TRACE_PENDING:
+        case PATH_BND_SF_NULLCOLL_RAD_TRACE:
+        case PATH_BND_SFN_RAD_TRACE:
+        case PATH_BND_EXT_DIFFUSE_TRACE:
+        case PATH_CND_WOS_FALLBACK_TRACE:
+        case PATH_COUPLED_BOUNDARY_REINJECT:
+        case PATH_BND_SS_REINJECT_SAMPLE:
+        case PATH_BND_SF_REINJECT_SAMPLE:
+          pv->pending_rays_radiative += nrays; break;
+        case PATH_COUPLED_COND_DS_PENDING:
+        case PATH_CND_DS_STEP_TRACE:
+          if(p->ds_robust_attempt > 0) pv->pending_rays_conductive_ds_retry += nrays;
+          else                         pv->pending_rays_conductive_ds += nrays;
+          break;
+        case PATH_BND_EXT_DIRECT_TRACE:
+        case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
+          pv->pending_rays_shadow += nrays; break;
+        case PATH_ENC_QUERY_EMIT:
+        case PATH_ENC_QUERY_FB_EMIT:
+        case PATH_CND_INIT_ENC:
+          pv->pending_rays_enclosure += nrays; break;
+        case PATH_CNV_STARTUP_TRACE:
+          pv->pending_rays_startup += nrays; break;
+        default:
+          pv->pending_rays_other += nrays; break;
+        }
       }
-      if(bkt == RAY_BUCKET_SHADOW)
-        pool->rays_shadow += count_path_rays_soa(ph_i, pool->dsoa.ray_count_ext[i], p);
-      else if(bkt == RAY_BUCKET_STARTUP)
-        pool->rays_startup += count_path_rays_soa(ph_i, pool->dsoa.ray_count_ext[i], p);
 
       {
         size_t ray_idx = ser_cursor[bkt]++;
@@ -2115,8 +2190,8 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     "  refill_phase: rays=%llu (%.1f%%)  wall=%.3fs\n"
     "  drain_phase:  rays=%llu (%.1f%%)  steps=%llu  wall=%.3fs\n"
     "  batch_size: min=%llu, max=%llu\n"
-    "  ray_buckets: radiative=%llu, step_pair=%llu, "
-    "shadow=%llu, startup=%llu\n"
+    "  rays: radiative=%llu  cond_ds=%llu(retry=%llu)  "
+    "shadow=%llu  enclosure=%llu  startup=%llu  other=%llu\n"
     "  paths: completed=%llu, failed=%llu, truncated=%llu, max_depth=%llu\n"
     "  refills=%llu\n"
     "  timing: compact=%.3fs  collect=%.3fs  trace=%.3fs  "
@@ -2136,8 +2211,11 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     (unsigned long long)pool->diag_max_batch,
     (unsigned long long)pool->rays_radiative,
     (unsigned long long)pool->rays_conductive_ds,
+    (unsigned long long)pool->rays_conductive_ds_retry,
     (unsigned long long)pool->rays_shadow,
+    (unsigned long long)pool->rays_enclosure,
     (unsigned long long)pool->rays_startup,
+    (unsigned long long)pool->rays_other,
     (unsigned long long)pool->paths_completed,
     (unsigned long long)pool->paths_failed,
     (unsigned long long)pool->paths_truncated,
@@ -2149,6 +2227,26 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     pool->time_distribute_s,
     pool->time_cascade_s,
     pool->time_harvest_s);
+
+  /* Verify ray stats sum == total_rays_traced */
+  {
+    size_t sum = pool->rays_radiative
+               + pool->rays_conductive_ds
+               + pool->rays_conductive_ds_retry
+               + pool->rays_shadow
+               + pool->rays_enclosure
+               + pool->rays_startup
+               + pool->rays_other;
+    if(sum != pool->total_rays_traced) {
+      log_info(dev,
+        "  WARNING: ray stats sum=%llu != total_rays_traced=%llu "
+        "(delta=%lld)\n",
+        (unsigned long long)sum,
+        (unsigned long long)pool->total_rays_traced,
+        (long long)((long long)sum - (long long)pool->total_rays_traced));
+    }
+    ASSERT(sum == pool->total_rays_traced);
+  }
 
   /* Enclosure query escalation stats */
   if(pool->enc_query_escalated_to_m10 > 0
@@ -2329,6 +2427,22 @@ gpu_wait_and_postprocess(struct wavefront_pool* pool,
     pv->gpu_pending = 0;
 
     pool->total_rays_traced += pv->ray_count;
+
+    /* Promote per-view pending ray stats to pool-level counters.
+     * Stats were accumulated during collect; they are only committed
+     * here after the GPU trace actually completes, so untrace'd views
+     * (e.g. last pipeline iteration that exits before launch) never
+     * pollute the pool totals. */
+    {
+      pool->rays_radiative           += pv->pending_rays_radiative;
+      pool->rays_conductive_ds       += pv->pending_rays_conductive_ds;
+      pool->rays_conductive_ds_retry += pv->pending_rays_conductive_ds_retry;
+      pool->rays_shadow              += pv->pending_rays_shadow;
+      pool->rays_enclosure           += pv->pending_rays_enclosure;
+      pool->rays_startup             += pv->pending_rays_startup;
+      pool->rays_other               += pv->pending_rays_other;
+    }
+
     pool->trace_call_count++;
     pool->trace_batch_size_sum   += pv->ray_count;
     pool->trace_batch_time_ms_sum  += stats.batch_time_ms;
@@ -2805,7 +2919,7 @@ solve_camera_persistent_wavefront(
        && pool.active_count > 0)) {
         log_info(scn->dev,
           "persistent_wavefront pipeline step %llu [A]: %llu/%llu active, "
-          "%llu rays (rad=%llu ds=%llu shd=%llu st=%llu), "
+          "%llu rays (rad=%llu ds=%llu shd=%llu enc=%llu st=%llu), "
           "%llu/%llu tasks done, %s\n",
           (unsigned long long)pool.total_steps,
           (unsigned long long)pool.active_count,
@@ -2814,6 +2928,7 @@ solve_camera_persistent_wavefront(
           (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_RADIATIVE],
           (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_STEP_PAIR],
           (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_SHADOW],
+          (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_ENCLOSURE],
           (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_STARTUP],
           (unsigned long long)(pool.paths_completed + pool.paths_failed),
           (unsigned long long)total_tasks,
@@ -2894,7 +3009,7 @@ solve_camera_persistent_wavefront(
        && pool.active_count > 0)) {
         log_info(scn->dev,
           "persistent_wavefront pipeline step %llu [B]: %llu/%llu active, "
-          "%llu rays (rad=%llu ds=%llu shd=%llu st=%llu), "
+          "%llu rays (rad=%llu ds=%llu shd=%llu enc=%llu st=%llu), "
           "%llu/%llu tasks done, %s\n",
           (unsigned long long)pool.total_steps,
           (unsigned long long)pool.active_count,
@@ -2903,6 +3018,7 @@ solve_camera_persistent_wavefront(
           (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_RADIATIVE],
           (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_STEP_PAIR],
           (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_SHADOW],
+          (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_ENCLOSURE],
           (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_STARTUP],
           (unsigned long long)(pool.paths_completed + pool.paths_failed),
           (unsigned long long)total_tasks,
@@ -3050,6 +3166,17 @@ solve_camera_persistent_wavefront(
       if(res != RES_OK) goto cleanup;
 
       pool.total_rays_traced += pv->ray_count;
+
+      /* Promote per-view pending ray stats to pool (single-pool path) */
+      {
+        pool.rays_radiative           += pv->pending_rays_radiative;
+        pool.rays_conductive_ds       += pv->pending_rays_conductive_ds;
+        pool.rays_conductive_ds_retry += pv->pending_rays_conductive_ds_retry;
+        pool.rays_shadow              += pv->pending_rays_shadow;
+        pool.rays_enclosure           += pv->pending_rays_enclosure;
+        pool.rays_startup             += pv->pending_rays_startup;
+        pool.rays_other               += pv->pending_rays_other;
+      }
 
       /* Experiment 7+8: accumulate per-call batch trace stats */
       pool.trace_call_count++;
@@ -3220,7 +3347,7 @@ solve_camera_persistent_wavefront(
      && pool.active_count > 0)) {
       log_info(scn->dev,
         "persistent_wavefront step %llu: %llu/%llu active, "
-        "%llu rays this step (rad=%llu ds=%llu shd=%llu st=%llu), "
+        "%llu rays this step (rad=%llu ds=%llu shd=%llu enc=%llu st=%llu), "
         "%llu/%llu tasks done, %s\n",
         (unsigned long long)pool.total_steps,
         (unsigned long long)pool.active_count,
@@ -3229,6 +3356,7 @@ solve_camera_persistent_wavefront(
         (unsigned long long)pv->bucket_counts[RAY_BUCKET_RADIATIVE],
         (unsigned long long)pv->bucket_counts[RAY_BUCKET_STEP_PAIR],
         (unsigned long long)pv->bucket_counts[RAY_BUCKET_SHADOW],
+        (unsigned long long)pv->bucket_counts[RAY_BUCKET_ENCLOSURE],
         (unsigned long long)pv->bucket_counts[RAY_BUCKET_STARTUP],
         (unsigned long long)(pool.paths_completed + pool.paths_failed),
         (unsigned long long)total_tasks,
@@ -3267,7 +3395,8 @@ solve_camera_persistent_wavefront(
     log_info(scn->dev,
       "persistent_wavefront DONE: %llux%llu spp=%llu pool=%llu "
       "elapsed=%s  steps=%llu  rays=%llu  avg_width=%.1f  "
-      "(rad=%llu cond_ds=%llu ds_retry=%llu)  "
+      "(rad=%llu cond_ds=%llu(retry=%llu) shadow=%llu enc=%llu "
+      "startup=%llu other=%llu)  "
       "done: rad=%llu temp=%llu bnd=%llu fail=%llu  "
       "max_depth=%llu\n",
       (unsigned long long)image_def[0], (unsigned long long)image_def[1],
@@ -3279,6 +3408,10 @@ solve_camera_persistent_wavefront(
       (unsigned long long)pool.rays_radiative,
       (unsigned long long)pool.rays_conductive_ds,
       (unsigned long long)pool.rays_conductive_ds_retry,
+      (unsigned long long)pool.rays_shadow,
+      (unsigned long long)pool.rays_enclosure,
+      (unsigned long long)pool.rays_startup,
+      (unsigned long long)pool.rays_other,
       (unsigned long long)pool.paths_done_radiative,
       (unsigned long long)pool.paths_done_temperature,
       (unsigned long long)pool.paths_done_boundary,

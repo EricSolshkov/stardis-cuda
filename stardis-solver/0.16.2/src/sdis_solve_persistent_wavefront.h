@@ -139,6 +139,16 @@ struct pool_view {
   /* ---- Async tracking (P4) ---- */
   int gpu_pending;           /* 1 = async GPU trace in flight        */
 
+  /* ---- Per-step pending ray stats (accumulated in collect, promoted
+   *      to pool counters only when trace completes in wait_and_postprocess) */
+  size_t pending_rays_radiative;
+  size_t pending_rays_conductive_ds;
+  size_t pending_rays_conductive_ds_retry;
+  size_t pending_rays_shadow;
+  size_t pending_rays_enclosure;
+  size_t pending_rays_startup;
+  size_t pending_rays_other;
+
   /* ---- View statistics ---- */
   size_t total_rays_traced;
   size_t paths_completed;
@@ -247,12 +257,15 @@ struct wavefront_pool {
   size_t paths_failed;
   size_t max_path_depth;
 
-  /* Detailed ray statistics */
+  /* Detailed ray statistics — semantic layer (7 counters) */
   size_t rays_radiative;
   size_t rays_conductive_ds;
   size_t rays_conductive_ds_retry;
   size_t rays_shadow;
+  size_t rays_enclosure;
   size_t rays_startup;
+  size_t rays_other;          /* catch-all: nonzero ⇒ classification bug */
+
   size_t paths_done_radiative;
   size_t paths_done_temperature;
   size_t paths_done_boundary;
