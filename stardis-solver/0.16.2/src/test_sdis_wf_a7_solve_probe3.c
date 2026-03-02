@@ -276,7 +276,7 @@ main(int argc, char** argv)
   solve_args.time_range[0] = INF;
   solve_args.time_range[1] = INF;
 
-  OK(sdis_solve_wavefront_probe(scn, &solve_args, &est_wf));
+  OK(sdis_solve_persistent_wavefront_probe(scn, &solve_args, &est_wf));
   OK(sdis_estimator_get_realisation_count(est_wf, &nreals));
   OK(sdis_estimator_get_failure_count(est_wf, &nfails));
   OK(sdis_estimator_get_temperature(est_wf, &T_mc));

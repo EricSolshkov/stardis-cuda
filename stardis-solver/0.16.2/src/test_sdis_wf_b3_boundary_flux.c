@@ -1,4 +1,4 @@
-/* WF-B3: Boundary flux â€” interior temperature profile (wavefront probe).
+/* WF-B3: Boundary flux â€?interior temperature profile (wavefront probe).
  *
  * Scene (3D only): unit cube solid [0,1]^3 with surrounding fluid.
  *   Solid: lambda=0.1, rho=25, cp=2, delta=1/40
@@ -44,6 +44,7 @@
 #define B3_Tref    300.0
 #define B3_EPSILON 1.0
 #define B3_NREALS  10000
+#define B3_NPROBES_CT 5
 #define B3_TOL_SIGMA 3.0
 #define B3_PASS_RATE 0.95
 
@@ -301,42 +302,50 @@ main(int argc, char** argv)
   OK(sdis_interface_ref_put(interf_H));
 
   /* ================================================================== */
-  /* Solve: steady-state interior probes along x-axis                   */
+  /* Solve: steady-state interior probes along x-axis — batch           */
   /* ================================================================== */
-  printf("  Running %d probes, %d realisations each ...\n",
+  printf("  Running %d probes (batch), %d realisations each ...\n",
     n_probes, B3_NREALS);
 
-  for(i = 0; i < n_probes; i++) {
-    struct sdis_solve_probe_args args = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
-    struct sdis_estimator* est_wf = NULL;
-    struct sdis_mc mc;
-    double ref;
-    int pass;
+  {
+    struct sdis_solve_probe_args args_arr[B3_NPROBES_CT];
+    struct sdis_estimator*       ests[B3_NPROBES_CT];
 
-    args.nrealisations = B3_NREALS;
-    args.position[0] = probe_x[i];
-    args.position[1] = 0.5;
-    args.position[2] = 0.5;
-    args.time_range[0] = INF;
-    args.time_range[1] = INF;
+    for(i = 0; i < n_probes; i++) {
+      args_arr[i] = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+      args_arr[i].nrealisations = B3_NREALS;
+      args_arr[i].position[0]   = probe_x[i];
+      args_arr[i].position[1]   = 0.5;
+      args_arr[i].position[2]   = 0.5;
+      args_arr[i].time_range[0] = INF;
+      args_arr[i].time_range[1] = INF;
+      ests[i] = NULL;
+    }
 
-    OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
-    OK(sdis_estimator_get_temperature(est_wf, &mc));
+    OK(sdis_solve_persistent_wavefront_probe_batch(
+      scn, (size_t)n_probes, args_arr, ests));
 
-    ref = B3_T(probe_x[i]);
-    pass = p0_compare_analytic(est_wf, ref, B3_TOL_SIGMA);
-    n_pass += pass;
+    for(i = 0; i < n_probes; i++) {
+      struct sdis_mc mc;
+      double ref;
+      int pass;
 
-    /* CSV: DS row */
-    csv_row(csv, "B3", "default", "gpu_wf", "DS",
-            probe_x[i], 0.5, 0.5, INF, 1, B3_NREALS, mc.E, mc.SE, ref);
+      OK(sdis_estimator_get_temperature(ests[i], &mc));
 
-    printf("  x=%.1f  wf=%.6f (SE=%.2e)  ref=%.6f  %s (%.1f sigma)\n",
-      probe_x[i], mc.E, mc.SE, ref,
-      pass ? "PASS" : "FAIL",
-      mc.SE > 0 ? fabs(mc.E - ref) / mc.SE : 0.0);
+      ref = B3_T(probe_x[i]);
+      pass = p0_compare_analytic(ests[i], ref, B3_TOL_SIGMA);
+      n_pass += pass;
 
-    OK(sdis_estimator_ref_put(est_wf));
+      csv_row(csv, "B3", "default", "gpu_wf", "DS",
+              probe_x[i], 0.5, 0.5, INF, 1, B3_NREALS, mc.E, mc.SE, ref);
+
+      printf("  x=%.1f  wf=%.6f (SE=%.2e)  ref=%.6f  %s (%.1f sigma)\n",
+        probe_x[i], mc.E, mc.SE, ref,
+        pass ? "PASS" : "FAIL",
+        mc.SE > 0 ? fabs(mc.E - ref) / mc.SE : 0.0);
+
+      OK(sdis_estimator_ref_put(ests[i]));
+    }
   }
 
   csv_close(csv);

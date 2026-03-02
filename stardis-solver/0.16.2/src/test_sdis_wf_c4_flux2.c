@@ -309,7 +309,7 @@ c4_create_interface(struct sdis_device* dev,
 }
 
 /* ========================================================================== */
-/* Reference data (identical to CPU test â€” analytically computed)              */
+/* Reference data (identical to CPU test â€?analytically computed)              */
 /* ========================================================================== */
 struct c4_probe {
   double x;
@@ -425,7 +425,7 @@ main(int argc, char** argv)
   ip.Tref = SDIS_TEMPERATURE_NONE;
   c4_create_interface(dev, solid, dummy, &ip, 1, &interfaces[C4_ADIABATIC]);
 
-  /* Fixed temperature (fluid2 / dummy) â€” right enclosure boundary */
+  /* Fixed temperature (fluid2 / dummy) â€?right enclosure boundary */
   ip.h = 1;
   ip.emissivity = 1;
   ip.phi = SDIS_FLUX_NONE;
@@ -433,7 +433,7 @@ main(int argc, char** argv)
   ip.Tref = 300.0;
   c4_create_interface(dev, fluid2, dummy, &ip, 1, &interfaces[C4_FIXED_TEMPERATURE]);
 
-  /* Solid-fluid with flux (solid / fluid1) â€” left face */
+  /* Solid-fluid with flux (solid / fluid1) â€?left face */
   ip.h = 2;
   ip.emissivity = 1;
   ip.phi = 10000.0;
@@ -442,7 +442,7 @@ main(int argc, char** argv)
   c4_create_interface(dev, solid, fluid1, &ip, 1,
     &interfaces[C4_SOLID_FLUID_WITH_FLUX]);
 
-  /* Solid-fluid (solid / fluid2) â€” right face of solid */
+  /* Solid-fluid (solid / fluid2) â€?right face of solid */
   ip.h = 8;
   ip.emissivity = 1;
   ip.phi = SDIS_FLUX_NONE;
@@ -492,37 +492,59 @@ main(int argc, char** argv)
 
   /* ================================================================== */
   /* Solve: 15 probes at (x, 0, 0), picard_order=1                     */
+  /* Grouped by time_range (5 groups × 3 x-positions per batch)        */
   /* ================================================================== */
-  printf("  Running %lu probes, %d realisations each, picard_order=%d ...\n",
-    (unsigned long)c4_nprobes, C4_NREALS, C4_PICARD);
+  {
+    /* 5 time groups, 3 probes each (stride in c4_probes[]) */
+    static const size_t C4_NPOS = 3;
+    static const size_t C4_NTIMES = 5;
+    size_t g;
 
-  for(i = 0; i < c4_nprobes; i++) {
-    struct sdis_solve_probe_args args = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
-    struct sdis_estimator* est_wf = NULL;
-    struct sdis_mc mc;
-    int pass;
+    printf("  Running %lu probes, %d realisations each, picard_order=%d ...\n",
+      (unsigned long)c4_nprobes, C4_NREALS, C4_PICARD);
+    printf("  (%lu time groups x %lu positions per batch)\n",
+      (unsigned long)C4_NTIMES, (unsigned long)C4_NPOS);
 
-    args.nrealisations = C4_NREALS;
-    args.picard_order = C4_PICARD;
-    args.position[0] = c4_probes[i].x;
-    args.position[1] = 0;
-    args.position[2] = 0;
-    args.time_range[0] = c4_probes[i].time;
-    args.time_range[1] = c4_probes[i].time;
+    for(g = 0; g < C4_NTIMES; g++) {
+      struct sdis_solve_probe_args args_arr[3];
+      struct sdis_estimator*       ests[3];
+      size_t base = g * C4_NPOS;
+      size_t j;
 
-    OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
-    OK(sdis_estimator_get_temperature(est_wf, &mc));
+      for(j = 0; j < C4_NPOS; j++) {
+        args_arr[j] = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+        args_arr[j].nrealisations = C4_NREALS;
+        args_arr[j].picard_order  = C4_PICARD;
+        args_arr[j].position[0]   = c4_probes[base + j].x;
+        args_arr[j].position[1]   = 0;
+        args_arr[j].position[2]   = 0;
+        args_arr[j].time_range[0] = c4_probes[base + j].time;
+        args_arr[j].time_range[1] = c4_probes[base + j].time;
+        ests[j] = NULL;
+      }
 
-    pass = p0_compare_analytic(est_wf, c4_probes[i].ref, C4_TOL_SIGMA);
-    n_pass += pass;
+      OK(sdis_solve_persistent_wavefront_probe_batch(
+        scn, C4_NPOS, args_arr, ests));
 
-    printf("  x=%.2f t=%.0f  wf=%.6f (SE=%.2e)  ref=%.6f  %s (%.1f sigma)\n",
-      c4_probes[i].x, c4_probes[i].time,
-      mc.E, mc.SE, c4_probes[i].ref,
-      pass ? "PASS" : "FAIL",
-      mc.SE > 0 ? fabs(mc.E - c4_probes[i].ref) / mc.SE : 0.0);
+      for(j = 0; j < C4_NPOS; j++) {
+        struct sdis_mc mc;
+        int pass;
+        size_t idx = base + j;
 
-    OK(sdis_estimator_ref_put(est_wf));
+        OK(sdis_estimator_get_temperature(ests[j], &mc));
+
+        pass = p0_compare_analytic(ests[j], c4_probes[idx].ref, C4_TOL_SIGMA);
+        n_pass += pass;
+
+        printf("  x=%.2f t=%.0f  wf=%.6f (SE=%.2e)  ref=%.6f  %s (%.1f sigma)\n",
+          c4_probes[idx].x, c4_probes[idx].time,
+          mc.E, mc.SE, c4_probes[idx].ref,
+          pass ? "PASS" : "FAIL",
+          mc.SE > 0 ? fabs(mc.E - c4_probes[idx].ref) / mc.SE : 0.0);
+
+        OK(sdis_estimator_ref_put(ests[j]));
+      }
+    }
   }
 
   /* ---- Summary ---- */

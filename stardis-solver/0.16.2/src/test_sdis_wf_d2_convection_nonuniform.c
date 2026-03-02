@@ -11,7 +11,7 @@
  *       = (100+30+3020+7300+3400+50) / 50 = 278
  *   Tinf = sum(Hi*Ti) / sum(Hi)
  *        = (100*300+30*310+3020*320+7300*330+3400*340+50*350) / 13900
- *        = 4573900/13900 â‰ˆ 329.1367 K
+ *        = 4573900/13900 â‰?329.1367 K
  *
  * Reference CPU test: test_sdis_convection_non_uniform.c
  */
@@ -247,47 +247,54 @@ main(int argc, char** argv)
   for(i = 0; i < 6; i++)
     OK(sdis_interface_ref_put(iface[i]));
 
-  /* ---- Run manual probe sweep ---- */
-  fprintf(stdout, "  Running %d probes, %d realisations each ...\n",
+  /* ---- Run manual probe sweep — batch ---- */
+  fprintf(stdout, "  Running %d probes (batch), %d realisations each ...\n",
     D2_NPROBES, D2_NREALS);
 
-  for(i = 0; i < D2_NPROBES; i++) {
-    double T_ref = D2_TINF;
-    struct sdis_solve_probe_args args = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
-    struct sdis_estimator *est_wf = NULL, *est_df = NULL;
+  {
+    struct sdis_solve_probe_args args_arr[D2_NPROBES];
+    struct sdis_estimator*       ests[D2_NPROBES];
 
-    args.nrealisations = D2_NREALS;
-    args.position[0] = probe_pos[i][0];
-    args.position[1] = probe_pos[i][1];
-    args.position[2] = probe_pos[i][2];
-    args.picard_order = 1;
-    args.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
-    /* Steady-state: default time_range = {INF, INF} */
-
-    OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
-
-    n_pass_primary += p0_compare_analytic(est_wf, T_ref, P0_TOL_SIGMA);
-
-    /* CSV: primary DS row + complementary WoS variant */
-    {
-      struct sdis_mc mc_csv;
-      OK(sdis_estimator_get_temperature(est_wf, &mc_csv));
-      csv_row(csv, "D2", "default", "gpu_wf", "DS",
-              probe_pos[i][0], probe_pos[i][1], probe_pos[i][2],
-              INF, 1, D2_NREALS, mc_csv.E, mc_csv.SE, T_ref);
-
+    for(i = 0; i < D2_NPROBES; i++) {
+      args_arr[i] = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+      args_arr[i].nrealisations = D2_NREALS;
+      args_arr[i].position[0]   = probe_pos[i][0];
+      args_arr[i].position[1]   = probe_pos[i][1];
+      args_arr[i].position[2]   = probe_pos[i][2];
+      args_arr[i].picard_order  = 1;
+      args_arr[i].diff_algo     = SDIS_DIFFUSION_DELTA_SPHERE;
+      ests[i] = NULL;
     }
 
-    if(P0_ENABLE_DIAG) {
-      OK(sdis_solve_probe(scn, &args, &est_df));
-      n_pass_diag += p0_diag_compare(est_wf, est_df, P0_DIAG_SIGMA);
+    OK(sdis_solve_persistent_wavefront_probe_batch(
+      scn, D2_NPROBES, args_arr, ests));
+
+    for(i = 0; i < D2_NPROBES; i++) {
+      double T_ref = D2_TINF;
+      struct sdis_estimator *est_df = NULL;
+
+      n_pass_primary += p0_compare_analytic(ests[i], T_ref, P0_TOL_SIGMA);
+
+      /* CSV: primary DS row */
+      {
+        struct sdis_mc mc_csv;
+        OK(sdis_estimator_get_temperature(ests[i], &mc_csv));
+        csv_row(csv, "D2", "default", "gpu_wf", "DS",
+                probe_pos[i][0], probe_pos[i][1], probe_pos[i][2],
+                INF, 1, D2_NREALS, mc_csv.E, mc_csv.SE, T_ref);
+      }
+
+      if(P0_ENABLE_DIAG) {
+        OK(sdis_solve_probe(scn, &args_arr[i], &est_df));
+        n_pass_diag += p0_diag_compare(ests[i], est_df, P0_DIAG_SIGMA);
+      }
+
+      p0_print_probe_result(probe_pos[i][0], ests[i], est_df, T_ref);
+
+      OK(sdis_estimator_ref_put(ests[i]));
+      if(est_df)
+        OK(sdis_estimator_ref_put(est_df));
     }
-
-    p0_print_probe_result(probe_pos[i][0], est_wf, est_df, T_ref);
-
-    OK(sdis_estimator_ref_put(est_wf));
-    if(est_df)
-      OK(sdis_estimator_ref_put(est_df));
   }
 
   csv_close(csv);

@@ -46,9 +46,13 @@ csv_open(const char* test_id)
   path[sizeof(path) - 1] = '\0';
 
   fp = fopen(path, "w");
-  if(!fp) return NULL;
+  if(!fp) {
+    fprintf(stderr, "[CSV] ERROR: cannot open '%s' for writing\n", path);
+    return NULL;
+  }
   fprintf(fp, CSV_HEADER);
   fflush(fp);
+  fprintf(stderr, "[CSV] >>> output: %s\n", path);
   return fp;
 }
 

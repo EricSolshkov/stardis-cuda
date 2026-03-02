@@ -576,7 +576,7 @@ main(int argc, char** argv)
     args.picard_order = cfg->picard_order;
     args.diff_algo = cfg->diff_algo;
 
-    OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
+    OK(sdis_solve_persistent_wavefront_probe(scn, &args, &est_wf));
 
     pass = p0_compare_analytic(est_wf, cfg->ref_T, P0_TOL_SIGMA);
     n_pass += pass;

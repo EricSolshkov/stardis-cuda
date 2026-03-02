@@ -9,14 +9,14 @@
  *   Interface: eps=1 on front (fluid side), Tref=320K
  *
  * Analytic (surface temperature of uniformly irradiated sphere):
- *   q   = P / (4*pi*d^2) â‰ˆ 79.577 W/m^2
+ *   q   = P / (4*pi*d^2) â‰?79.577 W/m^2
  *   Ts  = [ (q/4 + Ldiff*pi) / sigma + T_rad^4 ]^0.25
  *
  * With Ldiff=50 W/m^2/sr:
- *   Ts  â‰ˆ [ (19.894 + 157.08) / 5.6696e-8 + 300^4 ]^0.25
+ *   Ts  â‰?[ (19.894 + 157.08) / 5.6696e-8 + 300^4 ]^0.25
  *
  * Probe at sphere centre (0,0,0).  For a small sphere with lambda=1,
- * the temperature gradient is negligible â†’ probe â‰ˆ surface T.
+ * the temperature gradient is negligible â†?probe â‰?surface T.
  *
  * Reference CPU test: test_sdis_external_flux_with_diffuse_radiance.c
  */
@@ -409,7 +409,7 @@ main(int argc, char** argv)
     args.picard_order = 1;
     args.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
 
-    OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
+    OK(sdis_solve_persistent_wavefront_probe(scn, &args, &est_wf));
 
     pass = p0_compare_analytic(est_wf, T_ref, P0_TOL_SIGMA);
 

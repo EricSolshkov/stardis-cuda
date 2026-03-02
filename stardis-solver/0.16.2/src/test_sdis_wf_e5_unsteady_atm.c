@@ -24,7 +24,7 @@
  *   This matches CPU test_sdis_unsteady_atm.c tolerance.
  *
  * Note: boundary probes (solve_tbound1/tbound2) are skipped because
- * sdis_solve_wavefront_probe does not support boundary probe queries.
+ * sdis_solve_persistent_wavefront_probe does not support boundary probe queries.
  * Only interior probe-based tests are included.
  *
  * Verification: wavefront result vs hardcoded numerical reference.
@@ -338,7 +338,7 @@ static const double e5_tfluid_refs[] = {
 static const size_t e5_tfluid_npoints =
   sizeof(e5_tfluid_times) / sizeof(double);
 
-/* Solid probe at (XH + 0.2*XE, random Y/Z) â€” use fixed Y=Z=XHpE*0.5 */
+/* Solid probe at (XH + 0.2*XE, random Y/Z) â€?use fixed Y=Z=XHpE*0.5 */
 static const double e5_tsolid_times[] = {
   0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000
 };
@@ -553,7 +553,7 @@ main(int argc, char** argv)
     args.time_range[0] = e5_tfluid_times[i];
     args.time_range[1] = e5_tfluid_times[i];
 
-    OK(sdis_solve_wavefront_probe(box_scn, &args, &est_wf));
+    OK(sdis_solve_persistent_wavefront_probe(box_scn, &args, &est_wf));
     OK(sdis_estimator_get_temperature(est_wf, &mc));
 
     pass = fabs(mc.E - e5_tfluid_refs[i]) <= EPS;
@@ -594,7 +594,7 @@ main(int argc, char** argv)
     args.time_range[0] = e5_tsolid_times[i];
     args.time_range[1] = e5_tsolid_times[i];
 
-    OK(sdis_solve_wavefront_probe(box_scn, &args, &est_wf));
+    OK(sdis_solve_persistent_wavefront_probe(box_scn, &args, &est_wf));
     OK(sdis_estimator_get_temperature(est_wf, &mc));
 
     pass = fabs(mc.E - e5_tsolid_refs[i]) <= EPS;

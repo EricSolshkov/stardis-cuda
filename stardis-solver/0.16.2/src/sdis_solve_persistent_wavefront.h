@@ -76,6 +76,87 @@ struct pixel_task {
 #define PERSISTENT_WF_DEFAULT_POOL_SIZE  32768
 
 /*******************************************************************************
+ * wavefront_ops — mode-specific callbacks (camera vs probe)
+ *
+ * The persistent wavefront main loop is mode-agnostic.  These three callbacks
+ * isolate the only mode-specific operations:
+ *   1. generate_tasks — populate the task queue
+ *   2. init_path     — initialise a single path from a task
+ *   3. harvest       — collect completed path results
+ *
+ * Two static instances (wf_ops_camera, wf_ops_probe) are defined in the .c
+ * file.  The main loop dispatches through pool->ops->xxx().
+ ******************************************************************************/
+struct wavefront_pool;  /* forward */
+struct pool_view;       /* forward */
+
+struct wavefront_ops {
+  /* Populate pool->task_queue from mode_ctx parameters.
+   * Camera: Morton-order W×H×spp tasks.
+   * Probe:  nrealisations linear tasks at (0,0). */
+  res_T (*generate_tasks)(struct wavefront_pool* pool,
+                          const void* mode_ctx);
+
+  /* Initialise a single path in slot from a pixel_task.
+   * Camera: camera_ray + PATH_INIT.
+   * Probe:  position + PATH_COUPLED_CONDUCTIVE/CONVECTIVE. */
+  res_T (*init_path)(struct path_state* p,
+                     struct ssp_rng* rng,
+                     const struct pixel_task* task,
+                     struct sdis_scene* scn,
+                     unsigned enc_id,
+                     const void* mode_ctx,
+                     const double* time_range,
+                     size_t picard_order,
+                     enum sdis_diffusion_algorithm diff_algo,
+                     uint32_t path_id,
+                     uint64_t global_seed);
+
+  /* Accumulate one completed path's result into result_ctx.
+   * Camera: estimator_buffer_grab(buf, ipix[0], ipix[1]) + sum/sum2.
+   * Probe:  accum->sum += T.value, accum->count++. */
+  void (*accumulate_result)(const struct path_state* p,
+                            void* result_ctx);
+};
+
+/*******************************************************************************
+ * camera_mode_ctx — parameters specific to camera rendering
+ ******************************************************************************/
+struct camera_mode_ctx {
+  const struct sdis_camera* cam;
+  const double*             pix_sz;       /* pixel physical size [2] */
+  const size_t*             image_def;    /* image width, height     */
+  size_t                    spp;
+};
+
+/*******************************************************************************
+ * probe_mode_ctx — parameters specific to probe temperature estimation
+ ******************************************************************************/
+struct probe_mode_ctx {
+  double                    position[3];  /* probe spatial position  */
+  size_t                    nrealisations;
+  enum sdis_medium_type     mdm_type;     /* SOLID or FLUID          */
+};
+
+/*******************************************************************************
+ * probe_batch_mode_ctx — parameters for multi-probe batch estimation
+ *
+ * Allows K probes × N realisations to share a single persistent pool,
+ * amortising pool startup / BVH-cache cost.  Each probe is identified by
+ * its index (0..nprobes-1), stored in pixel_task::ipix_image[0] and
+ * propagated to path_state::ipix_image[0] so accumulate_result can route
+ * each completed path to the correct accum bucket.
+ ******************************************************************************/
+struct probe_batch_mode_ctx {
+  const double*             positions;    /* [nprobes * 3]           */
+  const unsigned*           enc_ids;      /* [nprobes]               */
+  const enum sdis_medium_type* mdm_types; /* [nprobes]               */
+  struct accum*             accums;       /* [nprobes] — output      */
+  size_t                    nprobes;
+  size_t                    nrealisations; /* per-probe realisation count */
+};
+
+/*******************************************************************************
  * pool_view — unified pool view (P2: 2-stream pipeline)
  *
  * Represents a view over slots[base .. base+view_size) within the pool.
@@ -169,15 +250,18 @@ struct wavefront_pool {
   size_t              task_count;      /* image_w × image_h × spp */
   size_t              task_next;       /* next unassigned task index */
 
-  /* --- Scene / camera params (cached for refill) --- */
+  /* --- Scene params (cached for refill) --- */
   struct sdis_scene*  scn;
   unsigned            enc_id;
-  const struct sdis_camera* cam;
   const double*       time_range;
-  const double*       pix_sz;
   size_t              picard_order;
   enum sdis_diffusion_algorithm diff_algo;
   uint32_t            next_path_id;    /* monotonically increasing path id */
+
+  /* --- Mode-specific dispatch (camera / probe) --- */
+  const struct wavefront_ops* ops;      /* mode vtable               */
+  const void*                 mode_ctx; /* camera_mode_ctx* or probe_mode_ctx* */
+  void*                       result_ctx; /* estimator_buffer* or accum*       */
 
   /* --- Per-slot RNG (independent streams) --- */
   struct ssp_rng**    slot_rngs;
@@ -415,5 +499,38 @@ solve_camera_persistent_wavefront
    int32_t                     progress[],
    const int                   pcent_progress,
    const char*                 progress_label);
+
+/* Persistent wavefront probe solver — same semantics as
+ * sdis_solve_wavefront_probe but uses the persistent pool main loop.
+ * This shares the full main loop with solve_camera_persistent_wavefront
+ * via the wavefront_ops vtable, avoiding code duplication. */
+extern LOCAL_SYM res_T
+solve_persistent_wavefront_probe
+  (struct sdis_scene*          scn,
+   struct ssp_rng*             base_rng,
+   const unsigned              enc_id,
+   const double                position[3],
+   const double                time_range[2],
+   const size_t                nrealisations,
+   const size_t                picard_order,
+   const enum sdis_diffusion_algorithm diff_algo,
+   struct accum*               out_acc_temp);
+
+/* Persistent wavefront batch probe solver — runs K probes × N realisations
+ * in a single persistent pool, improving GPU utilisation.
+ * out_acc_temps must point to an array of nprobes accum structs. */
+extern LOCAL_SYM res_T
+solve_persistent_wavefront_probe_batch
+  (struct sdis_scene*          scn,
+   struct ssp_rng*             base_rng,
+   const size_t                nprobes,
+   const unsigned              enc_ids[],
+   const double                positions[],   /* [nprobes * 3] */
+   const double                time_range[2],
+   const size_t                nrealisations, /* per-probe */
+   const size_t                picard_order,
+   const enum sdis_diffusion_algorithm diff_algo,
+   const enum sdis_medium_type mdm_types[],
+   struct accum*               out_acc_temps); /* [nprobes] */
 
 #endif /* SDIS_SOLVE_PERSISTENT_WAVEFRONT_H */

@@ -327,13 +327,13 @@ test_wos_closest_result_epsilon_shell(void)
   res = step_cnd_wos_closest_result(&p, g_scn);
   /* In epsilon-shell, setup_hit_wos is called (may fail on edge case).
    * If it succeeds, phase = TIME_TRAVEL.
-   * If the enclosure side doesn't match, it may fail â€” that's OK for this
+   * If the enclosure side doesn't match, it may fail â€?that's OK for this
    * unit test; we just check the state machine flow. */
   if(res == RES_OK) {
     CHK(p.phase == PATH_CND_WOS_TIME_TRAVEL);
     printf("    epsilon-shell hit -> TIME_TRAVEL  PASS\n");
   } else {
-    /* wf_setup_hit_wos failed due to side mismatch â€” error path is also valid */
+    /* wf_setup_hit_wos failed due to side mismatch â€?error path is also valid */
     CHK(p.phase == PATH_DONE);
     CHK(p.done_reason == -1);
     printf("    epsilon-shell hit -> error path (side mismatch)  PASS\n");
@@ -548,7 +548,7 @@ test_wos_time_travel_loop(void)
 /* Box (0,0,0)-(1,1,1), lambda=10, Cp=1, rho=1, delta=1/60.                  */
 /* Interface: T(P) = 100*x + 200*y + 300*z.                                   */
 /* Probe at (0.5, 0.5, 0.5), steady-state => T_ref = 300 K.                  */
-/* Uses SDIS_DIFFUSION_WOS via sdis_solve_wavefront_probe.                    */
+/* Uses SDIS_DIFFUSION_WOS via sdis_solve_persistent_wavefront_probe.                    */
 /* ========================================================================== */
 
 /* Dedicated scene for E2E tests (different shaders) */
@@ -652,10 +652,10 @@ test_e2e_steady_wos(void)
   args.diff_algo = SDIS_DIFFUSION_WOS;
 
   {
-    res_T probe_res = sdis_solve_wavefront_probe(scn, &args, &est);
+    res_T probe_res = sdis_solve_persistent_wavefront_probe(scn, &args, &est);
     if(probe_res != RES_OK) {
       fprintf(stdout,
-        "    [SKIP] sdis_solve_wavefront_probe failed (res=%d)\n"
+        "    [SKIP] sdis_solve_persistent_wavefront_probe failed (res=%d)\n"
         "    Known issue: wf_setup_hit_wos side mismatch at boundary.\n",
         (int)probe_res);
       OK(sdis_scene_ref_put(scn));
@@ -827,7 +827,7 @@ test_e2e_transient_wos(void)
     args.time_range[1] = e1_refs[i].time;
     args.diff_algo = SDIS_DIFFUSION_WOS;
 
-    probe_res = sdis_solve_wavefront_probe(scn, &args, &est);
+    probe_res = sdis_solve_persistent_wavefront_probe(scn, &args, &est);
     if(probe_res != RES_OK) {
       fprintf(stdout,
         "    t=%10.1f s  [SKIP] probe failed (res=%d)\n",

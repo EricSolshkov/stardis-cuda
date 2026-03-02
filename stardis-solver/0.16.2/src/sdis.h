@@ -1689,6 +1689,32 @@ sdis_solve_wavefront_probe
    const struct sdis_solve_probe_args* args,
    struct sdis_estimator** estimator);
 
+/* Persistent wavefront variant of sdis_solve_wavefront_probe.
+ *
+ * Uses the persistent wavefront pool (same main loop as the camera solver)
+ * with probe-specific vtable dispatch.  Avoids the O(nrealisations) memory
+ * allocation of the non-persistent variant. */
+SDIS_API res_T
+sdis_solve_persistent_wavefront_probe
+  (struct sdis_scene* scn,
+   const struct sdis_solve_probe_args* args,
+   struct sdis_estimator** estimator);
+
+/* Multi-probe batch variant — runs nprobes probes in a single persistent
+ * wavefront pool pass for improved GPU utilisation.
+ *
+ * args_array[0..nprobes-1]: per-probe solve parameters.
+ *   All entries must share the same nrealisations, time_range, picard_order,
+ *   diff_algo (taken from args_array[0]).  Position and rng_state may differ.
+ * out_estimators[0..nprobes-1]: receives one estimator per probe (caller frees).
+ */
+SDIS_API res_T
+sdis_solve_persistent_wavefront_probe_batch
+  (struct sdis_scene* scn,
+   const size_t nprobes,
+   const struct sdis_solve_probe_args* args_array,
+   struct sdis_estimator** out_estimators);
+
 SDIS_API res_T
 sdis_solve_probe_boundary
   (struct sdis_scene* scn,

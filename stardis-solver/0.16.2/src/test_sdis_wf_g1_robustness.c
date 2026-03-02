@@ -296,7 +296,7 @@ main(int argc, char** argv)
     args.time_range[1] = INF;
     args.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
 
-    OK(sdis_solve_wavefront_probe(scn, &args, &est));
+    OK(sdis_solve_persistent_wavefront_probe(scn, &args, &est));
     OK(sdis_estimator_get_temperature(est, &T));
     OK(sdis_estimator_get_failure_count(est, &nfails));
 
@@ -336,7 +336,7 @@ main(int argc, char** argv)
     args.time_range[1] = INF;
     args.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
 
-    OK(sdis_solve_wavefront_probe(scn, &args, &est));
+    OK(sdis_solve_persistent_wavefront_probe(scn, &args, &est));
     OK(sdis_estimator_get_temperature(est, &T));
     OK(sdis_estimator_get_failure_count(est, &nfails));
 

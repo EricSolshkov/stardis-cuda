@@ -493,7 +493,7 @@ main(int argc, char** argv)
     args.picard_order = 1;
     args.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
 
-    OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
+    OK(sdis_solve_persistent_wavefront_probe(scn, &args, &est_wf));
 
     pass = p0_compare_analytic(est_wf, T_ref, P0_TOL_SIGMA);
     n_pass += pass;
@@ -537,7 +537,7 @@ main(int argc, char** argv)
     args.picard_order = 1;
     args.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
 
-    OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
+    OK(sdis_solve_persistent_wavefront_probe(scn, &args, &est_wf));
 
     pass = p0_compare_analytic(est_wf, T_ref, P0_TOL_SIGMA);
     n_pass += pass;

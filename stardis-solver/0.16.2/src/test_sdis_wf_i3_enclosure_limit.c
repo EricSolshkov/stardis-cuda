@@ -1,11 +1,11 @@
-/* WF-I3: Enclosure limit conditions — 3D nested cubes (wavefront probe).
+/* WF-I3: Enclosure limit conditions - 3D nested cubes (wavefront probe).
  *
  * 3D analogue of test_sdis_enclosure_limit_conditions.c (CPU 2D-only).
  * Verifies multi-material enclosures: the inner cube has different fluids
  * on each face-pair, the outer cube has a single external fluid.
  *
- *  Outer cube:   [0,   1]^3   — solid/ext_fluid interface (Text=360)
- *  Inner cube:   [0.25, 0.75]^3 — multiple fluids / solid
+ *  Outer cube:   [0,   1]^3   - solid/ext_fluid interface (Text=360)
+ *  Inner cube:   [0.25, 0.75]^3 - multiple fluids / solid
  *      -Z, +Z faces: fluid T=280  (bottom/top of inner)
  *      -X, +X faces: fluid T=300
  *      -Y, +Y faces: fluid T=340
@@ -15,9 +15,9 @@
  * No radiation.
  *
  * Checks:
- *   1) Probe in solid region: temperature ∈ [280, 360], nonzero SE
+ *   1) Probe in solid region: temperature �?[280, 360], nonzero SE
  *   2) Multiple probes at symmetric positions give consistent results
- *   3) Probes closer to outer boundary → closer to Text=360
+ *   3) Probes closer to outer boundary �?closer to Text=360
  *
  * Reference CPU test: test_sdis_enclosure_limit_conditions.c
  */
@@ -69,20 +69,20 @@ static const double i3_vertices[16 * 3] = {
 static const size_t i3_nvertices = 16;
 
 static const size_t i3_indices[24 * 3] = {
-  /* Inner cube — normals pointing outward (into the solid) */
-  /* -Z face (z=0.25): tri 0,1 → fluid T=280 */
+  /* Inner cube - normals pointing outward (into the solid) */
+  /* -Z face (z=0.25): tri 0,1 �?fluid T=280 */
   0, 2, 3,   0, 3, 1,
-  /* +Z face (z=0.75): tri 2,3 → fluid T=280 */
+  /* +Z face (z=0.75): tri 2,3 �?fluid T=280 */
   4, 5, 7,   4, 7, 6,
-  /* -X face (x=0.25): tri 4,5 → fluid T=300 */
+  /* -X face (x=0.25): tri 4,5 �?fluid T=300 */
   0, 4, 6,   0, 6, 2,
-  /* +X face (x=0.75): tri 6,7 → fluid T=300 */
+  /* +X face (x=0.75): tri 6,7 �?fluid T=300 */
   1, 3, 7,   1, 7, 5,
-  /* -Y face (y=0.25): tri 8,9 → fluid T=340 */
+  /* -Y face (y=0.25): tri 8,9 �?fluid T=340 */
   0, 1, 5,   0, 5, 4,
-  /* +Y face (y=0.75): tri 10,11 → fluid T=340 */
+  /* +Y face (y=0.75): tri 10,11 �?fluid T=340 */
   2, 6, 7,   2, 7, 3,
-  /* Outer cube — normals pointing outward (away from solid) */
+  /* Outer cube - normals pointing outward (away from solid) */
   /* -Z face (z=0): tri 12,13 */
   8, 10, 11,  8, 11, 9,
   /* +Z face (z=1): tri 14,15 */
@@ -246,7 +246,7 @@ main(int argc, char** argv)
   int n_checks = 0;
   (void)argc; (void)argv;
 
-  printf("=== WF-I3: Enclosure limit conditions — 3D nested cubes (wavefront) ===\n");
+  printf("=== WF-I3: Enclosure limit conditions - 3D nested cubes (wavefront) ===\n");
 
   OK(sdis_device_create(&SDIS_DEVICE_CREATE_ARGS_DEFAULT, &dev));
 
@@ -315,115 +315,103 @@ main(int argc, char** argv)
   OK(sdis_interface_ref_put(interf_ext));
 
   /* ================================================================== */
-  /* Check 1: probe in solid near outer boundary → closer to Text       */
+  /* Batch solve: 4 probes                                              */
+  /*   [0] (0.1,0.1,0.1)   ?solid near outer boundary                 */
+  /*   [1] (0.5,0.5,0.5)   ?fluid enclosure (should be skipped)       */
+  /*   [2] (0.5,0.1,0.5)   ?solid, symmetry A                         */
+  /*   [3] (0.5,0.9,0.5)   ?solid, symmetry B                         */
+  /* Ref: CPU test_sdis_enclosure_limit_conditions.c places a probe at  */
+  /* the center of the multi-material enclosure and expects RES_BAD_OP. */
+  /* The batch API returns NULL estimator for such probes instead.      */
   /* ================================================================== */
   {
-    struct sdis_solve_probe_args args = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
-    struct sdis_estimator* est = NULL;
-    struct sdis_mc mc;
+    struct sdis_solve_probe_args args_arr[4];
+    struct sdis_estimator*       ests[4];
+    struct sdis_mc mc0, mc2, mc3;
+    int k;
 
-    args.nrealisations = I3_NREALS;
-    args.position[0] = 0.1;
-    args.position[1] = 0.1;
-    args.position[2] = 0.1;
-    args.time_range[0] = INF;
-    args.time_range[1] = INF;
+    for(k = 0; k < 4; k++) {
+      args_arr[k] = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+      args_arr[k].nrealisations = I3_NREALS;
+      args_arr[k].time_range[0] = INF;
+      args_arr[k].time_range[1] = INF;
+      ests[k] = NULL;
+    }
+    /* Probe 0: solid near outer boundary */
+    args_arr[0].position[0] = 0.1;
+    args_arr[0].position[1] = 0.1;
+    args_arr[0].position[2] = 0.1;
+    /* Probe 1: center of inner cube ?fluid enclosure (multi-material).
+     * CPU ref: CHK(sdis_solve_probe(scn, &args, &estimator) == RES_BAD_OP)
+     * Batch equivalent: estimator stays NULL. */
+    args_arr[1].position[0] = 0.5;
+    args_arr[1].position[1] = 0.5;
+    args_arr[1].position[2] = 0.5;
+    /* Probe 2: solid, symmetry A */
+    args_arr[2].position[0] = 0.5;
+    args_arr[2].position[1] = 0.1;
+    args_arr[2].position[2] = 0.5;
+    /* Probe 3: solid, symmetry B */
+    args_arr[3].position[0] = 0.5;
+    args_arr[3].position[1] = 0.9;
+    args_arr[3].position[2] = 0.5;
 
-    OK(sdis_solve_wavefront_probe(scn, &args, &est));
-    OK(sdis_estimator_get_temperature(est, &mc));
+    OK(sdis_solve_persistent_wavefront_probe_batch(scn, 4, args_arr, ests));
 
+    /* ---- Check 1: probe in fluid enclosure rejected (NULL estimator) ---- */
+    /* CPU ref: CHK(sdis_solve_probe(scn, &args, &estimator) == RES_BAD_OP) */
+    printf("  probe(0.5,0.5,0.5) in fluid enclosure: ests[1]=%s\n",
+      ests[1] == NULL ? "NULL (correctly skipped)" : "NOT NULL (ERROR)");
+    n_checks++;
+    if(ests[1] == NULL) {
+      printf("    PASS: probe in multi-material fluid enclosure was skipped\n");
+      n_checks_ok++;
+    } else {
+      printf("    FAIL: probe in fluid enclosure should yield NULL estimator\n");
+    }
+
+    /* Get temperatures for valid probes */
+    OK(sdis_estimator_get_temperature(ests[0], &mc0));
+    OK(sdis_estimator_get_temperature(ests[2], &mc2));
+    OK(sdis_estimator_get_temperature(ests[3], &mc3));
+
+    /* ---- Check 2: probe in solid near outer boundary ---- */
     printf("  probe(0.1,0.1,0.1) in solid near outer: T=%.3f +/- %.2e\n",
-      mc.E, mc.SE);
+      mc0.E, mc0.SE);
     n_checks++;
-    if(mc.E >= I3_Tmin && mc.E <= I3_Tmax && mc.SE > 0) {
+    if(mc0.E >= I3_Tmin && mc0.E <= I3_Tmax && mc0.SE > 0) {
       printf("    PASS: T in [%.0f, %.0f], SE > 0\n", I3_Tmin, I3_Tmax);
       n_checks_ok++;
     } else {
       printf("    FAIL: T not in [%.0f, %.0f] or SE=0\n", I3_Tmin, I3_Tmax);
     }
 
-    OK(sdis_estimator_ref_put(est));
-  }
+    /* ---- Check 3: symmetry (0.5,0.1,0.5) vs (0.5,0.9,0.5) ---- */
+    {
+      double diff = fabs(mc2.E - mc3.E);
+      double combined_SE = sqrt(mc2.SE * mc2.SE + mc3.SE * mc3.SE);
 
-  /* ================================================================== */
-  /* Check 2: probe in solid near inner boundary → lower temperature    */
-  /* Average inner temp = (280*4 + 300*4 + 340*4) / 12 = 306.67        */
-  /* ================================================================== */
-  {
-    struct sdis_solve_probe_args args = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
-    struct sdis_estimator* est = NULL;
-    struct sdis_mc mc;
-
-    args.nrealisations = I3_NREALS;
-    args.position[0] = 0.3;
-    args.position[1] = 0.5;
-    args.position[2] = 0.5;
-    args.time_range[0] = INF;
-    args.time_range[1] = INF;
-
-    OK(sdis_solve_wavefront_probe(scn, &args, &est));
-    OK(sdis_estimator_get_temperature(est, &mc));
-
-    printf("  probe(0.3,0.5,0.5) in solid near inner: T=%.3f +/- %.2e\n",
-      mc.E, mc.SE);
-    n_checks++;
-    if(mc.E >= I3_Tmin && mc.E <= I3_Tmax && mc.SE > 0) {
-      printf("    PASS: T in [%.0f, %.0f], SE > 0\n", I3_Tmin, I3_Tmax);
-      n_checks_ok++;
-    } else {
-      printf("    FAIL: T not in [%.0f, %.0f] or SE=0\n", I3_Tmin, I3_Tmax);
+      printf("  symmetry: T(0.5,0.1,0.5)=%.3f  T(0.5,0.9,0.5)=%.3f  "
+        "|diff|=%.3f  combined_SE=%.2e\n", mc2.E, mc3.E, diff, combined_SE);
+      n_checks++;
+      if(combined_SE > 0 && diff <= 5.0 * combined_SE) {
+        printf("    PASS: symmetric probes agree within 5 sigma\n");
+        n_checks_ok++;
+      } else {
+        printf("    FAIL: symmetric probes differ by %.1f sigma\n",
+          combined_SE > 0 ? diff / combined_SE : 9999.0);
+      }
     }
 
-    OK(sdis_estimator_ref_put(est));
-  }
-
-  /* ================================================================== */
-  /* Check 3: symmetry — probe at (0.5, 0.1, 0.5) vs (0.5, 0.9, 0.5) */
-  /* Both equidistant from Y faces (T=340), should give similar T       */
-  /* ================================================================== */
-  {
-    struct sdis_solve_probe_args args = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
-    struct sdis_estimator* est1 = NULL;
-    struct sdis_estimator* est2 = NULL;
-    struct sdis_mc mc1, mc2;
-    double diff, combined_SE;
-
-    args.nrealisations = I3_NREALS;
-    args.time_range[0] = INF;
-    args.time_range[1] = INF;
-
-    args.position[0] = 0.5;
-    args.position[1] = 0.1;
-    args.position[2] = 0.5;
-    OK(sdis_solve_wavefront_probe(scn, &args, &est1));
-    OK(sdis_estimator_get_temperature(est1, &mc1));
-
-    args.position[0] = 0.5;
-    args.position[1] = 0.9;
-    args.position[2] = 0.5;
-    OK(sdis_solve_wavefront_probe(scn, &args, &est2));
-    OK(sdis_estimator_get_temperature(est2, &mc2));
-
-    diff = fabs(mc1.E - mc2.E);
-    combined_SE = sqrt(mc1.SE * mc1.SE + mc2.SE * mc2.SE);
-
-    printf("  symmetry: T(0.5,0.1,0.5)=%.3f  T(0.5,0.9,0.5)=%.3f  "
-      "|diff|=%.3f  combined_SE=%.2e\n", mc1.E, mc2.E, diff, combined_SE);
-    n_checks++;
-    if(combined_SE > 0 && diff <= 5.0 * combined_SE) {
-      printf("    PASS: symmetric probes agree within 5 sigma\n");
-      n_checks_ok++;
-    } else {
-      printf("    FAIL: symmetric probes differ by %.1f sigma\n",
-        combined_SE > 0 ? diff / combined_SE : 9999.0);
-    }
-
-    OK(sdis_estimator_ref_put(est1));
-    OK(sdis_estimator_ref_put(est2));
+    OK(sdis_estimator_ref_put(ests[0]));
+    /* ests[1] is NULL ?no ref_put needed */
+    OK(sdis_estimator_ref_put(ests[2]));
+    OK(sdis_estimator_ref_put(ests[3]));
   }
 
   /* ---- Summary ---- */
   printf("\n  Checks passed: %d/%d\n", n_checks_ok, n_checks);
+  CHK(n_checks == 3);
   CHK(n_checks_ok == n_checks);
 
   printf("WF-I3: PASS\n");

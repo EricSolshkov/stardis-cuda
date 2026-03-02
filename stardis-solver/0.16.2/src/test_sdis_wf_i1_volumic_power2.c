@@ -22,7 +22,7 @@
  *
  * Reference: EDF SyrthÃ¨s industrial solver (3D values).
  *   Temperatures in Celsius. Converted to Kelvin by +273.15K.
- *   Tolerance: max(3*sigma, 5K) per probe â€” generous for external reference.
+ *   Tolerance: max(3*sigma, 5K) per probe â€?generous for external reference.
  *
  * 8 probes at (0, y, 0) for y in {0.85, 0.65, 0.45, 0.25, 0.05, -0.15,
  * -0.35, -0.55}. These positions are all in solid1 (outside the inner cube).
@@ -238,7 +238,8 @@ struct i1_probe_ref {
 };
 
 /* Check 1: lambda1=1, lambda2=10, Pw=10000 */
-static const struct i1_probe_ref i1_refs1[] = {
+#define I1_NREFS1 8
+static const struct i1_probe_ref i1_refs1[I1_NREFS1] = {
   {{0, 0.85, 0}, 189.13},
   {{0, 0.65, 0}, 247.09},
   {{0, 0.45, 0}, 308.42},
@@ -282,7 +283,7 @@ main(int argc, char** argv)
   FILE* csv = NULL;
   (void)argc; (void)argv;
 
-  printf("=== WF-I1: Nested volumic power â€” Syrthes reference (wavefront) ===\n");
+  printf("=== WF-I1: Nested volumic power â€?Syrthes reference (wavefront) ===\n");
 
   OK(sdis_device_create(&SDIS_DEVICE_CREATE_ARGS_DEFAULT, &dev));
 
@@ -419,57 +420,60 @@ main(int argc, char** argv)
   /* ================================================================== */
   printf("  Check 1: lambda1=1, lambda2=10, Pw=%g\n", I1_PW);
   csv = csv_open("I1");
-  printf("  Running %lu probes, %d realisations each ...\n",
+  printf("  Running %lu probes (batch), %d realisations each ...\n",
     (unsigned long)i1_nrefs1, I1_N);
 
-  for(i = 0; i < i1_nrefs1; i++) {
-    struct sdis_solve_probe_args args = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
-    struct sdis_estimator* est_wf = NULL;
-    struct sdis_mc mc;
-    double ref_K;
-    double tol;
-    int pass;
+  {
+    struct sdis_solve_probe_args args_arr[I1_NREFS1];
+    struct sdis_estimator*       ests[I1_NREFS1];
 
-    args.nrealisations = I1_N;
-    args.position[0] = i1_refs1[i].pos[0];
-    args.position[1] = i1_refs1[i].pos[1];
-    args.position[2] = i1_refs1[i].pos[2];
-    args.time_range[0] = INF;
-    args.time_range[1] = INF;
-
-    OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
-    OK(sdis_estimator_get_temperature(est_wf, &mc));
-
-    /* Reference in Kelvin */
-    ref_K = i1_refs1[i].T_celsius + 273.15;
-
-    /* Tolerance: max(3*SE, I1_TOL_K)
-     * The Syrthes reference itself has numerical uncertainty, so we use a
-     * generous fixed tolerance of 5K combined with statistical tolerance. */
-    tol = I1_TOL_SIGMA * mc.SE;
-    if(tol < I1_TOL_K) tol = I1_TOL_K;
-    pass = fabs(mc.E - ref_K) <= tol;
-    n_pass += pass;
-
-    /* CSV: primary DS row + complementary WoS variant */
-    {
-      char csv_sub[32];
-      sprintf(csv_sub, "y=%.2f", i1_refs1[i].pos[1]);
-      csv_row(csv, "I1", csv_sub, "gpu_wf", "DS",
-              i1_refs1[i].pos[0], i1_refs1[i].pos[1], i1_refs1[i].pos[2],
-              INF, 1, I1_N, mc.E, mc.SE, ref_K);
-
+    for(i = 0; i < i1_nrefs1; i++) {
+      args_arr[i] = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+      args_arr[i].nrealisations = I1_N;
+      args_arr[i].position[0]   = i1_refs1[i].pos[0];
+      args_arr[i].position[1]   = i1_refs1[i].pos[1];
+      args_arr[i].position[2]   = i1_refs1[i].pos[2];
+      args_arr[i].time_range[0] = INF;
+      args_arr[i].time_range[1] = INF;
+      ests[i] = NULL;
     }
 
-    printf("  (0, %+.2f, 0)  wf=%.2fK (%.2fC)  SE=%.2e  "
-      "ref=%.2fC  diff=%.2fK  tol=%.2fK  %s\n",
-      i1_refs1[i].pos[1],
-      mc.E, mc.E - 273.15, mc.SE,
-      i1_refs1[i].T_celsius,
-      fabs(mc.E - ref_K), tol,
-      pass ? "PASS" : "FAIL");
+    OK(sdis_solve_persistent_wavefront_probe_batch(
+      scn, i1_nrefs1, args_arr, ests));
 
-    OK(sdis_estimator_ref_put(est_wf));
+    for(i = 0; i < i1_nrefs1; i++) {
+      struct sdis_mc mc;
+      double ref_K;
+      double tol;
+      int pass;
+
+      OK(sdis_estimator_get_temperature(ests[i], &mc));
+
+      ref_K = i1_refs1[i].T_celsius + 273.15;
+
+      tol = I1_TOL_SIGMA * mc.SE;
+      if(tol < I1_TOL_K) tol = I1_TOL_K;
+      pass = fabs(mc.E - ref_K) <= tol;
+      n_pass += pass;
+
+      {
+        char csv_sub[32];
+        sprintf(csv_sub, "y=%.2f", i1_refs1[i].pos[1]);
+        csv_row(csv, "I1", csv_sub, "gpu_wf", "DS",
+                i1_refs1[i].pos[0], i1_refs1[i].pos[1], i1_refs1[i].pos[2],
+                INF, 1, I1_N, mc.E, mc.SE, ref_K);
+      }
+
+      printf("  (0, %+.2f, 0)  wf=%.2fK (%.2fC)  SE=%.2e  "
+        "ref=%.2fC  diff=%.2fK  tol=%.2fK  %s\n",
+        i1_refs1[i].pos[1],
+        mc.E, mc.E - 273.15, mc.SE,
+        i1_refs1[i].T_celsius,
+        fabs(mc.E - ref_K), tol,
+        pass ? "PASS" : "FAIL");
+
+      OK(sdis_estimator_ref_put(ests[i]));
+    }
   }
 
   csv_close(csv);

@@ -1532,3 +1532,192 @@ exit:
   if(rng && !args->rng_state) ssp_rng_ref_put(rng);
   return res;
 }
+
+/*******************************************************************************
+ * Public API: sdis_solve_persistent_wavefront_probe
+ *
+ * Same as sdis_solve_wavefront_probe but uses the persistent pool main loop
+ * (solve_persistent_wavefront_probe) shared with the camera solver.
+ ******************************************************************************/
+res_T
+sdis_solve_persistent_wavefront_probe(
+  struct sdis_scene*                   scn,
+  const struct sdis_solve_probe_args*  args,
+  struct sdis_estimator**              out_estimator)
+{
+  struct ssp_rng* rng = NULL;
+  struct sdis_estimator* estimator = NULL;
+  unsigned enc_id = ENCLOSURE_ID_NULL;
+  struct accum acc_temp = ACCUM_NULL;
+  res_T res = RES_OK;
+
+  if(!scn || !args || !out_estimator) return RES_BAD_ARG;
+  if(args->nrealisations == 0) return RES_BAD_ARG;
+
+  *out_estimator = NULL;
+
+  /* Retrieve enclosure at probe position */
+  res = scene_get_enclosure_id(scn, args->position, &enc_id);
+  if(res != RES_OK) goto error_p;
+
+  /* Create RNG */
+  if(args->rng_state) {
+    rng = args->rng_state;
+  } else {
+    res = ssp_rng_create(NULL, args->rng_type, &rng);
+    if(res != RES_OK) goto error_p;
+  }
+
+  /* Create estimator */
+  res = estimator_create(scn->dev, SDIS_ESTIMATOR_TEMPERATURE, &estimator);
+  if(res != RES_OK) goto error_p;
+
+  /* Run persistent wavefront probe solver */
+  res = solve_persistent_wavefront_probe(
+    scn, rng, enc_id,
+    args->position, args->time_range,
+    args->nrealisations,
+    args->picard_order,
+    args->diff_algo,
+    &acc_temp);
+  if(res != RES_OK) goto error_p;
+
+  /* Setup estimator from accumulator */
+  estimator_setup_realisations_count(estimator,
+    args->nrealisations, acc_temp.count);
+  estimator_setup_temperature(estimator, acc_temp.sum, acc_temp.sum2);
+
+  *out_estimator = estimator;
+  goto exit_p;
+
+error_p:
+  if(estimator) { sdis_estimator_ref_put(estimator); estimator = NULL; }
+exit_p:
+  if(rng && !args->rng_state) ssp_rng_ref_put(rng);
+  return res;
+}
+
+/*******************************************************************************
+ * Public API: sdis_solve_persistent_wavefront_probe_batch
+ *
+ * Multi-probe variant — runs K probes in a single persistent pool pass.
+ * Each probe gets its own estimator with independent sum/sum2/count.
+ ******************************************************************************/
+res_T
+sdis_solve_persistent_wavefront_probe_batch(
+  struct sdis_scene*                   scn,
+  const size_t                         nprobes,
+  const struct sdis_solve_probe_args*  args_array,
+  struct sdis_estimator**              out_estimators)
+{
+  struct ssp_rng* rng = NULL;
+  unsigned* enc_ids = NULL;
+  double* positions = NULL;
+  enum sdis_medium_type* mdm_types = NULL;
+  struct accum* accums = NULL;
+  size_t* valid_map = NULL; /* compact index -> original index */
+  size_t nvalid = 0;
+  res_T res = RES_OK;
+  size_t i;
+
+  if(!scn || !args_array || !out_estimators || nprobes == 0)
+    return RES_BAD_ARG;
+
+  for(i = 0; i < nprobes; i++)
+    out_estimators[i] = NULL;
+
+  /* ---- Allocate per-probe arrays ---- */
+  enc_ids   = (unsigned*)malloc(nprobes * sizeof(unsigned));
+  positions = (double*)malloc(nprobes * 3 * sizeof(double));
+  mdm_types = (enum sdis_medium_type*)malloc(
+    nprobes * sizeof(enum sdis_medium_type));
+  accums    = (struct accum*)malloc(nprobes * sizeof(struct accum));
+  valid_map = (size_t*)malloc(nprobes * sizeof(size_t));
+
+  if(!enc_ids || !positions || !mdm_types || !accums || !valid_map) {
+    res = RES_MEM_ERR;
+    goto error_batch;
+  }
+
+  /* ---- Resolve per-probe enclosures + medium types ---- */
+  /* Probes that fail enclosure/medium resolution are silently skipped
+   * (estimator stays NULL), matching the serial API where each probe may
+   * independently return RES_BAD_OP for fluid/multi-material enclosures.
+   * Only truly fatal errors (bad args, OOM) abort the whole batch. */
+  for(i = 0; i < nprobes; i++) {
+    const struct sdis_solve_probe_args* a = &args_array[i];
+    res_T pres; /* per-probe result */
+    if(a->nrealisations == 0) { res = RES_BAD_ARG; goto error_batch; }
+
+    pres = scene_get_enclosure_id(scn, a->position, &enc_ids[nvalid]);
+    if(pres != RES_OK) continue; /* skip — out_estimators[i] stays NULL */
+
+    { const struct enclosure* enc = scene_get_enclosure(scn, enc_ids[nvalid]);
+      struct sdis_medium* mdm = NULL;
+      pres = scene_get_enclosure_medium(scn, enc, &mdm);
+      if(pres != RES_OK) continue; /* skip — fluid/multi-material enclosure */
+      mdm_types[nvalid] = sdis_medium_get_type(mdm);
+    }
+
+    positions[nvalid*3+0] = a->position[0];
+    positions[nvalid*3+1] = a->position[1];
+    positions[nvalid*3+2] = a->position[2];
+    valid_map[nvalid] = i;
+    nvalid++;
+  }
+
+  /* All probes skipped — nothing to solve, return OK with all NULL ests */
+  if(nvalid == 0) goto exit_batch;
+
+  /* ---- Create RNG (from first args entry) ---- */
+  if(args_array[0].rng_state) {
+    rng = args_array[0].rng_state;
+  } else {
+    res = ssp_rng_create(NULL, args_array[0].rng_type, &rng);
+    if(res != RES_OK) goto error_batch;
+  }
+
+  /* ---- Create estimators for valid probes only ---- */
+  for(i = 0; i < nvalid; i++) {
+    res = estimator_create(scn->dev, SDIS_ESTIMATOR_TEMPERATURE,
+                           &out_estimators[valid_map[i]]);
+    if(res != RES_OK) goto error_batch;
+  }
+
+  /* ---- Run batch solver (compact arrays, nvalid probes) ---- */
+  res = solve_persistent_wavefront_probe_batch(
+    scn, rng, nvalid, enc_ids, positions,
+    args_array[0].time_range,
+    args_array[0].nrealisations,
+    args_array[0].picard_order,
+    args_array[0].diff_algo,
+    mdm_types, accums);
+  if(res != RES_OK) goto error_batch;
+
+  /* ---- Setup estimators from accumulators ---- */
+  for(i = 0; i < nvalid; i++) {
+    size_t orig = valid_map[i];
+    estimator_setup_realisations_count(out_estimators[orig],
+      args_array[orig].nrealisations, accums[i].count);
+    estimator_setup_temperature(out_estimators[orig],
+      accums[i].sum, accums[i].sum2);
+  }
+
+  goto exit_batch;
+
+error_batch:
+  for(i = 0; i < nprobes; i++) {
+    if(out_estimators[i]) {
+      sdis_estimator_ref_put(out_estimators[i]);
+      out_estimators[i] = NULL;
+    }
+  }
+exit_batch:
+  free(enc_ids);
+  free(positions);
+  free(mdm_types);
+  free(accums);
+  free(valid_map);
+  if(rng && !args_array[0].rng_state) ssp_rng_ref_put(rng);
+  return res;
+}

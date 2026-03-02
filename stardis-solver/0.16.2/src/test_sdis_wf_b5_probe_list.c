@@ -259,45 +259,53 @@ main(int argc, char** argv)
   csv = csv_open("B5");
 
   /* ================================================================== */
-  /* Solve: 10 probes at deterministic positions                        */
+  /* Solve: 10 probes in a single batch                                 */
   /* ================================================================== */
-  printf("  Running %d probes, %d realisations each ...\n",
+  printf("  Running %d probes (batch), %d realisations each ...\n",
     B5_NPROBES, B5_NREALS);
 
-  for(i = 0; i < B5_NPROBES; i++) {
-    struct sdis_solve_probe_args args = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
-    struct sdis_estimator* est_wf = NULL;
-    struct sdis_mc mc;
-    double ref;
-    int pass;
+  {
+    struct sdis_solve_probe_args args_arr[B5_NPROBES];
+    struct sdis_estimator* ests[B5_NPROBES];
 
-    args.nrealisations = B5_NREALS;
-    args.position[0] = b5_positions[i][0];
-    args.position[1] = b5_positions[i][1];
-    args.position[2] = b5_positions[i][2];
-    args.time_range[0] = INF;
-    args.time_range[1] = INF;
+    for(i = 0; i < B5_NPROBES; i++) {
+      args_arr[i] = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+      args_arr[i].nrealisations = B5_NREALS;
+      args_arr[i].position[0] = b5_positions[i][0];
+      args_arr[i].position[1] = b5_positions[i][1];
+      args_arr[i].position[2] = b5_positions[i][2];
+      args_arr[i].time_range[0] = INF;
+      args_arr[i].time_range[1] = INF;
+      ests[i] = NULL;
+    }
 
-    OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
-    OK(sdis_estimator_get_temperature(est_wf, &mc));
+    OK(sdis_solve_persistent_wavefront_probe_batch(
+      scn, B5_NPROBES, args_arr, ests));
 
-    ref = trilinear_profile(b5_positions[i]);
-    pass = p0_compare_analytic(est_wf, ref, B5_TOL_SIGMA);
-    n_pass += pass;
+    for(i = 0; i < B5_NPROBES; i++) {
+      struct sdis_mc mc;
+      double ref;
+      int pass;
 
-    /* CSV: primary DS row + complementary WoS variant */
-    csv_row(csv, "B5", "default", "gpu_wf", "DS",
-            b5_positions[i][0], b5_positions[i][1], b5_positions[i][2],
-            INF, 1, B5_NREALS, mc.E, mc.SE, ref);
+      OK(sdis_estimator_get_temperature(ests[i], &mc));
 
-    printf("  probe(%+.2f,%+.2f,%+.2f)  wf=%.4f (SE=%.2e)  ref=%.4f  "
-      "%s (%.1f sigma)\n",
-      b5_positions[i][0], b5_positions[i][1], b5_positions[i][2],
-      mc.E, mc.SE, ref,
-      pass ? "PASS" : "FAIL",
-      mc.SE > 0 ? fabs(mc.E - ref) / mc.SE : 0.0);
+      ref = trilinear_profile(b5_positions[i]);
+      pass = p0_compare_analytic(ests[i], ref, B5_TOL_SIGMA);
+      n_pass += pass;
 
-    OK(sdis_estimator_ref_put(est_wf));
+      csv_row(csv, "B5", "default", "gpu_wf", "DS",
+              b5_positions[i][0], b5_positions[i][1], b5_positions[i][2],
+              INF, 1, B5_NREALS, mc.E, mc.SE, ref);
+
+      printf("  probe(%+.2f,%+.2f,%+.2f)  wf=%.4f (SE=%.2e)  ref=%.4f  "
+        "%s (%.1f sigma)\n",
+        b5_positions[i][0], b5_positions[i][1], b5_positions[i][2],
+        mc.E, mc.SE, ref,
+        pass ? "PASS" : "FAIL",
+        mc.SE > 0 ? fabs(mc.E - ref) / mc.SE : 0.0);
+
+      OK(sdis_estimator_ref_put(ests[i]));
+    }
   }
 
   csv_close(csv);

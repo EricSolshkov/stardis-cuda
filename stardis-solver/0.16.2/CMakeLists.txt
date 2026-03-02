@@ -430,7 +430,9 @@ if(ENABLE_TESTS)
             LABELS "wf;p3;numerical")
     endforeach()
 
-    # S3DUT tests (supershape geometry): link sdis_obj + s3dut
+    # I1 batches 8 probes x 10K = 80K paths in a single pool pass — needs
+    # more wall-clock time than the default 600 s.
+    set_tests_properties(test_sdis_wf_i1_volumic_power2 PROPERTIES TIMEOUT 1200)
     set(WF_P3_TESTS_S3DUT
         test_sdis_wf_b5_probe_list)
 

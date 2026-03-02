@@ -4,9 +4,9 @@
  * for the P0-level tests (WF-A1, WF-A2, WF-B2, WF-C1, WF-D1).
  *
  * Validation protocol (per wf_p0_test_design.md v3):
- *   Primary  â€” wavefront result vs hardcoded analytic temperature
+ *   Primary  â€?wavefront result vs hardcoded analytic temperature
  *              Decides PASS/FAIL.
- *   Diagnostic â€” wavefront vs depth-first (same cuBQL backend)
+ *   Diagnostic â€?wavefront vs depth-first (same cuBQL backend)
  *              Logs only, does NOT affect test outcome.
  *
  * All P0 tests link sdis_obj (OBJECT lib) for access to LOCAL_SYM symbols.
@@ -100,11 +100,14 @@ p0_print_probe_result(
 }
 
 /* ========================================================================== */
-/* One-shot probe sweep: N probes along X axis                                */
+/* One-shot probe sweep: N probes along X axis (batch variant)                */
+/*   All N probes are solved in a single persistent wavefront pool pass.      */
 /*   Primary (analytic) decides PASS/FAIL.                                    */
 /*   Diagnostic (depth-first) is logged but non-blocking.                     */
 /* Returns 1 = pass, 0 = fail.                                                */
 /* ========================================================================== */
+#define P0_MAX_PROBES_BATCH 64
+
 typedef double (*p0_analytic_fn)(double x);
 
 static int
@@ -120,45 +123,58 @@ p0_run_probe_sweep(
 {
   size_t i;
   int n_pass_primary = 0, n_pass_diag = 0;
+  struct sdis_solve_probe_args args_arr[P0_MAX_PROBES_BATCH];
+  struct sdis_estimator*       ests[P0_MAX_PROBES_BATCH];
+  double xs[P0_MAX_PROBES_BATCH];
+  double T_refs[P0_MAX_PROBES_BATCH];
 
-  fprintf(stdout, "  Running %lu probes, %lu realisations each ...\n",
+  if(nprobes > P0_MAX_PROBES_BATCH) {
+    fprintf(stderr, "p0_run_probe_sweep: nprobes %lu exceeds max %d\n",
+      (unsigned long)nprobes, P0_MAX_PROBES_BATCH);
+    return 0;
+  }
+
+  fprintf(stdout, "  Running %lu probes (batch), %lu realisations each ...\n",
     (unsigned long)nprobes, (unsigned long)nrealisations);
 
+  /* Build args array */
   for(i = 0; i < nprobes; i++) {
     /* Offset probes inward to avoid degenerate behaviour exactly on
      * boundary surfaces.  x ranges from ~0.05 to ~0.95. */
     double x = 0.05 + (double)i * 0.9 / (double)(nprobes - 1);
-    double pos[3];
-    double T_ref;
-    struct sdis_solve_probe_args args = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
-    struct sdis_estimator *est_wf = NULL, *est_df = NULL;
+    xs[i]     = x;
+    T_refs[i] = T_analytic(x);
 
-    pos[0] = x; pos[1] = y_fixed; pos[2] = z_fixed;
-    T_ref = T_analytic(x);
+    args_arr[i] = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+    args_arr[i].nrealisations = nrealisations;
+    args_arr[i].position[0]   = x;
+    args_arr[i].position[1]   = y_fixed;
+    args_arr[i].position[2]   = z_fixed;
+    args_arr[i].picard_order  = picard_order;
+    args_arr[i].diff_algo     = diff_algo;
+    ests[i] = NULL;
+  }
 
-    args.nrealisations = nrealisations;
-    args.position[0] = pos[0];
-    args.position[1] = pos[1];
-    args.position[2] = pos[2];
-    args.picard_order = picard_order;
-    args.diff_algo = diff_algo;
+  /* Single batch solve — all probes in one pool pass */
+  OK(sdis_solve_persistent_wavefront_probe_batch(
+    scn, nprobes, args_arr, ests));
 
-    /* Wavefront probe solve */
-    OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
+  /* Evaluate results */
+  for(i = 0; i < nprobes; i++) {
+    struct sdis_estimator *est_df = NULL;
 
     /* Primary: wavefront vs analytic (decides PASS/FAIL) */
-    n_pass_primary += p0_compare_analytic(est_wf, T_ref, P0_TOL_SIGMA);
+    n_pass_primary += p0_compare_analytic(ests[i], T_refs[i], P0_TOL_SIGMA);
 
     /* Diagnostic: wavefront vs depth-first (log only, non-blocking) */
     if(P0_ENABLE_DIAG) {
-      OK(sdis_solve_probe(scn, &args, &est_df));
-      n_pass_diag += p0_diag_compare(est_wf, est_df, P0_DIAG_SIGMA);
+      OK(sdis_solve_probe(scn, &args_arr[i], &est_df));
+      n_pass_diag += p0_diag_compare(ests[i], est_df, P0_DIAG_SIGMA);
     }
 
-    /* Diagnostic output */
-    p0_print_probe_result(x, est_wf, est_df, T_ref);
+    p0_print_probe_result(xs[i], ests[i], est_df, T_refs[i]);
 
-    OK(sdis_estimator_ref_put(est_wf));
+    OK(sdis_estimator_ref_put(ests[i]));
     if(est_df)
       OK(sdis_estimator_ref_put(est_df));
   }

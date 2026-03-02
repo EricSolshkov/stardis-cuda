@@ -218,7 +218,7 @@ main(int argc, char** argv)
     args.time_range[1] = ref->time;
     args.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
 
-    OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
+    OK(sdis_solve_persistent_wavefront_probe(scn, &args, &est_wf));
     OK(sdis_estimator_get_temperature(est_wf, &mc_wf));
 
     /* Primary: wavefront vs Green function analytic (4 sigma, relaxed) */

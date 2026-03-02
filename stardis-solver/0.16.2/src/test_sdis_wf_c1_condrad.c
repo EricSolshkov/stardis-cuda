@@ -13,7 +13,7 @@
  *   Ts0 = T0 + tmp,  Ts1 = T1 - tmp
  *   T(x) = Ts0*(1-u) + Ts1*u,  u = (x+1)/thickness
  *
- * 9 probes in solid region x âˆˆ [-0.8, 0.8] (y=0, z=0).
+ * 9 probes in solid region x âˆ?[-0.8, 0.8] (y=0, z=0).
  * Dual validation A+B.
  *
  * Reference CPU test: test_sdis_conducto_radiative.c
@@ -291,8 +291,8 @@ static double
 c1_analytic(double u)
 {
   /* u is normalised: u = (x + 1) / thickness
-   * Called from p0_run_probe_sweep with x âˆˆ [0, 1] representing
-   * the probe parameter; we map it to physical x âˆˆ [-0.8, 0.8] */
+   * Called from p0_run_probe_sweep with x âˆ?[0, 1] representing
+   * the probe parameter; we map it to physical x âˆ?[-0.8, 0.8] */
   double x = -0.8 + 1.6 * u;
   double t = (x + 1.0) / C1_THICKNESS;
   return c1_Ts0 * (1.0 - t) + c1_Ts1 * t;
@@ -460,44 +460,54 @@ main(int argc, char** argv)
   printf("  hr = %.6e, Ts0 = %.4f, Ts1 = %.4f\n", c1_hr, c1_Ts0, c1_Ts1);
 
   /* ---- Run probe sweep in solid region ---- */
-  /* We probe x âˆˆ [-0.8, 0.8], passing through c1_analytic()
-   * which maps the normalised parameter u âˆˆ [0,1] to physical x.
+  /* We probe x âˆ?[-0.8, 0.8], passing through c1_analytic()
+   * which maps the normalised parameter u âˆ?[0,1] to physical x.
    * The sweep utility sets y_fixed=0, z_fixed=0 but we need probes
    * inside the solid cube which spans [-1,1]^3 so y=0, z=0 is fine. */
   {
-    /* Manual sweep since c1_analytic maps u differently */
-    fprintf(stdout, "  Running %d probes, %d realisations each ...\n",
+    /* Manual sweep since c1_analytic maps u differently — batch */
+    struct sdis_solve_probe_args args_arr[C1_NPROBES];
+    struct sdis_estimator*       ests[C1_NPROBES];
+    double xs[C1_NPROBES];
+    double T_refs[C1_NPROBES];
+
+    fprintf(stdout, "  Running %d probes (batch), %d realisations each ...\n",
       C1_NPROBES, C1_NREALS);
 
     for(i = 0; i < C1_NPROBES; i++) {
       double u = (double)i / (double)(C1_NPROBES - 1);
       double x = -0.8 + 1.6 * u;
       double t_norm = (x + 1.0) / C1_THICKNESS;
-      double T_ref = c1_Ts0 * (1.0 - t_norm) + c1_Ts1 * t_norm;
-      struct sdis_solve_probe_args args = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
-      struct sdis_estimator *est_wf = NULL, *est_df = NULL;
 
-      args.nrealisations = C1_NREALS;
-      args.position[0] = x;
-      args.position[1] = 0.0;
-      args.position[2] = 0.0;
-      args.picard_order = 1;
-      args.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
+      xs[i]     = x;
+      T_refs[i] = c1_Ts0 * (1.0 - t_norm) + c1_Ts1 * t_norm;
 
-      OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
+      args_arr[i] = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+      args_arr[i].nrealisations = C1_NREALS;
+      args_arr[i].position[0]   = x;
+      args_arr[i].position[1]   = 0.0;
+      args_arr[i].position[2]   = 0.0;
+      args_arr[i].picard_order  = 1;
+      args_arr[i].diff_algo     = SDIS_DIFFUSION_DELTA_SPHERE;
+      ests[i] = NULL;
+    }
 
-      /* Primary: wavefront vs analytic (decides PASS/FAIL) */
-      n_pass_primary += p0_compare_analytic(est_wf, T_ref, P0_TOL_SIGMA);
+    OK(sdis_solve_persistent_wavefront_probe_batch(
+      scn, C1_NPROBES, args_arr, ests));
 
-      /* Diagnostic: wavefront vs depth-first (log only, non-blocking) */
+    for(i = 0; i < C1_NPROBES; i++) {
+      struct sdis_estimator *est_df = NULL;
+
+      n_pass_primary += p0_compare_analytic(ests[i], T_refs[i], P0_TOL_SIGMA);
+
       if(P0_ENABLE_DIAG) {
-        OK(sdis_solve_probe(scn, &args, &est_df));
-        n_pass_diag += p0_diag_compare(est_wf, est_df, P0_DIAG_SIGMA);
+        OK(sdis_solve_probe(scn, &args_arr[i], &est_df));
+        n_pass_diag += p0_diag_compare(ests[i], est_df, P0_DIAG_SIGMA);
       }
 
-      p0_print_probe_result(x, est_wf, est_df, T_ref);
+      p0_print_probe_result(xs[i], ests[i], est_df, T_refs[i]);
 
-      OK(sdis_estimator_ref_put(est_wf));
+      OK(sdis_estimator_ref_put(ests[i]));
       if(est_df)
         OK(sdis_estimator_ref_put(est_df));
     }

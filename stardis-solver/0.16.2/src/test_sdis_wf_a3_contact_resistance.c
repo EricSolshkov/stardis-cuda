@@ -277,14 +277,14 @@ main(int argc, char** argv)
   (void)argc; (void)argv;
 
   /* 5 fixed R values spanning 4 decades (same range as CPU test's
-   * r = 10^uniform(-2,2) âˆˆ [0.01, 100]) */
+   * r = 10^uniform(-2,2) âˆ?[0.01, 100]) */
   static const double R_values[] = { 0.01, 0.1, 1.0, 10.0, 100.0 };
   static const size_t nR = sizeof(R_values) / sizeof(R_values[0]);
 
-  /* Probe positions â€” matching CPU pattern: probes placed inside each solid
+  /* Probe positions â€?matching CPU pattern: probes placed inside each solid
    * with 5% margin from boundaries.
-   *   solid1: x âˆˆ [0.05*X0, 0.95*X0] = [0.15, 2.85]
-   *   solid2: x âˆˆ [X0+0.05*(L-X0), X0+0.95*(L-X0)] = [3.05, 3.95]
+   *   solid1: x âˆ?[0.05*X0, 0.95*X0] = [0.15, 2.85]
+   *   solid2: x âˆ?[X0+0.05*(L-X0), X0+0.95*(L-X0)] = [3.05, 3.95]
    * 4 probes per solid, 8 per R, alternating solid1/solid2 as CPU does. */
 #define A3_NPROBES_PER_SOLID 4
   static const double a3_x_solid1[A3_NPROBES_PER_SOLID] = {
@@ -379,7 +379,7 @@ main(int argc, char** argv)
     &interf_TL));
   OK(sdis_data_ref_put(data));
 
-  /* ---- Contact interface (solid1/solid2) â€” mutable R via sdis_data ---- */
+  /* ---- Contact interface (solid1/solid2) â€?mutable R via sdis_data ---- */
   /* Like CPU test: one interface, change R through mutable pointer. */
   {
     struct sdis_interface_shader r_shader = SDIS_INTERFACE_SHADER_NULL;
@@ -397,7 +397,7 @@ main(int argc, char** argv)
     OK(sdis_data_ref_put(data));
   }
 
-  /* Mutable pointer â€” updated before each R group */
+  /* Mutable pointer â€?updated before each R group */
   interf_R_props = sdis_data_get(sdis_interface_get_data(interf_R));
 
   /* ---- Triangle-to-interface mapping (22 triangles) ---- */
@@ -461,52 +461,64 @@ main(int argc, char** argv)
     fprintf(stdout, "  Running %d probes (4 solid1 + 4 solid2), "
       "%d realisations each ...\n", 2 * A3_NPROBES_PER_SOLID, A3_NREALS);
 
-    /* ---- Sweep: alternating solid1/solid2 (like CPU isimul%2) ---- */
-    for(i = 0; i < 2 * (size_t)A3_NPROBES_PER_SOLID; i++) {
-      double x, T_ref;
-      struct sdis_solve_probe_args args = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
-      struct sdis_estimator *est_wf = NULL, *est_df = NULL;
+    /* ---- Batch sweep: 8 probes per R (4 solid1 + 4 solid2) ---- */
+    {
+      const size_t a3_batch_n = 2 * (size_t)A3_NPROBES_PER_SOLID;
+      struct sdis_solve_probe_args args_arr[2 * A3_NPROBES_PER_SOLID];
+      struct sdis_estimator *ests[2 * A3_NPROBES_PER_SOLID];
+      double x_arr[2 * A3_NPROBES_PER_SOLID];
+      double T_ref_arr[2 * A3_NPROBES_PER_SOLID];
 
-      if(i % 2) {
-        /* Odd: solid1, x âˆˆ [0.05*X0, 0.95*X0] */
-        x = a3_x_solid1[i / 2];
-        T_ref = a3_analytic_temperature(&ctx, x);
-      } else {
-        /* Even: solid2, x âˆˆ [X0+0.05*(L-X0), X0+0.95*(L-X0)] */
-        x = a3_x_solid2[i / 2];
-        T_ref = a3_analytic_temperature(&ctx, x);
+      /* Build args array */
+      for(i = 0; i < a3_batch_n; i++) {
+        args_arr[i] = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+        if(i % 2) {
+          x_arr[i] = a3_x_solid1[i / 2];
+        } else {
+          x_arr[i] = a3_x_solid2[i / 2];
+        }
+        T_ref_arr[i] = a3_analytic_temperature(&ctx, x_arr[i]);
+        args_arr[i].nrealisations = A3_NREALS;
+        args_arr[i].position[0] = x_arr[i];
+        args_arr[i].position[1] = A3_L / 2.0;
+        args_arr[i].position[2] = A3_L / 2.0;
+        args_arr[i].picard_order = 1;
+        args_arr[i].diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
+        ests[i] = NULL;
       }
 
-      args.nrealisations = A3_NREALS;
-      args.position[0] = x;
-      args.position[1] = A3_L / 2.0;
-      args.position[2] = A3_L / 2.0;
-      args.picard_order = 1;
-      args.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
+      OK(sdis_solve_persistent_wavefront_probe_batch(
+            scn, (int)a3_batch_n, args_arr, ests));
 
-      OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
-      n_pass_primary += p0_compare_analytic(est_wf, T_ref, P0_TOL_SIGMA);
-      n_probes++;
+      /* Process results */
+      for(i = 0; i < a3_batch_n; i++) {
+        struct sdis_estimator *est_df = NULL;
+        n_pass_primary += p0_compare_analytic(ests[i], T_ref_arr[i],
+                                              P0_TOL_SIGMA);
+        n_probes++;
 
-      /* CSV: primary DS row + complementary WoS variant */
-      {
-        struct sdis_mc mc_csv;
-        char csv_sub[32];
-        OK(sdis_estimator_get_temperature(est_wf, &mc_csv));
-        sprintf(csv_sub, "R=%.2g", R);
-        csv_row(csv, "A3", csv_sub, "gpu_wf", "DS",
-                args.position[0], args.position[1], args.position[2],
-                INF, (int)args.picard_order, (int)args.nrealisations,
-                mc_csv.E, mc_csv.SE, T_ref);
+        /* CSV row */
+        {
+          struct sdis_mc mc_csv;
+          char csv_sub[32];
+          OK(sdis_estimator_get_temperature(ests[i], &mc_csv));
+          sprintf(csv_sub, "R=%.2g", R);
+          csv_row(csv, "A3", csv_sub, "gpu_wf", "DS",
+                  args_arr[i].position[0], args_arr[i].position[1],
+                  args_arr[i].position[2],
+                  INF, (int)args_arr[i].picard_order,
+                  (int)args_arr[i].nrealisations,
+                  mc_csv.E, mc_csv.SE, T_ref_arr[i]);
+        }
+
+        if(P0_ENABLE_DIAG) {
+          OK(sdis_solve_probe(scn, &args_arr[i], &est_df));
+        }
+        p0_print_probe_result(x_arr[i], ests[i], est_df, T_ref_arr[i]);
+
+        OK(sdis_estimator_ref_put(ests[i]));
+        if(est_df) OK(sdis_estimator_ref_put(est_df));
       }
-
-      if(P0_ENABLE_DIAG) {
-        OK(sdis_solve_probe(scn, &args, &est_df));
-      }
-      p0_print_probe_result(x, est_wf, est_df, T_ref);
-
-      OK(sdis_estimator_ref_put(est_wf));
-      if(est_df) OK(sdis_estimator_ref_put(est_df));
     }
 
     fprintf(stdout, "  R=%.2e  Primary: %d/%d pass\n",

@@ -39,6 +39,7 @@
 #include "sdis_estimator_c.h"
 #include "sdis_heat_path_boundary_c.h"
 #include "sdis_heat_path_conductive_c.h"
+#include "sdis_heat_path.h"
 #include "sdis_interface_c.h"
 #include "sdis_log.h"
 #include "sdis_medium_c.h"
@@ -318,11 +319,56 @@ split_to_dual_pool(struct wavefront_pool* pool)
 
 /*******************************************************************************
  * Pool allocation / deallocation
+ *
+ * pool_create — Self-adaptive pool allocation.
+ *
+ * @param per_view_size  Target number of slots per view (from determine_pool_size).
+ * @param total_tasks    Total number of tasks (nrealisations, W*H*spp, etc.).
+ *
+ * Scheduling decision (dual- vs single-buffer) is made internally:
+ *   ratio = total_tasks / per_view_size
+ *   if ratio >= DUAL_BUFFER_RATIO_THRESHOLD  → dual-buffer pipeline
+ *   else                                     → single-buffer
+ *
+ * Environment override: STARDIS_PIPELINE=0  forces single-buffer.
+ *                       STARDIS_PIPELINE=1  forces dual-buffer.
  ******************************************************************************/
+#define DUAL_BUFFER_RATIO_THRESHOLD 12
+#define DUAL_BUFFER_MIN_VIEW_SIZE   512
+
 static res_T
-pool_create(struct wavefront_pool* pool, size_t pool_size)
+pool_create(struct wavefront_pool* pool, size_t per_view_size,
+            size_t total_tasks)
 {
-  ASSERT(pool && pool_size > 0);
+  int dual;
+  size_t pool_size;
+
+  ASSERT(pool && per_view_size > 0 && total_tasks > 0);
+
+  /* ---- Scheduling decision ---- */
+  {
+    const char* env = getenv("STARDIS_PIPELINE");
+    if(env && env[0] == '0') {
+      dual = 0;  /* forced single-buffer */
+    } else if(env && env[0] == '1') {
+      dual = 1;  /* forced dual-buffer */
+    } else {
+      /* Auto-adaptive: dual when workload saturates pool over many rounds */
+      size_t ratio = total_tasks / per_view_size;
+      dual = (ratio >= DUAL_BUFFER_RATIO_THRESHOLD
+           && per_view_size >= DUAL_BUFFER_MIN_VIEW_SIZE) ? 1 : 0;
+    }
+  }
+
+  if(dual) {
+    pool_size = per_view_size * 2;
+    /* Ensure even split */
+    pool_size = (pool_size / 2) * 2;
+    if(pool_size < 2) pool_size = 2;
+  } else {
+    pool_size = per_view_size;
+  }
+
   memset(pool, 0, sizeof(*pool));
   pool->pool_size = pool_size;
 
@@ -403,14 +449,10 @@ pool_create(struct wavefront_pool* pool, size_t pool_size)
   pool->diag_min_batch = (size_t)-1; /* updated on first step with rays */
   pool->trace_batch_size_min = (size_t)-1;
 
-  /* P2: Initialise unified pool views */
+  /* P2: Initialise unified pool views (decision already made above) */
   {
-    const char* env = getenv("STARDIS_PIPELINE");
-    int dual = (env && env[0] == '0') ? 0 : 1;
     res_T vrc;
-
     if(dual) {
-      /* Dual-buffer pipeline mode */
       size_t half = pool_size / 2;
 
       /* views[0]: capacity = pool_size (supports merge to full range)
@@ -697,6 +739,386 @@ init_single_path(
 }
 
 /*******************************************************************************
+ * wavefront_ops — CAMERA mode callbacks
+ ******************************************************************************/
+
+/* camera_generate_tasks: populate task queue in Morton order W×H×spp */
+static res_T
+camera_generate_tasks(struct wavefront_pool* pool, const void* mode_ctx)
+{
+  const struct camera_mode_ctx* ctx =
+    (const struct camera_mode_ctx*)mode_ctx;
+  return generate_task_queue(pool, ctx->image_def, ctx->spp);
+}
+
+/* camera_init_path: init a single camera path from a pixel_task */
+static res_T
+camera_init_path(struct path_state* p,
+                 struct ssp_rng* rng,
+                 const struct pixel_task* task,
+                 struct sdis_scene* scn,
+                 unsigned enc_id,
+                 const void* mode_ctx,
+                 const double* time_range,
+                 size_t picard_order,
+                 enum sdis_diffusion_algorithm diff_algo,
+                 uint32_t path_id,
+                 uint64_t global_seed)
+{
+  const struct camera_mode_ctx* ctx =
+    (const struct camera_mode_ctx*)mode_ctx;
+  return init_single_path(p, rng, task, scn, enc_id,
+    ctx->cam, time_range, ctx->pix_sz,
+    picard_order, diff_algo, path_id, global_seed);
+}
+
+/* camera_accumulate_result: write one completed path to estimator_buffer */
+static void
+camera_accumulate_result(const struct path_state* p, void* result_ctx)
+{
+  struct sdis_estimator_buffer* buf =
+    (struct sdis_estimator_buffer*)result_ctx;
+  struct sdis_estimator* estimator =
+    estimator_buffer_grab(buf, p->ipix_image[0], p->ipix_image[1]);
+
+  if(p->T.done) {
+    estimator->temperature.sum  += p->T.value;
+    estimator->temperature.sum2 += p->T.value * p->T.value;
+    estimator->temperature.count += 1;
+    estimator->realisation_time.count += 1;
+    estimator->nrealisations += 1;
+  }
+}
+
+/* Static camera vtable instance */
+static const struct wavefront_ops wf_ops_camera = {
+  camera_generate_tasks,
+  camera_init_path,
+  camera_accumulate_result
+};
+
+/*******************************************************************************
+ * wavefront_ops — PROBE mode callbacks
+ ******************************************************************************/
+
+/* probe_generate_tasks: nrealisations linear tasks at (0,0) */
+static res_T
+probe_generate_tasks(struct wavefront_pool* pool, const void* mode_ctx)
+{
+  const struct probe_mode_ctx* ctx =
+    (const struct probe_mode_ctx*)mode_ctx;
+  size_t i;
+  size_t total = ctx->nrealisations;
+
+  pool->task_queue = (struct pixel_task*)malloc(
+    total * sizeof(struct pixel_task));
+  if(!pool->task_queue) return RES_MEM_ERR;
+
+  pool->task_count = total;
+  pool->task_next = 0;
+
+  for(i = 0; i < total; i++) {
+    struct pixel_task* t = &pool->task_queue[i];
+    t->ipix_image[0] = 0;
+    t->ipix_image[1] = 0;
+    t->spp_idx = (uint32_t)i;
+  }
+  return RES_OK;
+}
+
+/* probe_init_path: init a single conductive/convective path from probe position.
+ * Adapted from init_paths_from_probe() in sdis_solve_wavefront.c (single-path
+ * version with CBRNG seeding instead of shared RNG). */
+static res_T
+probe_init_path(struct path_state* p,
+                struct ssp_rng* rng,
+                const struct pixel_task* task,
+                struct sdis_scene* scn,
+                unsigned enc_id,
+                const void* mode_ctx,
+                const double* time_range,
+                size_t picard_order,
+                enum sdis_diffusion_algorithm diff_algo,
+                uint32_t path_id,
+                uint64_t global_seed)
+{
+  const struct probe_mode_ctx* ctx =
+    (const struct probe_mode_ctx*)mode_ctx;
+  double time;
+
+  ASSERT(p && rng && task && scn && time_range);
+
+  memset(p, 0, sizeof(*p));
+
+  /* Identity — probe uses virtual pixel (0,0) */
+  p->path_id = path_id;
+  p->pixel_x = 0;
+  p->pixel_y = 0;
+  p->realisation_idx = task->spp_idx;
+  p->ipix_image[0] = 0;
+  p->ipix_image[1] = 0;
+
+  /* Per-slot RNG (thin wrapper pointing to p->rng_state) */
+  p->rng = rng;
+
+  /* Seed per-path CBRNG (same as camera but pixel coords are zero) */
+  wf_rng_seed(&p->rng_state, 0, 0, task->spp_idx, global_seed);
+
+  /* Sample time */
+  time = sample_time(p->rng, time_range);
+
+  /* Directly set probe position — no camera_ray */
+  p->rwalk = RWALK_NULL;
+  d3_set(p->rwalk.vtx.P, ctx->position);
+  p->rwalk.vtx.time = time;
+  p->rwalk.hit_3d = S3D_HIT_NULL;
+  p->rwalk.hit_side = SDIS_SIDE_NULL__;
+  p->rwalk.enc_id = enc_id;
+
+  /* Initialise rwalk_context (matches init_paths_from_probe) */
+  p->ctx = RWALK_CONTEXT_NULL;
+  p->ctx.heat_path   = NULL;
+  p->ctx.green_path  = NULL;
+  p->ctx.Tmin   = scn->tmin;
+  p->ctx.Tmin2  = scn->tmin * scn->tmin;
+  p->ctx.Tmin3  = scn->tmin * scn->tmin * scn->tmin;
+  p->ctx.That   = scn->tmax;
+  p->ctx.That2  = scn->tmax * scn->tmax;
+  p->ctx.That3  = scn->tmax * scn->tmax * scn->tmax;
+  p->ctx.max_branchings = picard_order - 1;
+  p->ctx.nbranchings    = 0;  /* probe: nbranchings=0 at entry */
+  p->ctx.irealisation   = task->spp_idx;
+  p->ctx.diff_algo      = diff_algo;
+
+  /* Temperature accumulator — T.func based on medium type */
+  p->T = TEMPERATURE_NULL;
+  if(ctx->mdm_type == SDIS_SOLID) {
+    p->T.func = conductive_path_3d;
+  } else {
+    p->T.func = convective_path_3d;
+  }
+
+  /* Probe has no camera ray direction */
+  memset(p->rad_direction, 0, sizeof(p->rad_direction));
+  p->rad_bounce_count = 0;
+  p->rad_retry_count  = 0;
+
+  /* Lifecycle — start at COUPLED_CONDUCTIVE/CONVECTIVE, not PATH_INIT */
+  if(ctx->mdm_type == SDIS_SOLID) {
+    p->phase = PATH_COUPLED_CONDUCTIVE;
+  } else {
+    p->phase = PATH_COUPLED_CONVECTIVE;
+  }
+  p->active  = 1;
+  p->needs_ray = 0;
+
+  /* Zero scratch areas */
+  p->ds_delta_solid = 0;
+  p->ds_initialized = 0;
+  p->ds_enc_id = ENCLOSURE_ID_NULL;
+  p->ds_medium = NULL;
+  p->ds_props_ref = SOLID_PROPS_NULL;
+  p->ds_green_power_term = 0;
+  memset(p->ds_position_start, 0, sizeof(p->ds_position_start));
+  p->ds_robust_attempt = 0;
+  p->ds_delta = 0;
+  p->ds_delta_solid_param = 0;
+  p->bnd_reinject_distance = 0;
+  p->bnd_solid_enc_id = ENCLOSURE_ID_NULL;
+  p->bnd_retry_count = 0;
+  p->coupled_nbranchings = 0;
+  p->steps_taken = 0;
+  p->done_reason = 0;
+
+  return RES_OK;
+}
+
+/* probe_accumulate_result: accumulate one completed path to struct accum */
+static void
+probe_accumulate_result(const struct path_state* p, void* result_ctx)
+{
+  struct accum* acc = (struct accum*)result_ctx;
+  if(p->T.done) {
+    acc->sum  += p->T.value;
+    acc->sum2 += p->T.value * p->T.value;
+    acc->count += 1;
+  }
+}
+
+/* Static probe vtable instance */
+static const struct wavefront_ops wf_ops_probe = {
+  probe_generate_tasks,
+  probe_init_path,
+  probe_accumulate_result
+};
+
+/*******************************************************************************
+ * wavefront_ops — PROBE BATCH mode callbacks
+ *
+ * Multi-probe variant: K probes share the pool.  Each task carries its probe
+ * index in ipix_image[0], which propagates through path_state to allow
+ * accumulate_result to route to the correct accum bucket.
+ ******************************************************************************/
+
+/* probe_batch_generate_tasks: nprobes × nrealisations tasks.
+ * ipix_image[0] = probe_index, spp_idx = realisation index. */
+static res_T
+probe_batch_generate_tasks(struct wavefront_pool* pool, const void* mode_ctx)
+{
+  const struct probe_batch_mode_ctx* ctx =
+    (const struct probe_batch_mode_ctx*)mode_ctx;
+  size_t total = ctx->nprobes * ctx->nrealisations;
+  size_t pi, ri, k;
+
+  pool->task_queue = (struct pixel_task*)malloc(
+    total * sizeof(struct pixel_task));
+  if(!pool->task_queue) return RES_MEM_ERR;
+
+  pool->task_count = total;
+  pool->task_next = 0;
+
+  /* Interleave: probe 0 real 0, probe 1 real 0, ..., probe K-1 real 0,
+   * probe 0 real 1, ...  This maximises diversity within each batch. */
+  k = 0;
+  for(ri = 0; ri < ctx->nrealisations; ri++) {
+    for(pi = 0; pi < ctx->nprobes; pi++) {
+      struct pixel_task* t = &pool->task_queue[k++];
+      t->ipix_image[0] = pi;        /* probe index */
+      t->ipix_image[1] = 0;
+      t->spp_idx = (uint32_t)ri;
+    }
+  }
+  return RES_OK;
+}
+
+/* probe_batch_init_path: same as probe_init_path but reads position/enc_id/
+ * mdm_type from batch arrays indexed by task->ipix_image[0]. */
+static res_T
+probe_batch_init_path(struct path_state* p,
+                      struct ssp_rng* rng,
+                      const struct pixel_task* task,
+                      struct sdis_scene* scn,
+                      unsigned enc_id,
+                      const void* mode_ctx,
+                      const double* time_range,
+                      size_t picard_order,
+                      enum sdis_diffusion_algorithm diff_algo,
+                      uint32_t path_id,
+                      uint64_t global_seed)
+{
+  const struct probe_batch_mode_ctx* ctx =
+    (const struct probe_batch_mode_ctx*)mode_ctx;
+  size_t probe_idx = task->ipix_image[0];
+  const double* pos = &ctx->positions[probe_idx * 3];
+  unsigned probe_enc_id = ctx->enc_ids[probe_idx];
+  enum sdis_medium_type mdm_type = ctx->mdm_types[probe_idx];
+  double time;
+
+  (void)enc_id; /* batch overrides with per-probe enc_id */
+
+  ASSERT(p && rng && task && scn && time_range);
+  ASSERT(probe_idx < ctx->nprobes);
+
+  memset(p, 0, sizeof(*p));
+
+  /* Identity — ipix_image[0] = probe_index for accumulate routing */
+  p->path_id = path_id;
+  p->pixel_x = 0;
+  p->pixel_y = 0;
+  p->realisation_idx = task->spp_idx;
+  p->ipix_image[0] = probe_idx;
+  p->ipix_image[1] = 0;
+
+  p->rng = rng;
+  wf_rng_seed(&p->rng_state,
+    (uint32_t)probe_idx, 0, task->spp_idx, global_seed);
+
+  time = sample_time(p->rng, time_range);
+
+  p->rwalk = RWALK_NULL;
+  d3_set(p->rwalk.vtx.P, pos);
+  p->rwalk.vtx.time = time;
+  p->rwalk.hit_3d = S3D_HIT_NULL;
+  p->rwalk.hit_side = SDIS_SIDE_NULL__;
+  p->rwalk.enc_id = probe_enc_id;
+
+  p->ctx = RWALK_CONTEXT_NULL;
+  p->ctx.heat_path   = NULL;
+  p->ctx.green_path  = NULL;
+  p->ctx.Tmin   = scn->tmin;
+  p->ctx.Tmin2  = scn->tmin * scn->tmin;
+  p->ctx.Tmin3  = scn->tmin * scn->tmin * scn->tmin;
+  p->ctx.That   = scn->tmax;
+  p->ctx.That2  = scn->tmax * scn->tmax;
+  p->ctx.That3  = scn->tmax * scn->tmax * scn->tmax;
+  p->ctx.max_branchings = picard_order - 1;
+  p->ctx.nbranchings    = 0;
+  p->ctx.irealisation   = task->spp_idx;
+  p->ctx.diff_algo      = diff_algo;
+
+  p->T = TEMPERATURE_NULL;
+  if(mdm_type == SDIS_SOLID) {
+    p->T.func = conductive_path_3d;
+  } else {
+    p->T.func = convective_path_3d;
+  }
+
+  memset(p->rad_direction, 0, sizeof(p->rad_direction));
+  p->rad_bounce_count = 0;
+  p->rad_retry_count  = 0;
+
+  if(mdm_type == SDIS_SOLID) {
+    p->phase = PATH_COUPLED_CONDUCTIVE;
+  } else {
+    p->phase = PATH_COUPLED_CONVECTIVE;
+  }
+  p->active  = 1;
+  p->needs_ray = 0;
+
+  p->ds_delta_solid = 0;
+  p->ds_initialized = 0;
+  p->ds_enc_id = ENCLOSURE_ID_NULL;
+  p->ds_medium = NULL;
+  p->ds_props_ref = SOLID_PROPS_NULL;
+  p->ds_green_power_term = 0;
+  memset(p->ds_position_start, 0, sizeof(p->ds_position_start));
+  p->ds_robust_attempt = 0;
+  p->ds_delta = 0;
+  p->ds_delta_solid_param = 0;
+  p->bnd_reinject_distance = 0;
+  p->bnd_solid_enc_id = ENCLOSURE_ID_NULL;
+  p->bnd_retry_count = 0;
+  p->coupled_nbranchings = 0;
+  p->steps_taken = 0;
+  p->done_reason = 0;
+
+  return RES_OK;
+}
+
+/* probe_batch_accumulate_result: route result to accums[probe_index] */
+static void
+probe_batch_accumulate_result(const struct path_state* p, void* result_ctx)
+{
+  struct probe_batch_mode_ctx* ctx = (struct probe_batch_mode_ctx*)result_ctx;
+  size_t probe_idx = p->ipix_image[0];
+  struct accum* acc;
+  ASSERT(probe_idx < ctx->nprobes);
+  acc = &ctx->accums[probe_idx];
+  if(p->T.done) {
+    acc->sum  += p->T.value;
+    acc->sum2 += p->T.value * p->T.value;
+    acc->count += 1;
+  }
+}
+
+/* Static probe batch vtable instance */
+static const struct wavefront_ops wf_ops_probe_batch = {
+  probe_batch_generate_tasks,
+  probe_batch_init_path,
+  probe_batch_accumulate_result
+};
+
+/*******************************************************************************
  * Advance a single path past PATH_INIT to its first ray-needed phase (or
  * PATH_DONE).  Shared by fill_pool() and refill_pool().
  ******************************************************************************/
@@ -748,10 +1170,10 @@ fill_pool(struct wavefront_pool* pool)
   for(i = 0; i < pool->pool_size && pool->task_next < pool->task_count; i++) {
     const struct pixel_task* task = &pool->task_queue[pool->task_next];
 
-    res = init_single_path(
+    res = pool->ops->init_path(
       &pool->slots[i], pool->slot_rngs[i], task,
-      pool->scn, pool->enc_id, pool->cam,
-      pool->time_range, pool->pix_sz,
+      pool->scn, pool->enc_id, pool->mode_ctx,
+      pool->time_range,
       pool->picard_order, pool->diff_algo,
       pool->next_path_id++, pool->global_seed);
     if(res != RES_OK) return res;
@@ -2102,20 +2524,21 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
 }
 
 /*******************************************************************************
- * Harvest completed paths -- write directly to estimator_buffer (M2)
+ * Harvest completed paths -- write results + mark for refill (M2)
  *
- * Called each wavefront step.  Marks completed slots as available for
- * refill.
+ * Called each wavefront step.  Per-path result accumulation is dispatched
+ * through pool->ops->accumulate_result (camera writes to estimator_buffer,
+ * probe writes to struct accum).  Common bookkeeping (trace logging, stats,
+ * PATH_HARVESTED marking) is mode-agnostic.
  ******************************************************************************/
 static res_T
 harvest_completed_paths(
   struct wavefront_pool* pool,
-  struct pool_view* pv,
-  struct sdis_estimator_buffer* buf)
+  struct pool_view* pv)
 {
   size_t k;
 
-  ASSERT(pool && buf);
+  ASSERT(pool);
 
   for(k = 0; k < pv->done_count; k++) {
     uint32_t i = pv->done_indices[k];
@@ -2128,18 +2551,8 @@ harvest_completed_paths(
     if(!pool->dsoa.active[i] && ph != PATH_DONE && ph != PATH_ERROR)
       continue;
 
-    {
-      struct sdis_estimator* estimator =
-        estimator_buffer_grab(buf, p->ipix_image[0], p->ipix_image[1]);
-
-      if(p->T.done) {
-        estimator->temperature.sum  += p->T.value;
-        estimator->temperature.sum2 += p->T.value * p->T.value;
-        estimator->temperature.count += 1;
-        estimator->realisation_time.count += 1;
-        estimator->nrealisations += 1;
-      }
-    }
+    /* Mode-specific per-path result accumulation */
+    pool->ops->accumulate_result(p, pool->result_ctx);
 
     /* Per-path temperature trace */
     { FILE* tf = pixel_trace_file();
@@ -2213,10 +2626,10 @@ refill_pool(struct wavefront_pool* pool, struct pool_view* pv,
     {
       const struct pixel_task* task = &pool->task_queue[pool->task_next];
 
-      res = init_single_path(
+      res = pool->ops->init_path(
         p, pool->slot_rngs[i], task,
-        pool->scn, pool->enc_id, pool->cam,
-        pool->time_range, pool->pix_sz,
+        pool->scn, pool->enc_id, pool->mode_ctx,
+        pool->time_range,
         pool->picard_order, pool->diff_algo,
         pool->next_path_id++, pool->global_seed);
       if(res != RES_OK) return res;
@@ -2652,9 +3065,7 @@ gpu_wait_and_postprocess(struct wavefront_pool* pool,
  * cpu_between — cascade non-ray steps + harvest completed + refill pool.
  */
 static res_T
-cpu_between(struct wavefront_pool* pool, struct pool_view* pv,
-            struct sdis_scene* scn,
-            struct sdis_estimator_buffer* buf)
+cpu_between(struct wavefront_pool* pool, struct pool_view* pv)
 {
   size_t refill_count = 0;
   struct time t0, t1;
@@ -2662,7 +3073,7 @@ cpu_between(struct wavefront_pool* pool, struct pool_view* pv,
 
   /* cascade non-ray steps */
   time_current(&t0);
-  res = pool_cascade_non_ray_steps_compact(pool, pv, scn);
+  res = pool_cascade_non_ray_steps_compact(pool, pv, pool->scn);
   if(res != RES_OK) return res;
   time_current(&t1);
   pool->time_cascade_s += time_elapsed_sec(&t0, &t1);
@@ -2681,7 +3092,7 @@ cpu_between(struct wavefront_pool* pool, struct pool_view* pv,
   /* rebuild done_indices after cascade + harvest + refill */
   time_current(&t0);
   compact_active_paths(pool, pv);
-  res = harvest_completed_paths(pool, pv, buf);
+  res = harvest_completed_paths(pool, pv);
   if(res != RES_OK) return res;
   res = refill_pool(pool, pv, &refill_count);
   if(res != RES_OK) return res;
@@ -2689,6 +3100,218 @@ cpu_between(struct wavefront_pool* pool, struct pool_view* pv,
   pool->time_harvest_s += time_elapsed_sec(&t0, &t1);
 
   return RES_OK;
+}
+
+/*******************************************************************************
+ * pool_run_single — Single-buffer main loop (bare, no progress reporting).
+ *
+ * Used by probe / probe_batch modes and as fallback after dual→single merge.
+ ******************************************************************************/
+static res_T
+pool_run_single(struct wavefront_pool* pool,
+                struct s3d_scene_view* sv,
+                struct sdis_scene* scn)
+{
+  struct pool_view* pv = &pool->views[0];
+  res_T res;
+
+  compact_active_paths(pool, pv);
+  pool_update_active_count(pool);
+
+  while(pool->active_count > 0 || pool->task_next < pool->task_count) {
+    pool->total_steps++;
+
+    res = cpu_pre_gpu(pool, pv);
+    if(res != RES_OK) return res;
+
+    res = gpu_launch_async(pool, pv, sv);
+    if(res != RES_OK) return res;
+
+    res = gpu_wait_and_postprocess(pool, pv, sv, scn);
+    if(res != RES_OK) return res;
+
+    res = cpu_between(pool, pv);
+    if(res != RES_OK) return res;
+
+    pool_update_active_count(pool);
+
+    /* Safety: prevent infinite loops */
+    if(pool->total_steps > pool->task_count * 1000) {
+      return RES_BAD_OP;
+    }
+  }
+
+  return RES_OK;
+}
+
+/*******************************************************************************
+ * pool_run_dual — Dual-buffer pipeline main loop (bare, no progress).
+ *
+ * Overlaps GPU trace on one view with CPU cascade on the other.
+ * Dynamically merges to single-buffer when either half's occupancy drops
+ * below 12.5% (via should_merge).
+ ******************************************************************************/
+static res_T
+pool_run_dual(struct wavefront_pool* pool,
+              struct s3d_scene_view* sv,
+              struct sdis_scene* scn)
+{
+  struct pool_view* pv_a = &pool->views[0];
+  struct pool_view* pv_b = &pool->views[1];
+  res_T res;
+
+  /* Startup: prepare A and launch first GPU */
+  res = cpu_pre_gpu(pool, pv_a);
+  if(res != RES_OK) return res;
+  res = gpu_launch_async(pool, pv_a, sv);
+  if(res != RES_OK) return res;
+
+  /* Prepare B (first cycle: no cascade yet, just pre) */
+  res = cpu_pre_gpu(pool, pv_b);
+  if(res != RES_OK) return res;
+
+  while(pool->active_count > 0 || pool->task_next < pool->task_count) {
+    struct time t_pl0, t_pl1;
+
+    /* ════════ Phase 1: wait GPU(A) → launch GPU(B) → CPU on A ════════ */
+    time_current(&t_pl0);
+    res = gpu_wait_and_postprocess(pool, pv_a, sv, scn);
+    if(res != RES_OK) return res;
+    time_current(&t_pl1);
+    pool->time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
+
+    res = gpu_launch_async(pool, pv_b, sv);
+    if(res != RES_OK) return res;
+
+    pool->total_steps++;
+
+    time_current(&t_pl0);
+    res = cpu_between(pool, pv_a);
+    if(res != RES_OK) return res;
+    res = cpu_pre_gpu(pool, pv_a);
+    if(res != RES_OK) return res;
+    time_current(&t_pl1);
+    pool->time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
+
+    pool_update_active_count(pool);
+
+    if(!pool->in_drain_phase && pool->task_next >= pool->task_count) {
+      pool->in_drain_phase = 1;
+    }
+
+    /* Safety */
+    if(pool->total_steps > pool->task_count * 1000) {
+      return RES_BAD_OP;
+    }
+
+    /* ════════ Phase 2: wait GPU(B) → launch GPU(A) → CPU on B ════════ */
+    time_current(&t_pl0);
+    res = gpu_wait_and_postprocess(pool, pv_b, sv, scn);
+    if(res != RES_OK) return res;
+    time_current(&t_pl1);
+    pool->time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
+
+    res = gpu_launch_async(pool, pv_a, sv);
+    if(res != RES_OK) return res;
+
+    pool->total_steps++;
+
+    time_current(&t_pl0);
+    res = cpu_between(pool, pv_b);
+    if(res != RES_OK) return res;
+    res = cpu_pre_gpu(pool, pv_b);
+    if(res != RES_OK) return res;
+    time_current(&t_pl1);
+    pool->time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
+
+    pool_update_active_count(pool);
+
+    if(!pool->in_drain_phase && pool->task_next >= pool->task_count) {
+      pool->in_drain_phase = 1;
+    }
+
+    /* Safety */
+    if(pool->total_steps > pool->task_count * 1000) {
+      return RES_BAD_OP;
+    }
+
+    /* ════════ Dynamic merge check ════════ */
+    if(should_merge(pool)) {
+      if(pv_a->gpu_pending) {
+        res = gpu_wait_and_postprocess(pool, pv_a, sv, scn);
+        if(res != RES_OK) return res;
+      }
+      if(pv_b->gpu_pending) {
+        res = gpu_wait_and_postprocess(pool, pv_b, sv, scn);
+        if(res != RES_OK) return res;
+      }
+      merge_to_single_pool(pool);
+      break;  /* fall through to single-buffer in pool_run() */
+    }
+  } /* end dual-buffer while */
+
+  /* Drain: wait for last pending GPU calls */
+  if(pool->num_active_views == 2) {
+    if(pv_a->gpu_pending) {
+      res = gpu_wait_and_postprocess(pool, pv_a, sv, scn);
+      if(res != RES_OK) return res;
+      pool->total_steps++;
+      res = cpu_between(pool, pv_a);
+      if(res != RES_OK) return res;
+    }
+    if(pv_b->gpu_pending) {
+      res = gpu_wait_and_postprocess(pool, pv_b, sv, scn);
+      if(res != RES_OK) return res;
+      pool->total_steps++;
+      res = cpu_between(pool, pv_b);
+      if(res != RES_OK) return res;
+    }
+  }
+
+  return RES_OK;
+}
+
+/*******************************************************************************
+ * pool_run — Unified main loop dispatcher.
+ *
+ * Runs the dual-buffer pipeline if num_active_views == 2 (which may
+ * dynamically merge to single).  Then runs single-buffer to completion.
+ *
+ * This is the entry point for probe / probe_batch modes.  Camera mode
+ * currently uses its own verbose loop with progress reporting.
+ ******************************************************************************/
+static res_T
+pool_run(struct wavefront_pool* pool,
+         struct s3d_scene_view* sv,
+         struct sdis_scene* scn)
+{
+  res_T res = RES_OK;
+
+  /* Phase 1: Dual-buffer pipeline (if scheduled) */
+  if(pool->num_active_views == 2) {
+    log_info(scn->dev,
+      "pool_run: dual-buffer pipeline, per-view=%llu, pool=%llu\n",
+      (unsigned long long)pool->views[0].view_size,
+      (unsigned long long)pool->pool_size);
+
+    res = pool_run_dual(pool, sv, scn);
+    if(res != RES_OK) return res;
+
+    /* May have merged — log if so */
+    if(pool->num_active_views == 1) {
+      log_info(scn->dev,
+        "pool_run: merged to single-buffer at step %llu\n",
+        (unsigned long long)pool->total_steps);
+    }
+  }
+
+  /* Phase 2: Single-buffer drain (or full run if started single) */
+  if(pool->num_active_views == 1) {
+    res = pool_run_single(pool, sv, scn);
+    if(res != RES_OK) return res;
+  }
+
+  return res;
 }
 
 /*******************************************************************************
@@ -2757,6 +3380,7 @@ solve_camera_persistent_wavefront(
   const char*                 progress_label)
 {
   struct wavefront_pool pool;
+  struct camera_mode_ctx cam_ctx;
   size_t total_tasks;
   size_t pool_size;
   res_T res = RES_OK;
@@ -2772,33 +3396,15 @@ solve_camera_persistent_wavefront(
   total_tasks = image_def[0] * image_def[1] * spp;
   pool_size = determine_pool_size(total_tasks, scn);
 
-  /* P4: In dual-buffer pipeline mode each view sees pool_size/2 slots.
-   * Double pool_size so that each half matches the single-buffer width.
-   * STARDIS_POOL_SIZE env var still controls the *per-view* width. */
-  {
-    const char* env_pipe = getenv("STARDIS_PIPELINE");
-    int dual = (env_pipe && env_pipe[0] == '0') ? 0 : 1;
-    if(dual) {
-      size_t doubled = pool_size * 2;
-      if(doubled > total_tasks) doubled = total_tasks;
-      /* Ensure even split */
-      doubled = (doubled / 2) * 2;
-      if(doubled < 2) doubled = 2;
-      log_info(scn->dev,
-        "pipeline: dual-buffer auto-double pool_size %llu -> %llu "
-        "(per-view=%llu)\n",
-        (unsigned long long)pool_size, (unsigned long long)doubled,
-        (unsigned long long)(doubled / 2));
-      pool_size = doubled;
-    }
-  }
+  /* pool_create decides dual/single based on total_tasks/pool_size ratio.
+   * pool_size here is the per-view target; pool_create doubles if dual. */
 
   {
     int sm = (scn->dev && scn->dev->s3d_dev)
            ? s3d_device_get_gpu_sm_count(scn->dev->s3d_dev) : 0;
     log_info(scn->dev,
       "Persistent wavefront (Phase B-3 M3): %llux%llu spp=%llu, "
-      "pool_size=%llu (SM=%d), total_tasks=%llu\n",
+      "per_view_size=%llu (SM=%d), total_tasks=%llu\n",
       (unsigned long long)image_def[0], (unsigned long long)image_def[1],
       (unsigned long long)spp, (unsigned long long)pool_size,
       sm, (unsigned long long)total_tasks);
@@ -2817,8 +3423,8 @@ solve_camera_persistent_wavefront(
       env ? env : "<unset,default=1>");
   }
 
-  /* ====== 1. Allocate pool ====== */
-  res = pool_create(&pool, pool_size);
+  /* ====== 1. Allocate pool (self-adaptive dual/single) ====== */
+  res = pool_create(&pool, pool_size, total_tasks);
   if(res != RES_OK) {
     log_err(scn->dev,
       "persistent_wavefront: pool_create failed for %llu paths -- %s\n",
@@ -2839,6 +3445,15 @@ solve_camera_persistent_wavefront(
       "persistent_wavefront: single-buffer mode, pool_size=%llu\n",
       (unsigned long long)pool.pool_size);
   }
+
+  /* ====== 1b. Wire camera vtable + context (needed before step 3) ====== */
+  cam_ctx.cam       = cam;
+  cam_ctx.pix_sz    = pix_sz;
+  cam_ctx.image_def = image_def;
+  cam_ctx.spp       = spp;
+  pool.ops          = &wf_ops_camera;
+  pool.mode_ctx     = &cam_ctx;
+  pool.result_ctx   = buf;
 
   /* ====== 2. Create per-path CBRNG thin wrappers ====== */
   /* Each slot gets its own ssp_rng whose desc.get delegates to wf_rng_get()
@@ -2882,8 +3497,8 @@ solve_camera_persistent_wavefront(
     pool.global_seed = ((uint64_t)hi << 32) | (uint64_t)lo;
   }
 
-  /* ====== 3. Generate task queue ====== */
-  res = generate_task_queue(&pool, image_def, spp);
+  /* ====== 3. Generate task queue (via ops dispatch) ====== */
+  res = pool.ops->generate_tasks(&pool, pool.mode_ctx);
   if(res != RES_OK) {
     log_err(scn->dev,
       "persistent_wavefront: task queue generation failed -- %s\n",
@@ -2921,9 +3536,7 @@ solve_camera_persistent_wavefront(
   /* ====== 5. Cache scene params for refill ====== */
   pool.scn          = scn;
   pool.enc_id       = enc_id;
-  pool.cam          = cam;
   pool.time_range   = time_range;
-  pool.pix_sz       = pix_sz;
   pool.picard_order = picard_order;
   pool.diff_algo    = diff_algo;
 
@@ -2984,7 +3597,7 @@ solve_camera_persistent_wavefront(
       pool.total_steps++;  /* view A completed one step */
 
       time_current(&t_pl0);
-      res = cpu_between(&pool, pv_a, scn, buf);
+      res = cpu_between(&pool, pv_a);
       if(res != RES_OK) goto cleanup;
       res = cpu_pre_gpu(&pool, pv_a);
       if(res != RES_OK) goto cleanup;
@@ -3074,7 +3687,7 @@ solve_camera_persistent_wavefront(
       pool.total_steps++;  /* view B completed one step */
 
       time_current(&t_pl0);
-      res = cpu_between(&pool, pv_b, scn, buf);
+      res = cpu_between(&pool, pv_b);
       if(res != RES_OK) goto cleanup;
       res = cpu_pre_gpu(&pool, pv_b);
       if(res != RES_OK) goto cleanup;
@@ -3203,14 +3816,14 @@ solve_camera_persistent_wavefront(
         res = gpu_wait_and_postprocess(&pool, pv_a, scn->s3d_view, scn);
         if(res != RES_OK) goto cleanup;
         pool.total_steps++;
-        res = cpu_between(&pool, pv_a, scn, buf);
+        res = cpu_between(&pool, pv_a);
         if(res != RES_OK) goto cleanup;
       }
       if(pv_b->gpu_pending) {
         res = gpu_wait_and_postprocess(&pool, pv_b, scn->s3d_view, scn);
         if(res != RES_OK) goto cleanup;
         pool.total_steps++;
-        res = cpu_between(&pool, pv_b, scn, buf);
+        res = cpu_between(&pool, pv_b);
         if(res != RES_OK) goto cleanup;
       }
     }
@@ -3400,7 +4013,7 @@ solve_camera_persistent_wavefront(
     /* Step F+G: Harvest completed paths + refill (timed together) */
     time_current(&t_phase0);
     compact_active_paths(&pool, pv); /* rebuild done_indices after cascade */
-    res = harvest_completed_paths(&pool, pv, buf);
+    res = harvest_completed_paths(&pool, pv);
     if(res != RES_OK) goto cleanup;
 
     /* Step G: Refill pool with new tasks (M2) */
@@ -3546,4 +4159,287 @@ cleanup:
   pool_destroy(&pool);
   return res;
 }
+
+/*******************************************************************************
+ * solve_persistent_wavefront_probe — probe temperature estimation using the
+ * persistent wavefront pool.
+ *
+ * Same main loop as camera mode but:
+ *   - Uses wf_ops_probe vtable (linear tasks, no camera ray, accum result).
+ *   - Single-buffer mode only (nrealisations typically small).
+ *   - No progress reporting.
+ ******************************************************************************/
+res_T
+solve_persistent_wavefront_probe(
+  struct sdis_scene*                   scn,
+  struct ssp_rng*                      base_rng,
+  const unsigned                       enc_id,
+  const double                         position[3],
+  const double                         time_range[2],
+  const size_t                         nrealisations,
+  const size_t                         picard_order,
+  const enum sdis_diffusion_algorithm  diff_algo,
+  struct accum*                        out_acc_temp)
+{
+  struct wavefront_pool pool;
+  struct probe_mode_ctx probe_ctx;
+  size_t total_tasks = nrealisations;
+  size_t pool_size;
+  res_T res = RES_OK;
+  struct time t_start, t_end;
+
+  ASSERT(scn && base_rng && position && time_range && nrealisations > 0);
+  ASSERT(out_acc_temp);
+
+  *out_acc_temp = ACCUM_NULL;
+
+  /* Resolve medium type from enclosure */
+  {
+    const struct enclosure* enc = scene_get_enclosure(scn, enc_id);
+    struct sdis_medium* mdm = NULL;
+    res = scene_get_enclosure_medium(scn, enc, &mdm);
+    if(res != RES_OK) return res;
+    probe_ctx.mdm_type = sdis_medium_get_type(mdm);
+  }
+  d3_set(probe_ctx.position, position);
+  probe_ctx.nrealisations = nrealisations;
+
+  pool_size = determine_pool_size(total_tasks, scn);
+  /* ====== 1. Allocate pool (self-adaptive dual/single) ====== */
+  res = pool_create(&pool, pool_size, total_tasks);
+  if(res != RES_OK) {
+    log_err(scn->dev,
+      "persistent_wavefront_probe: pool_create failed for %llu paths -- %s\n",
+      (unsigned long long)pool_size, res_to_cstr(res));
+    return res;
+  }
+
+  /* Wire probe vtable + context */
+  pool.ops       = &wf_ops_probe;
+  pool.mode_ctx  = &probe_ctx;
+  pool.result_ctx = out_acc_temp;
+
+  /* ====== 2. Create per-path CBRNG thin wrappers ====== */
+  {
+    struct ssp_rng* thin_storage = NULL;
+    struct wf_rng** rng_ptrs = (struct wf_rng**)malloc(
+        pool.pool_size * sizeof(struct wf_rng*));
+    if(!rng_ptrs) {
+      res = RES_MEM_ERR;
+      goto cleanup;
+    }
+    { size_t ri;
+      for(ri = 0; ri < pool.pool_size; ri++)
+        rng_ptrs[ri] = &pool.slots[ri].rng_state;
+    }
+    res = wf_rng_create_thin_ssp_rngs(pool.pool_size, rng_ptrs,
+                                       pool.slot_rngs, &thin_storage);
+    free(rng_ptrs);
+    if(res != RES_OK) goto cleanup;
+    pool.thin_rng_storage = thin_storage;
+  }
+
+  /* Global seed from base_rng */
+  {
+    double r0 = ssp_rng_canonical(base_rng);
+    double r1 = ssp_rng_canonical(base_rng);
+    uint32_t hi = (uint32_t)(r0 * 4294967296.0);
+    uint32_t lo = (uint32_t)(r1 * 4294967296.0);
+    pool.global_seed = ((uint64_t)hi << 32) | (uint64_t)lo;
+  }
+
+  /* ====== 3. Generate task queue ====== */
+  res = pool.ops->generate_tasks(&pool, pool.mode_ctx);
+  if(res != RES_OK) goto cleanup;
+
+  /* ====== 4. Create batch contexts ====== */
+  res = s3d_batch_trace_context_create(&pool.batch_ctx, pool.max_rays);
+  if(res != RES_OK) goto cleanup;
+  res = s3d_batch_enc_context_create(&pool.enc_batch_ctx, pool.max_enc_locates);
+  if(res != RES_OK) goto cleanup;
+  res = s3d_batch_cp_context_create(&pool.cp_batch_ctx, pool.max_cps);
+  if(res != RES_OK) goto cleanup;
+
+  /* ====== 5. Cache scene params ====== */
+  pool.scn          = scn;
+  pool.enc_id       = enc_id;
+  pool.time_range   = time_range;
+  pool.picard_order = picard_order;
+  pool.diff_algo    = diff_algo;
+
+  /* ====== 6. Fill pool ====== */
+  res = fill_pool(&pool);
+  if(res != RES_OK) goto cleanup;
+
+  log_info(scn->dev,
+    "persistent_wavefront_probe: %llu paths, pool=%llu, enc_id=%u\n",
+    (unsigned long long)nrealisations,
+    (unsigned long long)pool.pool_size, enc_id);
+
+  /* ====== 7. Main loop (dispatched by pool_run) ====== */
+  time_current(&t_start);
+  res = pool_run(&pool, scn->s3d_view, scn);
+  if(res != RES_OK) goto cleanup;
+  time_current(&t_end);
+
+  log_info(scn->dev,
+    "persistent_wavefront_probe: done, steps=%llu, rays=%llu, "
+    "accum count=%llu, wall=%.3fs\n",
+    (unsigned long long)pool.total_steps,
+    (unsigned long long)pool.total_rays_traced,
+    (unsigned long long)out_acc_temp->count,
+    time_elapsed_sec(&t_start, &t_end));
+
+cleanup:
+  pool_destroy(&pool);
+  return res;
+}
+
+/*******************************************************************************
+ * solve_persistent_wavefront_probe_batch — K probes in a single pool.
+ *
+ * Runs nprobes × nrealisations paths through the persistent wavefront pool,
+ * interleaving probe indices for maximum batch diversity.  Each probe's
+ * results are accumulated independently in out_acc_temps[probe_idx].
+ ******************************************************************************/
+res_T
+solve_persistent_wavefront_probe_batch(
+  struct sdis_scene*                   scn,
+  struct ssp_rng*                      base_rng,
+  const size_t                         nprobes,
+  const unsigned                       enc_ids[],
+  const double                         positions[],
+  const double                         time_range[2],
+  const size_t                         nrealisations,
+  const size_t                         picard_order,
+  const enum sdis_diffusion_algorithm  diff_algo,
+  const enum sdis_medium_type          mdm_types[],
+  struct accum*                        out_acc_temps)
+{
+  struct wavefront_pool pool;
+  struct probe_batch_mode_ctx batch_ctx;
+  size_t total_tasks;
+  size_t pool_size;
+  res_T res = RES_OK;
+  struct time t_start, t_end;
+  size_t pi;
+
+  ASSERT(scn && base_rng && nprobes > 0 && nrealisations > 0);
+  ASSERT(positions && enc_ids && mdm_types && out_acc_temps);
+
+  total_tasks = nprobes * nrealisations;
+
+  /* Zero all output accumulators */
+  for(pi = 0; pi < nprobes; pi++)
+    out_acc_temps[pi] = ACCUM_NULL;
+
+  /* Setup batch context */
+  batch_ctx.positions     = positions;
+  batch_ctx.enc_ids       = enc_ids;
+  batch_ctx.mdm_types     = mdm_types;
+  batch_ctx.accums        = out_acc_temps;
+  batch_ctx.nprobes       = nprobes;
+  batch_ctx.nrealisations = nrealisations;
+
+  pool_size = determine_pool_size(total_tasks, scn);
+
+  /* ====== 1. Allocate pool (self-adaptive dual/single) ====== */
+  res = pool_create(&pool, pool_size, total_tasks);
+  if(res != RES_OK) {
+    log_err(scn->dev,
+      "persistent_wavefront_probe_batch: pool_create failed for %llu -- %s\n",
+      (unsigned long long)pool_size, res_to_cstr(res));
+    return res;
+  }
+
+  /* Wire batch vtable + context.
+   * result_ctx points to the batch_ctx (not accums directly) so
+   * accumulate_result can index by probe_idx. */
+  pool.ops       = &wf_ops_probe_batch;
+  pool.mode_ctx  = &batch_ctx;
+  pool.result_ctx = &batch_ctx;
+
+  /* ====== 2. Create per-path CBRNG thin wrappers ====== */
+  {
+    struct ssp_rng* thin_storage = NULL;
+    struct wf_rng** rng_ptrs = (struct wf_rng**)malloc(
+        pool.pool_size * sizeof(struct wf_rng*));
+    if(!rng_ptrs) {
+      res = RES_MEM_ERR;
+      goto cleanup_batch;
+    }
+    { size_t ri;
+      for(ri = 0; ri < pool.pool_size; ri++)
+        rng_ptrs[ri] = &pool.slots[ri].rng_state;
+    }
+    res = wf_rng_create_thin_ssp_rngs(pool.pool_size, rng_ptrs,
+                                       pool.slot_rngs, &thin_storage);
+    free(rng_ptrs);
+    if(res != RES_OK) goto cleanup_batch;
+    pool.thin_rng_storage = thin_storage;
+  }
+
+  /* Global seed from base_rng */
+  {
+    double r0 = ssp_rng_canonical(base_rng);
+    double r1 = ssp_rng_canonical(base_rng);
+    uint32_t hi = (uint32_t)(r0 * 4294967296.0);
+    uint32_t lo = (uint32_t)(r1 * 4294967296.0);
+    pool.global_seed = ((uint64_t)hi << 32) | (uint64_t)lo;
+  }
+
+  /* ====== 3. Generate task queue ====== */
+  res = pool.ops->generate_tasks(&pool, pool.mode_ctx);
+  if(res != RES_OK) goto cleanup_batch;
+
+  /* ====== 4. Create batch contexts ====== */
+  res = s3d_batch_trace_context_create(&pool.batch_ctx, pool.max_rays);
+  if(res != RES_OK) goto cleanup_batch;
+  res = s3d_batch_enc_context_create(&pool.enc_batch_ctx, pool.max_enc_locates);
+  if(res != RES_OK) goto cleanup_batch;
+  res = s3d_batch_cp_context_create(&pool.cp_batch_ctx, pool.max_cps);
+  if(res != RES_OK) goto cleanup_batch;
+
+  /* ====== 5. Cache scene params ====== */
+  pool.scn          = scn;
+  pool.enc_id       = 0; /* unused — batch init_path reads per-probe enc_id */
+  pool.time_range   = time_range;
+  pool.picard_order = picard_order;
+  pool.diff_algo    = diff_algo;
+
+  /* ====== 6. Fill pool ====== */
+  res = fill_pool(&pool);
+  if(res != RES_OK) goto cleanup_batch;
+
+  log_info(scn->dev,
+    "persistent_wavefront_probe_batch: %llu probes x %llu = %llu paths, "
+    "pool=%llu\n",
+    (unsigned long long)nprobes,
+    (unsigned long long)nrealisations,
+    (unsigned long long)total_tasks,
+    (unsigned long long)pool.pool_size);
+
+  /* ====== 7. Main loop (dispatched by pool_run) ====== */
+  time_current(&t_start);
+  res = pool_run(&pool, scn->s3d_view, scn);
+  if(res != RES_OK) goto cleanup_batch;
+  time_current(&t_end);
+
+  { size_t total_accum = 0;
+    for(pi = 0; pi < nprobes; pi++)
+      total_accum += out_acc_temps[pi].count;
+    log_info(scn->dev,
+      "persistent_wavefront_probe_batch: done, steps=%llu, rays=%llu, "
+      "total_accum=%llu, wall=%.3fs\n",
+      (unsigned long long)pool.total_steps,
+      (unsigned long long)pool.total_rays_traced,
+      (unsigned long long)total_accum,
+      time_elapsed_sec(&t_start, &t_end));
+  }
+
+cleanup_batch:
+  pool_destroy(&pool);
+  return res;
+}
+
 #endif /* !SDIS_SOLVE_PERSISTENT_WAVEFRONT_SKIP_PUBLIC_API */

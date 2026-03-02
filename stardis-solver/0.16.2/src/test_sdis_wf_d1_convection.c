@@ -238,40 +238,46 @@ main(int argc, char** argv)
   OK(sdis_interface_ref_put(iface_t4));
   OK(sdis_interface_ref_put(iface_t5));
 
-  /* ---- Run manual probe sweep (not axis-aligned) ---- */
-  fprintf(stdout, "  Running %d probes, %d realisations each ...\n",
+  /* ---- Run manual probe sweep (not axis-aligned) — batch ---- */
+  fprintf(stdout, "  Running %d probes (batch), %d realisations each ...\n",
     D1_NPROBES, D1_NREALS);
   fprintf(stdout, "  T_inf (analytic) = %.1f K\n", D1_TINF);
 
-  for(i = 0; i < D1_NPROBES; i++) {
-    double T_ref = D1_TINF;
-    struct sdis_solve_probe_args args = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
-    struct sdis_estimator *est_wf = NULL, *est_df = NULL;
+  {
+    struct sdis_solve_probe_args args_arr[D1_NPROBES];
+    struct sdis_estimator*       ests[D1_NPROBES];
 
-    args.nrealisations = D1_NREALS;
-    args.position[0] = probe_pos[i][0];
-    args.position[1] = probe_pos[i][1];
-    args.position[2] = probe_pos[i][2];
-    args.picard_order = 1;
-    args.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
-    /* Steady-state: default time_range = {INF, INF} */
-
-    OK(sdis_solve_wavefront_probe(scn, &args, &est_wf));
-
-    /* Primary: wavefront vs analytic (decides PASS/FAIL) */
-    n_pass_primary += p0_compare_analytic(est_wf, T_ref, P0_TOL_SIGMA);
-
-    /* Diagnostic: wavefront vs depth-first (log only, non-blocking) */
-    if(P0_ENABLE_DIAG) {
-      OK(sdis_solve_probe(scn, &args, &est_df));
-      n_pass_diag += p0_diag_compare(est_wf, est_df, P0_DIAG_SIGMA);
+    for(i = 0; i < D1_NPROBES; i++) {
+      args_arr[i] = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+      args_arr[i].nrealisations = D1_NREALS;
+      args_arr[i].position[0]   = probe_pos[i][0];
+      args_arr[i].position[1]   = probe_pos[i][1];
+      args_arr[i].position[2]   = probe_pos[i][2];
+      args_arr[i].picard_order  = 1;
+      args_arr[i].diff_algo     = SDIS_DIFFUSION_DELTA_SPHERE;
+      ests[i] = NULL;
     }
 
-    p0_print_probe_result(probe_pos[i][0], est_wf, est_df, T_ref);
+    OK(sdis_solve_persistent_wavefront_probe_batch(
+      scn, D1_NPROBES, args_arr, ests));
 
-    OK(sdis_estimator_ref_put(est_wf));
-    if(est_df)
-      OK(sdis_estimator_ref_put(est_df));
+    for(i = 0; i < D1_NPROBES; i++) {
+      double T_ref = D1_TINF;
+      struct sdis_estimator *est_df = NULL;
+
+      n_pass_primary += p0_compare_analytic(ests[i], T_ref, P0_TOL_SIGMA);
+
+      if(P0_ENABLE_DIAG) {
+        OK(sdis_solve_probe(scn, &args_arr[i], &est_df));
+        n_pass_diag += p0_diag_compare(ests[i], est_df, P0_DIAG_SIGMA);
+      }
+
+      p0_print_probe_result(probe_pos[i][0], ests[i], est_df, T_ref);
+
+      OK(sdis_estimator_ref_put(ests[i]));
+      if(est_df)
+        OK(sdis_estimator_ref_put(est_df));
+    }
   }
 
   fprintf(stdout, "  Primary:    %d/%d probes pass (%.1f%%)\n",
