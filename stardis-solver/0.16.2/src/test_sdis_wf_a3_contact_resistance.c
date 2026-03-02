@@ -20,6 +20,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <rsys/mem_allocator.h>
 #include <stdio.h>
@@ -272,6 +273,7 @@ main(int argc, char** argv)
   int n_pass_total = 0;
   int n_probes_total = 0;
   size_t ri;
+  FILE* csv = NULL;
   (void)argc; (void)argv;
 
   /* 5 fixed R values spanning 4 decades (same range as CPU test's
@@ -299,6 +301,7 @@ main(int argc, char** argv)
   };
 
   printf("=== WF-A3: Contact resistance steady-state (wavefront probe) ===\n");
+  csv = csv_open("A3");
 
   OK(sdis_device_create(&SDIS_DEVICE_CREATE_ARGS_DEFAULT, &dev));
 
@@ -485,6 +488,18 @@ main(int argc, char** argv)
       n_pass_primary += p0_compare_analytic(est_wf, T_ref, P0_TOL_SIGMA);
       n_probes++;
 
+      /* CSV: primary DS row + complementary WoS variant */
+      {
+        struct sdis_mc mc_csv;
+        char csv_sub[32];
+        OK(sdis_estimator_get_temperature(est_wf, &mc_csv));
+        sprintf(csv_sub, "R=%.2g", R);
+        csv_row(csv, "A3", csv_sub, "gpu_wf", "DS",
+                args.position[0], args.position[1], args.position[2],
+                INF, (int)args.picard_order, (int)args.nrealisations,
+                mc_csv.E, mc_csv.SE, T_ref);
+      }
+
       if(P0_ENABLE_DIAG) {
         OK(sdis_solve_probe(scn, &args, &est_df));
       }
@@ -501,6 +516,7 @@ main(int argc, char** argv)
     n_probes_total += n_probes;
   }
 
+  csv_close(csv);
   fprintf(stdout, "\n  Overall: %d/%d pass\n", n_pass_total, n_probes_total);
   CHK(n_probes_total > 0);
   CHK((double)n_pass_total / (double)n_probes_total >= P0_PASS_RATE);

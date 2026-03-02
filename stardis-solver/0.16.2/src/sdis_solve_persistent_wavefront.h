@@ -354,13 +354,19 @@ count_path_rays(const struct path_state* p)
 }
 
 /* P1: SoA-friendly variant — reads phase + ray_count_ext from SoA,
- * falls back to AoS ray_req.ray_count for the common (non-ENC) case. */
+ * falls back to AoS ray_req.ray_count for the common (non-ENC) case.
+ *
+ * BUG-FIX: also handle ray_count_ext==4 for SS 4-ray reinjection
+ * (PATH_BND_SS_REINJECT_SAMPLE).  Previously only the ENC 6-ray case
+ * was handled, causing SS reinject to under-count rays as 2 instead of 4. */
 static INLINE size_t
 count_path_rays_soa(enum path_phase phase, int ray_count_ext,
                     const struct path_state* p)
 {
   if(phase == PATH_ENC_QUERY_EMIT && ray_count_ext == 6)
     return 6;
+  if(phase == PATH_BND_SS_REINJECT_SAMPLE && ray_count_ext == 4)
+    return 4;
   return (size_t)p->ray_req.ray_count;
 }
 

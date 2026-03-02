@@ -28,6 +28,7 @@
 #include "buffer_manager.h"
 #include "geometry_manager.h"
 #include "unified_tracer.h"
+#include "unified_params.h"
 #include "optix_check.h"
 #include "ray_types.h"
 #include "nn_types.h"
@@ -43,6 +44,8 @@
 #include <cmath>
 #include <chrono>
 #include <algorithm>
+#include <thread>
+#include <numeric>
 
 /* ======================================================================
  * PTX File Loading
@@ -1072,6 +1075,689 @@ static void benchmarkMultiStream(
 }
 
 /* ======================================================================
+ * Realistic Benchmark A: Single-Batch Width + Pipeline Latency Breakdown
+ *
+ * Fixed 10K-triangle scene.  Sweep ray count to find the GPU saturation
+ * point (W_sat) and decompose every launch into:
+ *   T_submit  – CPU-side submission overhead   (chrono)
+ *   T_params  – H2D params upload              (CUDA event)
+ *   T_kernel  – optixLaunch kernel execution   (CUDA event)
+ *   T_total   – params + kernel end-to-end     (CUDA event)
+ *
+ * W_sat detection: kernel-only throughput (MRays/s based on T_kernel).
+ * Requires 2 consecutive data points with <5% growth to confirm.
+ * Returns W_sat.
+ * ====================================================================*/
+static unsigned int benchmarkSingleBatchWidth(
+    UnifiedTracer& tracer,
+    float3         bbox_min,
+    float3         bbox_max,
+    int            num_iters,
+    std::ostream&  csv)
+{
+    printSubHeader("Realistic A: Single-Batch Width (10K tris)");
+
+    std::cout << std::right
+              << std::setw(12) << "Rays"
+              << std::setw(12) << "T_sub(us)"
+              << std::setw(12) << "T_par(us)"
+              << std::setw(12) << "T_ker(ms)"
+              << std::setw(12) << "T_tot(ms)"
+              << std::setw(12) << "Ker MR/s"
+              << std::setw(12) << "Tot MR/s"
+              << std::setw(10) << "GRays/s"
+              << std::setw(8)  << "Hit%"
+              << "\n"
+              << std::string(100, '-') << "\n";
+
+    csv << "# Realistic A: Single-Batch Width\n"
+        << "real_a_width,ray_count,T_submit_us,T_params_us,T_kernel_ms,"
+        << "T_total_ms,ker_MRays_s,tot_MRays_s,GRays_s,hit_rate\n";
+
+    /* Build ray counts: dense from 256 to 128M, VRAM-aware clipping.
+     * Each ray needs sizeof(Ray) + sizeof(HitResult) + overhead ≈ 96 bytes.
+     * Reserve 1GB headroom for BVH, params, events, etc. */
+    size_t free_bytes = 0, total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    size_t headroom = 1024ULL * 1024 * 1024;
+    size_t usable = (free_bytes > headroom)
+                  ? (free_bytes - headroom) : (free_bytes / 4);
+    unsigned int max_rays_for_alloc = (unsigned int)std::min(
+        (unsigned long long)(usable / 96ULL),
+        (unsigned long long)128 * 1024 * 1024);
+
+    std::vector<unsigned int> ray_counts = {
+        256, 1024, 4096, 8192, 16384, 32768, 65536,
+        131072, 262144, 524288,
+        1024*1024, 2*1024*1024, 4*1024*1024, 8*1024*1024, 16*1024*1024,
+        32*1024*1024, 64*1024*1024, 128*1024*1024
+    };
+    /* Clip to available VRAM */
+    while (!ray_counts.empty() && ray_counts.back() > max_rays_for_alloc)
+        ray_counts.pop_back();
+    std::cout << "  (VRAM-limited max: " << formatNumber(max_rays_for_alloc)
+              << " rays, free=" << (free_bytes / (1024*1024)) << "MB)\n\n";
+
+    /* We need to decompose traceBatch into sub-steps, so we replicate the
+     * internal logic here with per-phase CUDA events.
+     * Pre-allocate a dedicated params buffer for this benchmark. */
+    CUdeviceptr bench_params = 0;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&bench_params),
+                          sizeof(UnifiedParams)));
+
+    unsigned int w_sat = ray_counts.back();
+    double prev_ker_mrays  = 0.0;  /* kernel-only throughput for W_sat detection */
+    int    consec_saturated = 0;   /* consecutive sub-5% growth count */
+    bool   sat_locked = false;     /* once confirmed, don't re-detect */
+
+    for (unsigned int count : ray_counts) {
+        /* OOM safety: if allocation fails, stop sweeping larger sizes */
+        CudaBuffer<Ray>       d_rays;
+        CudaBuffer<HitResult> d_hits;
+        try {
+            d_rays.alloc(count);
+            d_hits.alloc(count);
+        } catch (const std::exception& e) {
+            std::cout << "  [VRAM limit hit at " << formatNumber(count)
+                      << " rays, stopping sweep]\n";
+            break;
+        }
+        generateRandomRaysDevice(d_rays.get(), count, bbox_min, bbox_max, 12345);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        /* Warm-up (3 rounds) */
+        for (int w = 0; w < 3; ++w)
+            tracer.traceBatch(d_rays.get(), d_hits.get(), count, 0, bench_params);
+        CUDA_CHECK(cudaStreamSynchronize(0));
+
+        /* Timing storage */
+        std::vector<double> t_submit(num_iters);
+        std::vector<float>  t_params(num_iters);
+        std::vector<float>  t_kernel(num_iters);
+        std::vector<float>  t_total(num_iters);
+
+        cudaEvent_t ev_start, ev_after_params, ev_stop;
+        CUDA_CHECK(cudaEventCreate(&ev_start));
+        CUDA_CHECK(cudaEventCreate(&ev_after_params));
+        CUDA_CHECK(cudaEventCreate(&ev_stop));
+
+        for (int i = 0; i < num_iters; ++i) {
+            /* Prepare host-side launch params */
+            UnifiedParams lp = {};
+            lp.handle = tracer.activeRTHandle();
+            lp.count  = count;
+            lp.rays   = d_rays.get();
+            lp.hits   = d_hits.get();
+
+            unsigned int lw, lh;
+            if (count <= 65536) { lw = count; lh = 1; }
+            else { lw = 8192; lh = (count + lw - 1) / lw; }
+
+            /* ---- Measure CPU submission time (chrono) ---- */
+            auto cpu_t0 = std::chrono::high_resolution_clock::now();
+
+            CUDA_CHECK(cudaEventRecord(ev_start, 0));
+
+            /* Phase 1: H2D params upload */
+            CUDA_CHECK(cudaMemcpyAsync(
+                reinterpret_cast<void*>(bench_params),
+                &lp, sizeof(UnifiedParams),
+                cudaMemcpyHostToDevice, 0));
+
+            CUDA_CHECK(cudaEventRecord(ev_after_params, 0));
+
+            /* Phase 2: optixLaunch kernel */
+            OPTIX_CHECK(optixLaunch(tracer.pipeline(), 0, bench_params,
+                                    sizeof(UnifiedParams),
+                                    &tracer.sbtRT(), lw, lh, 1));
+
+            CUDA_CHECK(cudaEventRecord(ev_stop, 0));
+
+            auto cpu_t1 = std::chrono::high_resolution_clock::now();
+            t_submit[i] = std::chrono::duration<double, std::micro>(cpu_t1 - cpu_t0).count();
+
+            /* Synchronize and collect GPU times */
+            CUDA_CHECK(cudaEventSynchronize(ev_stop));
+            float ms_params = 0, ms_kernel = 0, ms_total = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms_params, ev_start, ev_after_params));
+            CUDA_CHECK(cudaEventElapsedTime(&ms_kernel, ev_after_params, ev_stop));
+            CUDA_CHECK(cudaEventElapsedTime(&ms_total,  ev_start, ev_stop));
+            t_params[i] = ms_params;
+            t_kernel[i] = ms_kernel;
+            t_total[i]  = ms_total;
+        }
+        CUDA_CHECK(cudaEventDestroy(ev_start));
+        CUDA_CHECK(cudaEventDestroy(ev_after_params));
+        CUDA_CHECK(cudaEventDestroy(ev_stop));
+
+        /* Statistics: sort and take median */
+        std::sort(t_submit.begin(), t_submit.end());
+        std::sort(t_params.begin(), t_params.end());
+        std::sort(t_kernel.begin(), t_kernel.end());
+        std::sort(t_total.begin(),  t_total.end());
+        int mid = num_iters / 2;
+        double med_submit = t_submit[mid];
+        float  med_params = t_params[mid];
+        float  med_kernel = t_kernel[mid];
+        float  med_total  = t_total[mid];
+
+        double ker_mrays = (med_kernel > 0) ? (double)count / (med_kernel * 1000.0) : 0.0;
+        double tot_mrays = (double)count / (med_total * 1000.0);
+        double grays = ker_mrays / 1000.0;
+
+        /* Hit count */
+        CudaBuffer<unsigned int> d_hcount;
+        d_hcount.alloc(1);
+        countHitsDevice(d_hits.get(), count, d_hcount.get());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        unsigned int hcount = 0;
+        d_hcount.download(&hcount, 1);
+        float hit_rate = (float)hcount / (float)count;
+
+        std::cout << std::right
+                  << std::setw(12) << formatNumber(count)
+                  << std::setw(12) << std::fixed << std::setprecision(1) << med_submit
+                  << std::setw(12) << std::fixed << std::setprecision(2) << (med_params * 1000.0f)
+                  << std::setw(12) << std::fixed << std::setprecision(3) << med_kernel
+                  << std::setw(12) << std::fixed << std::setprecision(3) << med_total
+                  << std::setw(12) << std::fixed << std::setprecision(2) << ker_mrays
+                  << std::setw(12) << std::fixed << std::setprecision(2) << tot_mrays
+                  << std::setw(10) << std::fixed << std::setprecision(4) << grays
+                  << std::setw(7)  << std::fixed << std::setprecision(1) << (hit_rate * 100.0f) << "%"
+                  << "\n";
+
+        csv << "real_a_width," << count << ","
+            << med_submit << "," << (med_params * 1000.0f) << ","
+            << med_kernel << "," << med_total << ","
+            << ker_mrays << "," << tot_mrays << "," << grays << "," << hit_rate << "\n";
+
+        /* Detect saturation using KERNEL-ONLY throughput.
+         * Require 2 consecutive data points with <5% growth to confirm,
+         * filtering out CPU submission jitter that contaminates T_total. */
+        if (!sat_locked && prev_ker_mrays > 0.0 && ker_mrays > 0.0) {
+            double growth = (ker_mrays - prev_ker_mrays) / prev_ker_mrays;
+            if (growth < 0.05) {
+                consec_saturated++;
+                if (consec_saturated >= 2) {
+                    /* Confirmed: saturation started 2 steps ago */
+                    /* Walk back to find the first sub-5% point */
+                    w_sat = count;  /* conservative: use current as W_sat */
+                    sat_locked = true;
+                }
+            } else {
+                consec_saturated = 0;  /* reset: not a genuine plateau */
+            }
+        }
+        prev_ker_mrays = ker_mrays;
+    }
+
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(bench_params)));
+
+    /* If saturation was never confirmed, W_sat stays at the largest tested count.
+     * This is correct: it means the GPU was not saturated even at max rays. */
+    std::cout << "\n  >> Saturation width (W_sat): " << formatNumber(w_sat) << " rays"
+              << (sat_locked ? " (kernel-confirmed)" : " (never saturated — GPU has headroom)")
+              << "\n";
+    csv << "# W_sat=" << w_sat
+        << (sat_locked ? " (confirmed)" : " (GPU_not_saturated)") << "\n";
+
+    return w_sat;
+}
+
+/* ======================================================================
+ * Realistic Benchmark B: Multi-Batch Call Frequency
+ *
+ * Sub-saturation batch size, continuous multi-batch launches.
+ * B1: Back-to-back async (2 streams, measure pipeline overlap)
+ * B2: Single-stream with controlled inter-batch interval
+ * ====================================================================*/
+static void benchmarkMultiBatchFrequency(
+    UnifiedTracer& tracer,
+    unsigned int   w_sat,
+    float3         bbox_min,
+    float3         bbox_max,
+    int            num_iters,
+    std::ostream&  csv)
+{
+    /* Adaptive batch sizing: use fraction of W_sat, not fixed 32K.
+     * For big GPUs (high W_sat), batch must be large enough that kernel
+     * time dominates over submission overhead (~0.5ms minimum kernel). */
+    unsigned int batch_rays = std::max(w_sat / 8, 32768u);
+    /* Clamp to at most W_sat (no point batching more than saturation) */
+    batch_rays = std::min(batch_rays, w_sat);
+    if (batch_rays < 256) batch_rays = 256;
+
+    printSubHeader("Realistic B: Multi-Batch Frequency (batch=" + formatNumber(batch_rays) + " rays)");
+
+    /* ---- B1: Back-to-back dual-stream async ---- */
+    {
+        printSubHeader("B1: Dual-Stream Back-to-Back Async");
+
+        csv << "# Realistic B1: Dual-stream async\n"
+            << "real_b1_async,num_batches,total_ms,avg_batch_ms,MRays_s,"
+            << "p50_ms,p99_ms,max_ms,overlap_ratio\n";
+
+        std::cout << std::right
+                  << std::setw(10) << "Batches"
+                  << std::setw(12) << "Total(ms)"
+                  << std::setw(12) << "Avg(ms)"
+                  << std::setw(12) << "MRays/s"
+                  << std::setw(10) << "p50(ms)"
+                  << std::setw(10) << "p99(ms)"
+                  << std::setw(10) << "max(ms)"
+                  << std::setw(10) << "Overlap"
+                  << "\n"
+                  << std::string(86, '-') << "\n";
+
+        const int NUM_STREAMS = 2;
+        cudaStream_t streams[NUM_STREAMS];
+        CUdeviceptr  params[NUM_STREAMS];
+        for (int s = 0; s < NUM_STREAMS; ++s) {
+            CUDA_CHECK(cudaStreamCreate(&streams[s]));
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&params[s]),
+                                  sizeof(UnifiedParams)));
+        }
+
+        /* Allocate per-stream buffers */
+        CudaBuffer<Ray>       d_rays[NUM_STREAMS];
+        CudaBuffer<HitResult> d_hits[NUM_STREAMS];
+        for (int s = 0; s < NUM_STREAMS; ++s) {
+            d_rays[s].alloc(batch_rays);
+            d_hits[s].alloc(batch_rays);
+            generateRandomRaysDevice(d_rays[s].get(), batch_rays,
+                                     bbox_min, bbox_max, 42 + s, streams[s]);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<int> batch_counts = { 8, 16, 32, 64, 128, 256 };
+
+        for (int num_batches : batch_counts) {
+            /* Per-batch events for latency distribution */
+            std::vector<cudaEvent_t> ev_start(num_batches), ev_stop(num_batches);
+            for (int b = 0; b < num_batches; ++b) {
+                CUDA_CHECK(cudaEventCreate(&ev_start[b]));
+                CUDA_CHECK(cudaEventCreate(&ev_stop[b]));
+            }
+
+            /* Warm-up */
+            for (int w = 0; w < 3; ++w) {
+                for (int s = 0; s < NUM_STREAMS; ++s)
+                    tracer.traceBatch(d_rays[s].get(), d_hits[s].get(),
+                                      batch_rays, streams[s], params[s]);
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            /* Timed runs — take best of num_iters outer iterations */
+            std::vector<float> outer_times(num_iters);
+            std::vector<float> best_per_batch; /* filled from best outer iter */
+
+            for (int iter = 0; iter < num_iters; ++iter) {
+                cudaEvent_t wall_start, wall_stop;
+                CUDA_CHECK(cudaEventCreate(&wall_start));
+                CUDA_CHECK(cudaEventCreate(&wall_stop));
+
+                CUDA_CHECK(cudaEventRecord(wall_start, streams[0]));
+
+                for (int b = 0; b < num_batches; ++b) {
+                    int s = b % NUM_STREAMS;
+                    CUDA_CHECK(cudaEventRecord(ev_start[b], streams[s]));
+                    tracer.traceBatch(d_rays[s].get(), d_hits[s].get(),
+                                      batch_rays, streams[s], params[s]);
+                    CUDA_CHECK(cudaEventRecord(ev_stop[b], streams[s]));
+                }
+
+                /* Sync stream 0 with stream 1 via event dependency */
+                cudaEvent_t sync_ev;
+                CUDA_CHECK(cudaEventCreate(&sync_ev));
+                CUDA_CHECK(cudaEventRecord(sync_ev, streams[1]));
+                CUDA_CHECK(cudaStreamWaitEvent(streams[0], sync_ev, 0));
+                CUDA_CHECK(cudaEventRecord(wall_stop, streams[0]));
+                CUDA_CHECK(cudaEventSynchronize(wall_stop));
+
+                float wall_ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&wall_ms, wall_start, wall_stop));
+                outer_times[iter] = wall_ms;
+
+                CUDA_CHECK(cudaEventDestroy(wall_start));
+                CUDA_CHECK(cudaEventDestroy(wall_stop));
+                CUDA_CHECK(cudaEventDestroy(sync_ev));
+            }
+
+            /* Use median outer iteration */
+            std::sort(outer_times.begin(), outer_times.end());
+            float med_wall = outer_times[num_iters / 2];
+
+            /* Collect per-batch latencies from last iteration */
+            std::vector<float> per_batch(num_batches);
+            float sum_per_batch = 0;
+            for (int b = 0; b < num_batches; ++b) {
+                float ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start[b], ev_stop[b]));
+                per_batch[b] = ms;
+                sum_per_batch += ms;
+            }
+            std::sort(per_batch.begin(), per_batch.end());
+
+            float p50 = per_batch[num_batches / 2];
+            float p99 = per_batch[(int)(num_batches * 0.99)];
+            float pmax = per_batch.back();
+            float avg_batch = sum_per_batch / num_batches;
+            double total_rays = (double)batch_rays * num_batches;
+            double mrays = total_rays / (med_wall * 1000.0);
+            /* Overlap ratio: sum of individual batch times / wall-clock total */
+            float overlap = sum_per_batch / med_wall;
+
+            for (int b = 0; b < num_batches; ++b) {
+                CUDA_CHECK(cudaEventDestroy(ev_start[b]));
+                CUDA_CHECK(cudaEventDestroy(ev_stop[b]));
+            }
+
+            std::cout << std::right
+                      << std::setw(10) << num_batches
+                      << std::setw(12) << std::fixed << std::setprecision(3) << med_wall
+                      << std::setw(12) << std::fixed << std::setprecision(3) << avg_batch
+                      << std::setw(12) << std::fixed << std::setprecision(2) << mrays
+                      << std::setw(10) << std::fixed << std::setprecision(3) << p50
+                      << std::setw(10) << std::fixed << std::setprecision(3) << p99
+                      << std::setw(10) << std::fixed << std::setprecision(3) << pmax
+                      << std::setw(9)  << std::fixed << std::setprecision(2) << overlap << "x"
+                      << "\n";
+
+            csv << "real_b1_async," << num_batches << ","
+                << med_wall << "," << avg_batch << "," << mrays << ","
+                << p50 << "," << p99 << "," << pmax << "," << overlap << "\n";
+        }
+
+        for (int s = 0; s < NUM_STREAMS; ++s) {
+            CUDA_CHECK(cudaStreamDestroy(streams[s]));
+            CUDA_CHECK(cudaFree(reinterpret_cast<void*>(params[s])));
+        }
+    }
+
+    /* ---- B2: Single-stream with controlled interval ---- */
+    {
+        printSubHeader("B2: Single-Stream Interval Sweep");
+
+        csv << "# Realistic B2: Single-stream interval sweep\n"
+            << "real_b2_interval,interval_us,total_ms,avg_batch_ms,MRays_s,effective_util\n";
+
+        std::cout << std::right
+                  << std::setw(12) << "Interval"
+                  << std::setw(12) << "Total(ms)"
+                  << std::setw(12) << "Avg(ms)"
+                  << std::setw(12) << "MRays/s"
+                  << std::setw(12) << "Util%"
+                  << "\n"
+                  << std::string(60, '-') << "\n";
+
+        CudaBuffer<Ray>       d_rays;
+        CudaBuffer<HitResult> d_hits;
+        d_rays.alloc(batch_rays);
+        d_hits.alloc(batch_rays);
+        generateRandomRaysDevice(d_rays.get(), batch_rays, bbox_min, bbox_max, 12345);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        /* Pre-allocate a dedicated params buffer */
+        CUdeviceptr b2_params = 0;
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&b2_params),
+                              sizeof(UnifiedParams)));
+
+        const int TOTAL_BATCHES = 64;
+        std::vector<double> intervals_us = { 0, 10, 50, 100, 500, 1000, 5000 };
+
+        /* Baseline (0-interval) throughput for utilization calculation */
+        double baseline_mrays = 0.0;
+
+        for (double interval : intervals_us) {
+            /* Warm-up */
+            for (int w = 0; w < 3; ++w)
+                tracer.traceBatch(d_rays.get(), d_hits.get(), batch_rays, 0, b2_params);
+            CUDA_CHECK(cudaStreamSynchronize(0));
+
+            std::vector<float> outer_totals(num_iters);
+
+            for (int iter = 0; iter < num_iters; ++iter) {
+                cudaEvent_t wall_start, wall_stop;
+                CUDA_CHECK(cudaEventCreate(&wall_start));
+                CUDA_CHECK(cudaEventCreate(&wall_stop));
+
+                CUDA_CHECK(cudaEventRecord(wall_start, 0));
+
+                for (int b = 0; b < TOTAL_BATCHES; ++b) {
+                    cudaEvent_t bstop;
+                    CUDA_CHECK(cudaEventCreate(&bstop));
+                    tracer.traceBatch(d_rays.get(), d_hits.get(),
+                                      batch_rays, 0, b2_params);
+                    CUDA_CHECK(cudaEventRecord(bstop, 0));
+                    CUDA_CHECK(cudaEventSynchronize(bstop));
+                    CUDA_CHECK(cudaEventDestroy(bstop));
+
+                    /* CPU spin-wait for specified interval */
+                    if (interval > 0) {
+                        auto t0 = std::chrono::high_resolution_clock::now();
+                        double target_ns = interval * 1000.0;
+                        while (true) {
+                            auto now = std::chrono::high_resolution_clock::now();
+                            double elapsed = std::chrono::duration<double, std::nano>(now - t0).count();
+                            if (elapsed >= target_ns) break;
+                        }
+                    }
+                }
+
+                CUDA_CHECK(cudaEventRecord(wall_stop, 0));
+                CUDA_CHECK(cudaEventSynchronize(wall_stop));
+
+                float ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&ms, wall_start, wall_stop));
+                outer_totals[iter] = ms;
+
+                CUDA_CHECK(cudaEventDestroy(wall_start));
+                CUDA_CHECK(cudaEventDestroy(wall_stop));
+            }
+
+            std::sort(outer_totals.begin(), outer_totals.end());
+            float med_total = outer_totals[num_iters / 2];
+            float avg_batch = med_total / TOTAL_BATCHES;
+            double total_rays = (double)batch_rays * TOTAL_BATCHES;
+            double mrays = total_rays / (med_total * 1000.0);
+
+            if (interval == 0) baseline_mrays = mrays;
+            double util = (baseline_mrays > 0) ? (mrays / baseline_mrays * 100.0) : 100.0;
+
+            std::cout << std::right
+                      << std::setw(10) << std::fixed << std::setprecision(0) << interval << "us"
+                      << std::setw(12) << std::fixed << std::setprecision(3) << med_total
+                      << std::setw(12) << std::fixed << std::setprecision(3) << avg_batch
+                      << std::setw(12) << std::fixed << std::setprecision(2) << mrays
+                      << std::setw(11) << std::fixed << std::setprecision(1) << util << "%"
+                      << "\n";
+
+            csv << "real_b2_interval," << interval << ","
+                << med_total << "," << avg_batch << ","
+                << mrays << "," << util << "\n";
+        }
+
+        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(b2_params)));
+    }
+}
+
+/* ======================================================================
+ * Realistic Benchmark C: Extreme Sustained Workload
+ *
+ * Max batch width (W_sat) + dual-stream back-to-back for 10 seconds.
+ * Reports per-second throughput windows to capture thermal throttling.
+ * ====================================================================*/
+static void benchmarkExtremeSustained(
+    UnifiedTracer& tracer,
+    unsigned int   w_sat,
+    float3         bbox_min,
+    float3         bbox_max,
+    std::ostream&  csv)
+{
+    printSubHeader("Realistic C: Extreme Sustained (" + formatNumber(w_sat) + " rays x 2-stream, 10s)");
+
+    csv << "# Realistic C: Extreme sustained workload\n"
+        << "real_c_sustained,window_sec,batches_in_window,MRays_s,p50_ms,p99_ms,max_ms\n";
+
+    std::cout << std::right
+              << std::setw(10) << "Window"
+              << std::setw(12) << "Batches"
+              << std::setw(12) << "MRays/s"
+              << std::setw(10) << "p50(ms)"
+              << std::setw(10) << "p99(ms)"
+              << std::setw(10) << "max(ms)"
+              << "\n"
+              << std::string(64, '-') << "\n";
+
+    const int NUM_STREAMS = 2;
+    const double RUN_SECONDS = 10.0;  /* 10 seconds to capture thermal throttling */
+
+    cudaStream_t streams[NUM_STREAMS];
+    CUdeviceptr  par[NUM_STREAMS];
+    CudaBuffer<Ray>       d_rays[NUM_STREAMS];
+    CudaBuffer<HitResult> d_hits[NUM_STREAMS];
+
+    for (int s = 0; s < NUM_STREAMS; ++s) {
+        CUDA_CHECK(cudaStreamCreate(&streams[s]));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&par[s]),
+                              sizeof(UnifiedParams)));
+        d_rays[s].alloc(w_sat);
+        d_hits[s].alloc(w_sat);
+        generateRandomRaysDevice(d_rays[s].get(), w_sat,
+                                 bbox_min, bbox_max, 42 + s, streams[s]);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    /* Warm-up */
+    for (int w = 0; w < 3; ++w) {
+        for (int s = 0; s < NUM_STREAMS; ++s)
+            tracer.traceBatch(d_rays[s].get(), d_hits[s].get(),
+                              w_sat, streams[s], par[s]);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    /* Pre-allocate event ring buffer (reuse after each window) */
+    const int MAX_BATCHES = 4096;
+    std::vector<cudaEvent_t> ev_s(MAX_BATCHES), ev_e(MAX_BATCHES);
+    for (int i = 0; i < MAX_BATCHES; ++i) {
+        CUDA_CHECK(cudaEventCreate(&ev_s[i]));
+        CUDA_CHECK(cudaEventCreate(&ev_e[i]));
+    }
+
+    /* Run for RUN_SECONDS, snapshot each 1-second window */
+    auto run_start = std::chrono::high_resolution_clock::now();
+    int batch_idx = 0;
+    int window = 0;
+    double window_boundary = 1.0; /* next snapshot at 1s */
+
+    std::vector<float> window_latencies;
+    window_latencies.reserve(1024);
+
+    while (true) {
+        auto now = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(now - run_start).count();
+        if (elapsed >= RUN_SECONDS && batch_idx > 0) break;
+
+        int ring = batch_idx % MAX_BATCHES;
+        int s    = batch_idx % NUM_STREAMS;
+
+        /* If we're reusing an event slot, sync it first to ensure prior use is done */
+        if (batch_idx >= MAX_BATCHES) {
+            CUDA_CHECK(cudaEventSynchronize(ev_e[ring]));
+        }
+
+        CUDA_CHECK(cudaEventRecord(ev_s[ring], streams[s]));
+        tracer.traceBatch(d_rays[s].get(), d_hits[s].get(),
+                          w_sat, streams[s], par[s]);
+        CUDA_CHECK(cudaEventRecord(ev_e[ring], streams[s]));
+
+        batch_idx++;
+
+        /* Check if we crossed a window boundary */
+        now = std::chrono::high_resolution_clock::now();
+        elapsed = std::chrono::duration<double>(now - run_start).count();
+
+        if (elapsed >= window_boundary && batch_idx > 0) {
+            /* Sync all streams to read events */
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            /* Collect per-batch latencies for this window */
+
+            /* Resolve all recent events */
+            std::vector<float> fresh;
+            int begin = 0;
+            if (window > 0) {
+                /* Only collect batches submitted since last window snapshot */
+                begin = batch_idx - (int)((elapsed - (window_boundary - 1.0)) /
+                        (elapsed / batch_idx) * batch_idx);
+                if (begin < 0) begin = 0;
+            }
+            for (int b = begin; b < batch_idx; ++b) {
+                int r = b % MAX_BATCHES;
+                float ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&ms, ev_s[r], ev_e[r]));
+                fresh.push_back(ms);
+            }
+
+            if (!fresh.empty()) {
+                std::sort(fresh.begin(), fresh.end());
+                int n = (int)fresh.size();
+                float p50 = fresh[n / 2];
+                float p99 = fresh[std::min(n - 1, (int)(n * 0.99))];
+                float pmax = fresh.back();
+                double total = (double)w_sat * n;
+                /* Use actual time delta for per-window throughput */
+                double actual_window_s = (window == 0) ? window_boundary :
+                    std::min(1.0, elapsed - (window_boundary - 1.0));
+                double mrays_w = total / (actual_window_s * 1e6);
+
+                window++;
+                std::cout << std::right
+                          << std::setw(8) << window << "s"
+                          << std::setw(12) << n
+                          << std::setw(12) << std::fixed << std::setprecision(2) << mrays_w
+                          << std::setw(10) << std::fixed << std::setprecision(3) << p50
+                          << std::setw(10) << std::fixed << std::setprecision(3) << p99
+                          << std::setw(10) << std::fixed << std::setprecision(3) << pmax
+                          << "\n";
+
+                csv << "real_c_sustained," << window << ","
+                    << n << "," << mrays_w << ","
+                    << p50 << "," << p99 << "," << pmax << "\n";
+            }
+
+            window_boundary += 1.0;
+        }
+    }
+
+    /* Final sync and total summary */
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto run_end = std::chrono::high_resolution_clock::now();
+    double total_sec = std::chrono::duration<double>(run_end - run_start).count();
+    double total_rays = (double)w_sat * batch_idx;
+    double total_mrays = total_rays / (total_sec * 1e6);
+
+    std::cout << "\n  >> Total: " << batch_idx << " batches in "
+              << std::fixed << std::setprecision(2) << total_sec << "s, "
+              << std::fixed << std::setprecision(2) << total_mrays << " MRays/s ("
+              << std::fixed << std::setprecision(4) << (total_mrays / 1000.0) << " GRays/s)\n";
+
+    csv << "real_c_sustained,total," << batch_idx << ","
+        << total_mrays << ",,,\n";
+
+    /* Cleanup */
+    for (int i = 0; i < MAX_BATCHES; ++i) {
+        CUDA_CHECK(cudaEventDestroy(ev_s[i]));
+        CUDA_CHECK(cudaEventDestroy(ev_e[i]));
+    }
+    for (int s = 0; s < NUM_STREAMS; ++s) {
+        CUDA_CHECK(cudaStreamDestroy(streams[s]));
+        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(par[s])));
+    }
+}
+
+/* ======================================================================
  * Benchmark: Instance Count Sweep
  * Same base mesh (CornellBox), varying number of instances.
  * Measures IAS build + trace throughput vs instance count.
@@ -1261,6 +1947,7 @@ int main(int argc, char* argv[])
 {
     /* ---- Parse arguments ---- */
     bool         do_validate  = true;
+    bool         do_realistic = false;
     unsigned int max_rays     = 64 * 1024 * 1024;
     int          num_iters    = 10;
     int          device_id    = 0;
@@ -1269,6 +1956,7 @@ int main(int argc, char* argv[])
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
         if (arg == "--no-validate")          do_validate = false;
+        else if (arg == "--realistic")       do_realistic = true;
         else if (arg == "--max-rays" && i+1 < argc) max_rays  = std::stoul(argv[++i]);
         else if (arg == "--iters"    && i+1 < argc) num_iters = std::stoi(argv[++i]);
         else if (arg == "--device"   && i+1 < argc) device_id = std::stoi(argv[++i]);
@@ -1276,6 +1964,7 @@ int main(int argc, char* argv[])
         else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "  --no-validate      Skip validation tests\n"
+                      << "  --realistic        Run realistic workload benchmarks (A/B/C)\n"
                       << "  --max-rays <N>     Maximum ray/query count (default: 64M)\n"
                       << "  --iters <N>        Timed iterations (default: 10)\n"
                       << "  --device <id>      CUDA device (default: 0)\n"
@@ -1449,6 +2138,40 @@ int main(int argc, char* argv[])
             std::cerr << "\n*** SCENE MODIFICATION TESTS FAILED ***\n";
         } else {
             std::cout << "\n  All scene modification tests PASSED.\n";
+        }
+
+        /* ============================================================
+         * 8. Realistic Workload Benchmarks (--realistic)
+         * ============================================================*/
+        if (do_realistic) {
+            printHeader("Realistic Workload Benchmarks (10K triangles)");
+
+            /* Build 10K-triangle scene */
+            TriangleMesh real_mesh = GeometryManager::createRandomTriangles(10000, 10.0f, 77);
+            tracer.setTriangleMesh(real_mesh);
+            std::cout << "  Realistic scene: "
+                      << real_mesh.indices.size() << " triangles, "
+                      << real_mesh.vertices.size() << " vertices\n";
+
+            /* A: Single-batch width + pipeline decomposition */
+            unsigned int w_sat = benchmarkSingleBatchWidth(
+                tracer, real_mesh.bbox_min, real_mesh.bbox_max,
+                num_iters, csv);
+
+            /* B: Multi-batch call frequency (B1 async + B2 interval) */
+            benchmarkMultiBatchFrequency(
+                tracer, w_sat,
+                real_mesh.bbox_min, real_mesh.bbox_max,
+                num_iters, csv);
+
+            /* C: Extreme sustained workload (5 seconds) */
+            benchmarkExtremeSustained(
+                tracer, w_sat,
+                real_mesh.bbox_min, real_mesh.bbox_max,
+                csv);
+
+            /* Restore Cornell Box */
+            tracer.setTriangleMesh(cornell);
         }
 
         csv.close();

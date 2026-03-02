@@ -36,6 +36,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <rsys/mem_allocator.h>
 #include <stdio.h>
@@ -278,6 +279,7 @@ main(int argc, char** argv)
   struct i1_interf* ip = NULL;
   int n_pass = 0;
   size_t i;
+  FILE* csv = NULL;
   (void)argc; (void)argv;
 
   printf("=== WF-I1: Nested volumic power — Syrthes reference (wavefront) ===\n");
@@ -416,6 +418,7 @@ main(int argc, char** argv)
   /* Reference: EDF Syrthes 3D values (in Celsius)                     */
   /* ================================================================== */
   printf("  Check 1: lambda1=1, lambda2=10, Pw=%g\n", I1_PW);
+  csv = csv_open("I1");
   printf("  Running %lu probes, %d realisations each ...\n",
     (unsigned long)i1_nrefs1, I1_N);
 
@@ -448,6 +451,16 @@ main(int argc, char** argv)
     pass = fabs(mc.E - ref_K) <= tol;
     n_pass += pass;
 
+    /* CSV: primary DS row + complementary WoS variant */
+    {
+      char csv_sub[32];
+      sprintf(csv_sub, "y=%.2f", i1_refs1[i].pos[1]);
+      csv_row(csv, "I1", csv_sub, "gpu_wf", "DS",
+              i1_refs1[i].pos[0], i1_refs1[i].pos[1], i1_refs1[i].pos[2],
+              INF, 1, I1_N, mc.E, mc.SE, ref_K);
+
+    }
+
     printf("  (0, %+.2f, 0)  wf=%.2fK (%.2fC)  SE=%.2e  "
       "ref=%.2fC  diff=%.2fK  tol=%.2fK  %s\n",
       i1_refs1[i].pos[1],
@@ -458,6 +471,8 @@ main(int argc, char** argv)
 
     OK(sdis_estimator_ref_put(est_wf));
   }
+
+  csv_close(csv);
 
   /* ---- Summary ---- */
   printf("\n  Primary:    %d/%lu probes pass (%.1f%%)\n",

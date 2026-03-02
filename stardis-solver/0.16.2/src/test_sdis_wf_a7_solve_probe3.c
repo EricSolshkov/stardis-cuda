@@ -21,6 +21,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <rsys/stretchy_array.h>
 #include <rsys_math.h>
@@ -168,9 +169,11 @@ main(int argc, char** argv)
   size_t nreals, nfails;
   size_t i;
   int pass;
+  FILE* csv = NULL;
   (void)argc; (void)argv;
 
   OK(sdis_device_create(&SDIS_DEVICE_CREATE_ARGS_DEFAULT, &dev));
+  csv = csv_open("A7");
 
   /* ---- Fluid ---- */
   fluid_shader.temperature = a7_temp_unknown;
@@ -285,6 +288,13 @@ main(int argc, char** argv)
   fprintf(stdout,
     "  Temperature at (%g, %g, %g) = %g ~ %g +/- %g\n",
     SPLIT3(solve_args.position), ref, T_mc.E, T_mc.SE);
+
+  /* CSV: primary DS row only (WoS disabled for isolation test) */
+  csv_row(csv, "A7", "default", "gpu_wf", "DS",
+          solve_args.position[0], solve_args.position[1],
+          solve_args.position[2],
+          INF, 1, A7_NREALS, T_mc.E, T_mc.SE, ref);
+
   fprintf(stdout,
     "  #failures = %lu / %lu\n",
     (unsigned long)nfails, (unsigned long)A7_NREALS);
@@ -294,6 +304,8 @@ main(int argc, char** argv)
       && p0_compare_analytic(est_wf, ref, A7_TOL_SIGMA);
 
   fprintf(stdout, "  WF-A7: %s\n", pass ? "PASS" : "FAIL");
+
+  csv_close(csv);
 
   /* ---- Cleanup ---- */
   OK(sdis_estimator_ref_put(est_wf));

@@ -143,6 +143,11 @@ public:
     void traceBatch(Ray* d_rays, HitResult* d_hits,
                     unsigned int count, CUstream stream = 0);
 
+    /* P1: overload accepting external params buffer (dual-buffer safe) */
+    void traceBatch(Ray* d_rays, HitResult* d_hits,
+                    unsigned int count, CUstream stream,
+                    CUdeviceptr external_params_ptr);
+
     TraceResult traceBatchTimed(Ray* d_rays, HitResult* d_hits,
                                 unsigned int count,
                                 int num_iters = 10, int warm_up = 3,
@@ -237,6 +242,11 @@ public:
     float3       getTriBBoxMax()       const { return m_scene_bbox_max; }
     bool         hasTriangles()        const { return hasScene(); }
 
+    /* Low-level accessors for external pipeline decomposition benchmarks */
+    OptixPipeline                    pipeline() const { return m_pipeline; }
+    const OptixShaderBindingTable&   sbtRT()    const { return m_sbt_rt; }
+    OptixTraversableHandle           activeRTHandle() const { return m_ias_handle; }
+
     void cleanup();
 
 private:
@@ -262,9 +272,6 @@ private:
     /* Query GAS */
     void buildQueryGASInternal(bool compact);
     void freeQueryGAS();
-
-    /* Active traversable */
-    OptixTraversableHandle activeRTHandle() const { return m_ias_handle; }
 
     /* BBox utility */
     static void computeBBox(const std::vector<float3>& pts,

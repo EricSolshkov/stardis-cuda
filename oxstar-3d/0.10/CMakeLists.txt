@@ -287,6 +287,53 @@ add_custom_command(TARGET s3d POST_BUILD
 )
 
 # ============================================================================
+# Throughput Benchmark Executable (src/main.cpp)
+# ============================================================================
+
+add_executable(oxs3d_throughput
+    src/main.cpp
+    src/device_manager.cpp
+    src/geometry_manager.cpp
+    src/unified_tracer.cpp
+    src/accel_manager.cpp
+    src/pipeline_manager.cpp
+    src/ray_tracer.cpp
+    src/nn_query.cpp
+    device/kernels.cu
+    device/nn_kernels.cu
+)
+
+target_include_directories(oxs3d_throughput PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/device
+    ${OptiX_INCLUDE_DIR}
+)
+
+target_link_libraries(oxs3d_throughput PRIVATE
+    rsys
+    CUDA::cudart
+)
+
+set_target_properties(oxs3d_throughput PROPERTIES
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    CXX_STANDARD 17
+)
+
+add_dependencies(oxs3d_throughput oxs3d_ptx_programs)
+
+# Deploy PTX files alongside the benchmark executable
+add_custom_command(TARGET oxs3d_throughput POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${PTX_OUTPUT}"
+        "$<TARGET_FILE_DIR:oxs3d_throughput>/programs.ptx"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${NN_PTX_OUTPUT}"
+        "$<TARGET_FILE_DIR:oxs3d_throughput>/nn_programs.ptx"
+    COMMENT "oxstar-3d: Copying PTX files for throughput benchmark"
+)
+
+# ============================================================================
 # Tests
 # ============================================================================
 

@@ -28,6 +28,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <rsys/mem_allocator.h>
 #include <stdio.h>
@@ -350,9 +351,11 @@ main(int argc, char** argv)
   struct f1_interf* ground_interf_data = NULL;
   int n_pass = 0, n_total = 0;
   size_t i;
+  FILE* csv = NULL;
   (void)argc; (void)argv;
 
   printf("=== WF-F1: External flux / solar source (wavefront probe) ===\n");
+  csv = csv_open("F1");
 
   OK(sdis_device_create(&SDIS_DEVICE_CREATE_ARGS_DEFAULT, &dev));
 
@@ -496,6 +499,16 @@ main(int argc, char** argv)
     n_pass += pass;
     n_total++;
 
+    /* CSV: primary DS row + complementary WoS variant */
+    {
+      struct sdis_mc mc_csv;
+      OK(sdis_estimator_get_temperature(est_wf, &mc_csv));
+      csv_row(csv, "F1", "lambertian", "gpu_wf", "DS",
+              args.position[0], args.position[1], args.position[2],
+              INF, 1, F1_NREALS_LAMBERT, mc_csv.E, mc_csv.SE, T_ref);
+
+    }
+
     if(P0_ENABLE_DIAG) {
       OK(sdis_solve_probe(scn, &args, &est_df));
     }
@@ -530,6 +543,16 @@ main(int argc, char** argv)
     n_pass += pass;
     n_total++;
 
+    /* CSV: primary DS row + complementary WoS variant */
+    {
+      struct sdis_mc mc_csv;
+      OK(sdis_estimator_get_temperature(est_wf, &mc_csv));
+      csv_row(csv, "F1", "specular", "gpu_wf", "DS",
+              args.position[0], args.position[1], args.position[2],
+              INF, 1, F1_NREALS_SPECULAR, mc_csv.E, mc_csv.SE, T_ref);
+
+    }
+
     if(P0_ENABLE_DIAG) {
       OK(sdis_solve_probe(scn, &args, &est_df));
     }
@@ -540,6 +563,7 @@ main(int argc, char** argv)
     if(est_df) OK(sdis_estimator_ref_put(est_df));
   }
 
+  csv_close(csv);
   fprintf(stdout, "\n  Primary: %d/%d sub-tests pass (%.1f%%)\n",
     n_pass, n_total,
     100.0 * (double)n_pass / (double)n_total);

@@ -36,6 +36,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <rsys/mem_allocator.h>
 #include <stdio.h>
@@ -378,9 +379,11 @@ main(int argc, char** argv)
   int n_pass = 0;
   int n_total = 0;
   size_t i;
+  FILE* csv = NULL;
   (void)argc; (void)argv;
 
   printf("=== WF-E5: Transient conduction with atmosphere (wavefront probe) ===\n");
+  csv = csv_open("E5");
 
   OK(sdis_device_create(&SDIS_DEVICE_CREATE_ARGS_DEFAULT, &dev));
 
@@ -557,6 +560,12 @@ main(int argc, char** argv)
     n_pass += pass;
     n_total++;
 
+    /* CSV: primary DS row + complementary WoS variant */
+    csv_row(csv, "E5", "fluid", "gpu_wf", "DS",
+            XH*0.5, XH*0.5, XH*0.5, e5_tfluid_times[i],
+            1, E5_NREALS, mc.E, mc.SE, e5_tfluid_refs[i]);
+
+
     printf("  t=%8.0f  wf=%.6f (SE=%.2e)  ref=%.5f  diff=%.4f  %s\n",
       e5_tfluid_times[i], mc.E, mc.SE, e5_tfluid_refs[i],
       fabs(mc.E - e5_tfluid_refs[i]), pass ? "PASS" : "FAIL");
@@ -592,12 +601,20 @@ main(int argc, char** argv)
     n_pass += pass;
     n_total++;
 
+    /* CSV: primary DS row + complementary WoS variant */
+    csv_row(csv, "E5", "solid", "gpu_wf", "DS",
+            X_PROBE, XHpE*0.5, XHpE*0.5, e5_tsolid_times[i],
+            1, E5_NREALS, mc.E, mc.SE, e5_tsolid_refs[i]);
+
+
     printf("  t=%8.0f  wf=%.6f (SE=%.2e)  ref=%.5f  diff=%.4f  %s\n",
       e5_tsolid_times[i], mc.E, mc.SE, e5_tsolid_refs[i],
       fabs(mc.E - e5_tsolid_refs[i]), pass ? "PASS" : "FAIL");
 
     OK(sdis_estimator_ref_put(est_wf));
   }
+
+  csv_close(csv);
 
   /* ---- Summary ---- */
   printf("\n  Primary:    %d/%d probes pass (%.1f%%)\n",

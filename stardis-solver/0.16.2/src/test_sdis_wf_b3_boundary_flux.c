@@ -23,6 +23,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <rsys/mem_allocator.h>
 #include <stdio.h>
@@ -187,6 +188,7 @@ main(int argc, char** argv)
 
   static const double probe_x[] = {0.1, 0.3, 0.5, 0.7, 0.9};
   int i;
+  FILE* csv = NULL;
   (void)argc; (void)argv;
 
   n_probes = (int)(sizeof(probe_x)/sizeof(probe_x[0]));
@@ -195,6 +197,8 @@ main(int argc, char** argv)
   printf("  Hrad = %.6f\n", B3_Hrad);
   printf("  T(+X) = %.6f\n", B3_T_RIGHT);
   printf("  T(x=0.5) = %.6f\n", B3_T(0.5));
+
+  csv = csv_open("B3");
 
   OK(sdis_device_create(&SDIS_DEVICE_CREATE_ARGS_DEFAULT, &dev));
 
@@ -323,6 +327,10 @@ main(int argc, char** argv)
     pass = p0_compare_analytic(est_wf, ref, B3_TOL_SIGMA);
     n_pass += pass;
 
+    /* CSV: DS row */
+    csv_row(csv, "B3", "default", "gpu_wf", "DS",
+            probe_x[i], 0.5, 0.5, INF, 1, B3_NREALS, mc.E, mc.SE, ref);
+
     printf("  x=%.1f  wf=%.6f (SE=%.2e)  ref=%.6f  %s (%.1f sigma)\n",
       probe_x[i], mc.E, mc.SE, ref,
       pass ? "PASS" : "FAIL",
@@ -330,6 +338,8 @@ main(int argc, char** argv)
 
     OK(sdis_estimator_ref_put(est_wf));
   }
+
+  csv_close(csv);
 
   /* ---- Summary ---- */
   printf("\n  Primary:    %d/%d probes pass (%.1f%%)\n",

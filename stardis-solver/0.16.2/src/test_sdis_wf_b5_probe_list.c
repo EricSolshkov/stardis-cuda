@@ -26,6 +26,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <star/s3dut.h>
 #include <rsys_math.h>
@@ -203,6 +204,7 @@ main(int argc, char** argv)
   double spread;
   int n_pass = 0;
   int i;
+  FILE* csv = NULL;
   (void)argc; (void)argv;
 
   printf("=== WF-B5: Trilinear field with supershape (wavefront probe) ===\n");
@@ -254,6 +256,7 @@ main(int argc, char** argv)
   OK(sdis_scene_get_medium_spread(scn, solid, &spread));
   sp->delta = 0.4 / spread;
   printf("  Adaptive delta = %.6f  (spread = %.2f)\n", sp->delta, spread);
+  csv = csv_open("B5");
 
   /* ================================================================== */
   /* Solve: 10 probes at deterministic positions                        */
@@ -282,6 +285,11 @@ main(int argc, char** argv)
     pass = p0_compare_analytic(est_wf, ref, B5_TOL_SIGMA);
     n_pass += pass;
 
+    /* CSV: primary DS row + complementary WoS variant */
+    csv_row(csv, "B5", "default", "gpu_wf", "DS",
+            b5_positions[i][0], b5_positions[i][1], b5_positions[i][2],
+            INF, 1, B5_NREALS, mc.E, mc.SE, ref);
+
     printf("  probe(%+.2f,%+.2f,%+.2f)  wf=%.4f (SE=%.2e)  ref=%.4f  "
       "%s (%.1f sigma)\n",
       b5_positions[i][0], b5_positions[i][1], b5_positions[i][2],
@@ -291,6 +299,8 @@ main(int argc, char** argv)
 
     OK(sdis_estimator_ref_put(est_wf));
   }
+
+  csv_close(csv);
 
   /* ---- Summary ---- */
   printf("\n  Primary:    %d/%d probes pass (%.1f%%)\n",

@@ -22,6 +22,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <rsys/mem_allocator.h>
 #include <stdio.h>
@@ -341,6 +342,7 @@ main(int argc, char** argv)
   struct c3_geometry geom;
   int n_pass = 0, n_total = 0;
   size_t ti;
+  FILE* csv = NULL;
   (void)argc; (void)argv;
 
   /* 6 sub-test configurations */
@@ -385,6 +387,7 @@ main(int argc, char** argv)
   static const size_t n_configs = sizeof(configs) / sizeof(configs[0]);
 
   printf("=== WF-C3: Picard multi-order conducto-radiative (wavefront probe) ===\n");
+  csv = csv_open("C3");
 
   OK(sdis_device_create(&SDIS_DEVICE_CREATE_ARGS_DEFAULT, &dev));
 
@@ -579,6 +582,17 @@ main(int argc, char** argv)
     n_pass += pass;
     n_total++;
 
+    /* CSV: primary row + complementary variant */
+    {
+      struct sdis_mc mc_csv;
+      OK(sdis_estimator_get_temperature(est_wf, &mc_csv));
+      csv_row(csv, "C3", cfg->label, "gpu_wf",
+              cfg->diff_algo == SDIS_DIFFUSION_WOS ? "WoS" : "DS",
+              0.05, 0.0, 0.0, INF, (int)cfg->picard_order,
+              C3_NREALS, mc_csv.E, mc_csv.SE, cfg->ref_T);
+
+    }
+
     if(P0_ENABLE_DIAG) {
       OK(sdis_solve_probe(scn, &args, &est_df));
     }
@@ -589,6 +603,7 @@ main(int argc, char** argv)
     if(est_df) OK(sdis_estimator_ref_put(est_df));
   }
 
+  csv_close(csv);
   fprintf(stdout, "\n  Primary: %d/%d configs pass (%.1f%%)\n",
     n_pass, n_total,
     100.0 * (double)n_pass / (double)n_total);

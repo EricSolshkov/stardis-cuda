@@ -1234,6 +1234,41 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
             pool->enc_arr[i].batch_indices[j] = (uint32_t)ray_idx;
           }
         }
+
+        /* --- B-4 M3: Rays 2..3 for SS 4-ray reinjection --- */
+        /* BUG-FIX: previously missing — back direction rays were never
+         * emitted in the persistent wavefront collect, causing
+         * step_bnd_ss_reinject_process to read stale/zero hits for
+         * ray_bck[0] and ray_bck[1]. */
+        if(pool->dsoa.ray_count_ext[i] == 4
+        && ph_i == PATH_BND_SS_REINJECT_SAMPLE) {
+          int j;
+          p->locals.bnd_ss.batch_idx_frt0 = p->ray_req.batch_idx;
+          p->locals.bnd_ss.batch_idx_frt1 = p->ray_req.batch_idx2;
+
+          for(j = 0; j < 2; j++) {
+            size_t ray_idx = my_cursor[bkt]++;
+            struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
+            rr->origin[0]    = p->ray_req.origin[0];
+            rr->origin[1]    = p->ray_req.origin[1];
+            rr->origin[2]    = p->ray_req.origin[2];
+            rr->direction[0] = p->locals.bnd_ss.dir_bck[j][0];
+            rr->direction[1] = p->locals.bnd_ss.dir_bck[j][1];
+            rr->direction[2] = p->locals.bnd_ss.dir_bck[j][2];
+            rr->range[0]     = p->ray_req.range[0];
+            rr->range[1]     = p->ray_req.range[1];
+            if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d))
+              rr->filter_data = &p->filter_data_storage;
+            else
+              rr->filter_data = NULL;
+            rr->user_id      = i;
+
+            pv->ray_to_slot[ray_idx] = i;
+            pv->ray_slot_sub[ray_idx] = (uint32_t)(j + 2);
+            if(j == 0) p->locals.bnd_ss.batch_idx_bck0 = (uint32_t)ray_idx;
+            else       p->locals.bnd_ss.batch_idx_bck1 = (uint32_t)ray_idx;
+          }
+        }
       } /* end omp for */
 
       #pragma omp critical
@@ -1392,6 +1427,37 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
           pool->enc_arr[i].batch_indices[j] = (uint32_t)ray_idx;
         }
       }
+
+      /* B-4 M3: Rays 2..3 for SS 4-ray reinjection (serial path) */
+      if(pool->dsoa.ray_count_ext[i] == 4
+      && ph_i == PATH_BND_SS_REINJECT_SAMPLE) {
+        int j;
+        p->locals.bnd_ss.batch_idx_frt0 = p->ray_req.batch_idx;
+        p->locals.bnd_ss.batch_idx_frt1 = p->ray_req.batch_idx2;
+
+        for(j = 0; j < 2; j++) {
+          size_t ray_idx = ser_cursor[bkt]++;
+          struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
+          rr->origin[0]    = p->ray_req.origin[0];
+          rr->origin[1]    = p->ray_req.origin[1];
+          rr->origin[2]    = p->ray_req.origin[2];
+          rr->direction[0] = p->locals.bnd_ss.dir_bck[j][0];
+          rr->direction[1] = p->locals.bnd_ss.dir_bck[j][1];
+          rr->direction[2] = p->locals.bnd_ss.dir_bck[j][2];
+          rr->range[0]     = p->ray_req.range[0];
+          rr->range[1]     = p->ray_req.range[1];
+          if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d))
+            rr->filter_data = &p->filter_data_storage;
+          else
+            rr->filter_data = NULL;
+          rr->user_id      = i;
+
+          pv->ray_to_slot[ray_idx] = i;
+          pv->ray_slot_sub[ray_idx] = (uint32_t)(j + 2);
+          if(j == 0) p->locals.bnd_ss.batch_idx_bck0 = (uint32_t)ray_idx;
+          else       p->locals.bnd_ss.batch_idx_bck1 = (uint32_t)ray_idx;
+        }
+      }
     }
 
     pv->ray_count = pv->bucket_offsets[RAY_BUCKET_COUNT];
@@ -1460,11 +1526,17 @@ pool_distribute_enc_locate_results(struct wavefront_pool* pool,
 }
 
 /*******************************************************************************
- * B-4 M9: Collect closest_point requests from WoS paths in PATH_CND_WOS_CLOSEST
+ * B-4 M9: Collect closest_point requests from WoS paths
  *
- * Scans active paths for PATH_CND_WOS_CLOSEST and fills the cp_requests
- * array.  The requests are then dispatched as a single GPU batch via
+ * Scans active paths for any CP-pending phase (PATH_CND_WOS_CLOSEST and
+ * PATH_CND_WOS_DIFFUSION_CHECK) and fills the cp_requests array.  The
+ * requests are then dispatched as a single GPU batch via
  * s3d_scene_view_closest_point_batch_ctx.
+ *
+ * BUG-FIX: previously only checked PATH_CND_WOS_CLOSEST, missing
+ * PATH_CND_WOS_DIFFUSION_CHECK.  Now uses path_phase_is_cp_pending()
+ * to match the non-persistent wavefront and the canonical predicate
+ * definition in sdis_wf_types.h.
  ******************************************************************************/
 LOCAL_SYM res_T
 pool_collect_cp_requests(struct wavefront_pool* pool,
@@ -1476,7 +1548,7 @@ pool_collect_cp_requests(struct wavefront_pool* pool,
     uint32_t i = pv->active_indices[k];
     struct path_state* p = &pool->slots[i];
 
-    if(p->phase == PATH_CND_WOS_CLOSEST) {
+    if(path_phase_is_cp_pending(p->phase)) {
       struct s3d_cp_request* req = &pv->cp_requests[n];
       req->pos[0] = (float)p->locals.cnd_wos.query_pos[0];
       req->pos[1] = (float)p->locals.cnd_wos.query_pos[1];
@@ -1498,8 +1570,13 @@ pool_collect_cp_requests(struct wavefront_pool* pool,
  * B-4 M9: Distribute closest_point results back to WoS paths
  *
  * For each CP result, write the hit into the path's cached_hit field,
- * then transition to PATH_CND_WOS_CLOSEST_RESULT so the cascade loop
- * can process the result via step_cnd_wos_closest_result.
+ * then transition to the matching *_RESULT phase so the cascade loop
+ * can process the result.
+ *
+ * BUG-FIX: previously always set PATH_CND_WOS_CLOSEST_RESULT regardless
+ * of the origin phase.  Now correctly maps:
+ *   PATH_CND_WOS_CLOSEST          → PATH_CND_WOS_CLOSEST_RESULT
+ *   PATH_CND_WOS_DIFFUSION_CHECK  → PATH_CND_WOS_DIFFUSION_CHECK_RESULT
  ******************************************************************************/
 LOCAL_SYM res_T
 pool_distribute_cp_results(struct wavefront_pool* pool,
@@ -1512,7 +1589,11 @@ pool_distribute_cp_results(struct wavefront_pool* pool,
     struct path_state* p = &pool->slots[slot_id];
 
     p->locals.cnd_wos.cached_hit = pv->cp_hits[k];
-    p->phase = PATH_CND_WOS_CLOSEST_RESULT;
+
+    if(p->phase == PATH_CND_WOS_DIFFUSION_CHECK)
+      p->phase = PATH_CND_WOS_DIFFUSION_CHECK_RESULT;
+    else
+      p->phase = PATH_CND_WOS_CLOSEST_RESULT;
   }
 
   return RES_OK;
@@ -1652,6 +1733,19 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
               pool->enc_arr[i].fb_hit = pv->ray_hits[p->ray_req.batch_idx];
             }
 
+            /* B-4 M3: SS 4-ray pre-delivery (BUG-FIX) */
+            if(p->phase == PATH_BND_SS_REINJECT_SAMPLE
+            && p->ray_count_ext == 4) {
+              p->locals.bnd_ss.ray_frt[0] =
+                pv->ray_hits[p->locals.bnd_ss.batch_idx_frt0];
+              p->locals.bnd_ss.ray_frt[1] =
+                pv->ray_hits[p->locals.bnd_ss.batch_idx_frt1];
+              p->locals.bnd_ss.ray_bck[0] =
+                pv->ray_hits[p->locals.bnd_ss.batch_idx_bck0];
+              p->locals.bnd_ss.ray_bck[1] =
+                pv->ray_hits[p->locals.bnd_ss.batch_idx_bck1];
+            }
+
             {
               enum path_phase phase_before = p->phase;
               p->needs_ray = 0;
@@ -1757,6 +1851,19 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
           }
           if(p->phase == PATH_ENC_QUERY_FB_EMIT) {
             pool->enc_arr[i].fb_hit = pv->ray_hits[p->ray_req.batch_idx];
+          }
+
+          /* B-4 M3: SS 4-ray pre-delivery (BUG-FIX) */
+          if(p->phase == PATH_BND_SS_REINJECT_SAMPLE
+          && p->ray_count_ext == 4) {
+            p->locals.bnd_ss.ray_frt[0] =
+              pv->ray_hits[p->locals.bnd_ss.batch_idx_frt0];
+            p->locals.bnd_ss.ray_frt[1] =
+              pv->ray_hits[p->locals.bnd_ss.batch_idx_frt1];
+            p->locals.bnd_ss.ray_bck[0] =
+              pv->ray_hits[p->locals.bnd_ss.batch_idx_bck0];
+            p->locals.bnd_ss.ray_bck[1] =
+              pv->ray_hits[p->locals.bnd_ss.batch_idx_bck1];
           }
 
           {

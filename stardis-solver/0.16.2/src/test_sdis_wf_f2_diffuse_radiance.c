@@ -24,6 +24,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <rsys/mem_allocator.h>
 #include <stdio.h>
@@ -315,6 +316,7 @@ main(int argc, char** argv)
   double* pLdiff = NULL;
   double T_ref;
   int pass;
+  FILE* csv = NULL;
   (void)argc; (void)argv;
 
   printf("=== WF-F2: External flux + diffuse radiance (wavefront probe) ===\n");
@@ -323,6 +325,8 @@ main(int argc, char** argv)
   f2_generate_sphere(F2_SPHERE_RADIUS);
   printf("  Sphere mesh: %lu verts, %lu tris\n",
     (unsigned long)f2_nverts, (unsigned long)f2_ntris);
+
+  csv = csv_open("F2");
 
   OK(sdis_device_create(&SDIS_DEVICE_CREATE_ARGS_DEFAULT, &dev));
 
@@ -409,6 +413,16 @@ main(int argc, char** argv)
 
     pass = p0_compare_analytic(est_wf, T_ref, P0_TOL_SIGMA);
 
+    /* CSV: primary DS row + complementary WoS variant */
+    {
+      struct sdis_mc mc_csv;
+      OK(sdis_estimator_get_temperature(est_wf, &mc_csv));
+      csv_row(csv, "F2", "Ldiff=50", "gpu_wf", "DS",
+              0.0, 0.0, 0.0, INF, 1, F2_NREALS,
+              mc_csv.E, mc_csv.SE, T_ref);
+
+    }
+
     if(P0_ENABLE_DIAG) {
       OK(sdis_solve_probe(scn, &args, &est_df));
     }
@@ -419,6 +433,7 @@ main(int argc, char** argv)
     if(est_df) OK(sdis_estimator_ref_put(est_df));
   }
 
+  csv_close(csv);
   CHK(pass);
   printf("WF-F2: PASS\n");
 

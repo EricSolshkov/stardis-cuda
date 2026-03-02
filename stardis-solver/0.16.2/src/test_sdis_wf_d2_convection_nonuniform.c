@@ -19,6 +19,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <rsys/mem_allocator.h>
 #include <stdio.h>
@@ -181,6 +182,7 @@ main(int argc, char** argv)
   struct sdis_interface* box_interfaces[12];
   int n_pass_primary = 0, n_pass_diag = 0;
   size_t i;
+  FILE* csv = NULL;
   (void)argc; (void)argv;
 
   /* Probe positions (all inside the unit cube) */
@@ -194,6 +196,7 @@ main(int argc, char** argv)
 
   printf("=== WF-D2: Non-uniform convection, steady-state (wavefront probe) ===\n");
   printf("  Analytic T_inf = %.4f K\n", D2_TINF);
+  csv = csv_open("D2");
 
   OK(sdis_device_create(&SDIS_DEVICE_CREATE_ARGS_DEFAULT, &dev));
 
@@ -265,6 +268,16 @@ main(int argc, char** argv)
 
     n_pass_primary += p0_compare_analytic(est_wf, T_ref, P0_TOL_SIGMA);
 
+    /* CSV: primary DS row + complementary WoS variant */
+    {
+      struct sdis_mc mc_csv;
+      OK(sdis_estimator_get_temperature(est_wf, &mc_csv));
+      csv_row(csv, "D2", "default", "gpu_wf", "DS",
+              probe_pos[i][0], probe_pos[i][1], probe_pos[i][2],
+              INF, 1, D2_NREALS, mc_csv.E, mc_csv.SE, T_ref);
+
+    }
+
     if(P0_ENABLE_DIAG) {
       OK(sdis_solve_probe(scn, &args, &est_df));
       n_pass_diag += p0_diag_compare(est_wf, est_df, P0_DIAG_SIGMA);
@@ -277,6 +290,7 @@ main(int argc, char** argv)
       OK(sdis_estimator_ref_put(est_df));
   }
 
+  csv_close(csv);
   fprintf(stdout, "  Primary:    %d/%d probes pass (%.1f%%)\n",
     n_pass_primary, D2_NPROBES,
     100.0 * (double)n_pass_primary / (double)D2_NPROBES);
