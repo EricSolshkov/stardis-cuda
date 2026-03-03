@@ -2921,19 +2921,23 @@ gpu_launch_async(struct wavefront_pool* pool, struct pool_view* pv,
 }
 
 /**
- * gpu_wait_and_postprocess — wait for async GPU trace, then distribute
- * ray results, enc_locate, and closest_point batches.
+ * gpu_wait_download — synchronise with async GPU trace and download
+ * results (D2H).  This is the only part that actually blocks on the
+ * GPU; everything after this is pure CPU work.
+ *
+ * Split out from gpu_wait_and_postprocess() so that the opposite pool's
+ * GPU launch can be issued immediately after D2H completes, hiding the
+ * CPU post-processing latency behind GPU execution.
  */
 static res_T
-gpu_wait_and_postprocess(struct wavefront_pool* pool,
-                         struct pool_view* pv,
-                         struct s3d_scene_view* sv,
-                         struct sdis_scene* scn)
+gpu_wait_download(struct wavefront_pool* pool,
+                  struct pool_view* pv,
+                  struct s3d_scene_view* sv)
 {
   struct time t0, t1;
   res_T res;
 
-  /* ---- batch trace wait + postprocess ---- */
+  /* ---- batch trace wait (sync + D2H) ---- */
   time_current(&t0);
   if(pv->ray_count > 0 && pv->gpu_pending) {
     struct s3d_batch_trace_stats stats;
@@ -2979,6 +2983,24 @@ gpu_wait_and_postprocess(struct wavefront_pool* pool,
   }
   time_current(&t1);
   pool->time_trace_s += time_elapsed_sec(&t0, &t1);
+
+  return RES_OK;
+}
+
+/**
+ * gpu_postprocess — distribute ray results, enc_locate, closest_point
+ * batches, and sync dsoa.  Pure CPU work, no GPU dependency.
+ *
+ * Split out from gpu_wait_and_postprocess() so that it can run while
+ * the opposite pool's GPU trace is already in flight.
+ */
+static res_T
+gpu_postprocess(struct wavefront_pool* pool,
+                struct pool_view* pv,
+                struct sdis_scene* scn)
+{
+  struct time t0, t1;
+  res_T res;
 
   /* ---- distribute ray results ---- */
   time_current(&t0);
@@ -3059,6 +3081,21 @@ gpu_wait_and_postprocess(struct wavefront_pool* pool,
   }
 
   return RES_OK;
+}
+
+/**
+ * gpu_wait_and_postprocess — combined wait + postprocess (convenience
+ * wrapper used by merge/drain paths that don't need early-launch).
+ */
+static res_T
+gpu_wait_and_postprocess(struct wavefront_pool* pool,
+                         struct pool_view* pv,
+                         struct s3d_scene_view* sv,
+                         struct sdis_scene* scn)
+{
+  res_T res = gpu_wait_download(pool, pv, sv);
+  if(res != RES_OK) return res;
+  return gpu_postprocess(pool, pv, scn);
 }
 
 /**
@@ -3577,25 +3614,38 @@ solve_camera_persistent_wavefront(
 
     while(pool.active_count > 0 || pool.task_next < pool.task_count) {
       struct time t_pl0, t_pl1;
-      /* P4 timeline: 7 timestamps spanning one full A+B cycle
-       * [0]=start [1]=waitA [2]=launchB [3]=cpuA [4]=waitB [5]=launchA [6]=cpuB */
-      struct time t_cy[7];
+      /* P4 timeline: 9 timestamps spanning one full A+B cycle (early-launch)
+       * [0]=start [1]=d2hA [2]=launchB [3]=postA [4]=cpuA
+       *           [5]=d2hB [6]=launchA [7]=postB [8]=cpuB */
+      struct time t_cy[9];
 
-      /* ════════ Phase 1: wait GPU(A) → launch GPU(B) → CPU on A ════════ */
+      /* ════════ Phase 1: d2h(A) → launch(B) → post(A) → CPU(A) ════════ */
       time_current(&t_cy[0]);
+
+      /* 1a. GPU sync + D2H only — this is the true GPU-blocking part */
       time_current(&t_pl0);
-      res = gpu_wait_and_postprocess(&pool, pv_a, scn->s3d_view, scn);
+      res = gpu_wait_download(&pool, pv_a, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
       time_current(&t_pl1);
       pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[1] = t_pl1;  /* after wait(A) */
+      t_cy[1] = t_pl1;  /* after d2h(A) */
 
+      /* 1b. Launch opposite pool ASAP — GPU(B) starts while we postprocess A */
       res = gpu_launch_async(&pool, pv_b, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
       time_current(&t_cy[2]);  /* after launch(B) */
 
+      /* 1c. CPU postprocess on A (distribute + enc_locate + cp + dsoa_sync) */
+      time_current(&t_pl0);
+      res = gpu_postprocess(&pool, pv_a, scn);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_pl1);
+      pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
+      t_cy[3] = t_pl1;  /* after post(A) */
+
       pool.total_steps++;  /* view A completed one step */
 
+      /* 1d. CPU cascade + harvest + refill + pre_gpu on A */
       time_current(&t_pl0);
       res = cpu_between(&pool, pv_a);
       if(res != RES_OK) goto cleanup;
@@ -3603,7 +3653,7 @@ solve_camera_persistent_wavefront(
       if(res != RES_OK) goto cleanup;
       time_current(&t_pl1);
       pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[3] = t_pl1;  /* after cpu(A) */
+      t_cy[4] = t_pl1;  /* after cpu(A) */
 
       /* -- Housekeeping after A's step -- */
       pool_update_active_count(&pool);
@@ -3672,20 +3722,32 @@ solve_camera_persistent_wavefront(
         goto cleanup;
       }
 
-      /* ════════ Phase 2: wait GPU(B) → launch GPU(A) → CPU on B ════════ */
+      /* ════════ Phase 2: d2h(B) → launch(A) → post(B) → CPU(B) ════════ */
+
+      /* 2a. GPU sync + D2H only */
       time_current(&t_pl0);
-      res = gpu_wait_and_postprocess(&pool, pv_b, scn->s3d_view, scn);
+      res = gpu_wait_download(&pool, pv_b, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
       time_current(&t_pl1);
       pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[4] = t_pl1;  /* after wait(B) */
+      t_cy[5] = t_pl1;  /* after d2h(B) */
 
+      /* 2b. Launch opposite pool ASAP — GPU(A) starts while we postprocess B */
       res = gpu_launch_async(&pool, pv_a, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
-      time_current(&t_cy[5]);  /* after launch(A) */
+      time_current(&t_cy[6]);  /* after launch(A) */
+
+      /* 2c. CPU postprocess on B */
+      time_current(&t_pl0);
+      res = gpu_postprocess(&pool, pv_b, scn);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_pl1);
+      pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
+      t_cy[7] = t_pl1;  /* after post(B) */
 
       pool.total_steps++;  /* view B completed one step */
 
+      /* 2d. CPU cascade + harvest + refill + pre_gpu on B */
       time_current(&t_pl0);
       res = cpu_between(&pool, pv_b);
       if(res != RES_OK) goto cleanup;
@@ -3693,7 +3755,7 @@ solve_camera_persistent_wavefront(
       if(res != RES_OK) goto cleanup;
       time_current(&t_pl1);
       pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[6] = t_pl1;  /* after cpu(B) */
+      t_cy[8] = t_pl1;  /* after cpu(B) */
 
       /* -- Housekeeping after B's step -- */
       pool_update_active_count(&pool);
@@ -3767,21 +3829,23 @@ solve_camera_persistent_wavefront(
         const char* env_tl = getenv("STARDIS_PIPELINE_LOG");
         env_tl="2";
         if(env_tl && env_tl[0] == '2' && pool.total_steps % 500 == 0) {
-          double waitA   = time_elapsed_sec(&t_cy[0], &t_cy[1]) * 1000.0;
+          double d2hA    = time_elapsed_sec(&t_cy[0], &t_cy[1]) * 1000.0;
           double launchB = time_elapsed_sec(&t_cy[1], &t_cy[2]) * 1000.0;
-          double cpuA    = time_elapsed_sec(&t_cy[2], &t_cy[3]) * 1000.0;
-          double waitB   = time_elapsed_sec(&t_cy[3], &t_cy[4]) * 1000.0;
-          double launchA = time_elapsed_sec(&t_cy[4], &t_cy[5]) * 1000.0;
-          double cpuB    = time_elapsed_sec(&t_cy[5], &t_cy[6]) * 1000.0;
-          double cycle   = time_elapsed_sec(&t_cy[0], &t_cy[6]) * 1000.0;
+          double postA   = time_elapsed_sec(&t_cy[2], &t_cy[3]) * 1000.0;
+          double cpuA    = time_elapsed_sec(&t_cy[3], &t_cy[4]) * 1000.0;
+          double d2hB    = time_elapsed_sec(&t_cy[4], &t_cy[5]) * 1000.0;
+          double launchA = time_elapsed_sec(&t_cy[5], &t_cy[6]) * 1000.0;
+          double postB   = time_elapsed_sec(&t_cy[6], &t_cy[7]) * 1000.0;
+          double cpuB    = time_elapsed_sec(&t_cy[7], &t_cy[8]) * 1000.0;
+          double cycle   = time_elapsed_sec(&t_cy[0], &t_cy[8]) * 1000.0;
           log_info(scn->dev,
             "[TIMELINE] step=%llu "
-            "|waitA=%.2fms|launchB=%.2fms|cpuA=%.2fms"
-            "|waitB=%.2fms|launchA=%.2fms|cpuB=%.2fms"
+            "|d2hA=%.2fms|launchB=%.2fms|postA=%.2fms|cpuA=%.2fms"
+            "|d2hB=%.2fms|launchA=%.2fms|postB=%.2fms|cpuB=%.2fms"
             "|cycle=%.2fms raysA=%llu raysB=%llu\n",
             (unsigned long long)pool.total_steps,
-            waitA, launchB, cpuA,
-            waitB, launchA, cpuB,
+            d2hA, launchB, postA, cpuA,
+            d2hB, launchA, postB, cpuB,
             cycle,
             (unsigned long long)pv_a->ray_count,
             (unsigned long long)pv_b->ray_count);
