@@ -25,6 +25,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <star/s3dut.h>
 #include <rsys/mem_allocator.h>
@@ -250,6 +251,103 @@ main(int argc, char** argv)
 
   CHK(pass);
   printf("WF-E3: PASS\n");
+
+  /* ---- CSV output: time sweep + x sweep ---- */
+  {
+    FILE* csv = csv_open("E3");
+    static const double e3_times[] = {
+      0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0,
+      50.0, 100.0, 200.0, 500.0, 1000.0
+    };
+    static const double e3_xs[] = {
+      -0.45, -0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.45
+    };
+    size_t e3_ntimes = sizeof(e3_times) / sizeof(double);
+    size_t e3_nxs    = sizeof(e3_xs) / sizeof(double);
+    size_t ti, xi;
+
+    /* Record the already-computed t=5 result */
+    csv_row(csv, "E3", "t=5.0", "gpu_wf", "DS",
+            pos[0], pos[1], pos[2], time,
+            1, E3_NREALS, mc_wf.E, mc_wf.SE, ref);
+
+    /* Time sweep at fixed position (0.2, 0.3, 0.4) */
+    fprintf(stdout, "\n  CSV time sweep at (%.1f, %.1f, %.1f) ...\n",
+      pos[0], pos[1], pos[2]);
+    for(ti = 0; ti < e3_ntimes; ti++) {
+      struct sdis_solve_probe_args targs = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+      struct sdis_estimator* est_t = NULL;
+      struct sdis_mc mc_t;
+      double ref_t;
+      char sub[32];
+
+      if(fabs(e3_times[ti] - time) < 0.01) continue;
+
+      targs.nrealisations = E3_NREALS;
+      targs.position[0] = pos[0];
+      targs.position[1] = pos[1];
+      targs.position[2] = pos[2];
+      targs.time_range[0] = e3_times[ti];
+      targs.time_range[1] = e3_times[ti];
+      targs.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
+
+      OK(sdis_solve_persistent_wavefront_probe(scn, &targs, &est_t));
+      OK(sdis_estimator_get_temperature(est_t, &mc_t));
+
+      ref_t = e3_temperature(pos, e3_times[ti]);
+
+      sprintf(sub, "t=%.1f", e3_times[ti]);
+      csv_row(csv, "E3", sub, "gpu_wf", "DS",
+              pos[0], pos[1], pos[2], e3_times[ti],
+              1, E3_NREALS, mc_t.E, mc_t.SE, ref_t);
+
+      fprintf(stdout, "  t=%5.1f  wf=%.6f (SE=%.2e)  ref=%.6f\n",
+              e3_times[ti], mc_t.E, mc_t.SE, ref_t);
+
+      OK(sdis_estimator_ref_put(est_t));
+    }
+
+    /* X sweep at t=5, y=0.3, z=0.4 */
+    fprintf(stdout, "\n  CSV x sweep at t=%.1f, y=%.1f, z=%.1f ...\n",
+      time, pos[1], pos[2]);
+    for(xi = 0; xi < e3_nxs; xi++) {
+      double xp[3];
+      struct sdis_solve_probe_args xargs = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+      struct sdis_estimator* est_x = NULL;
+      struct sdis_mc mc_x;
+      double ref_x;
+      char sub[32];
+
+      xp[0] = e3_xs[xi]; xp[1] = pos[1]; xp[2] = pos[2];
+
+      if(fabs(xp[0] - pos[0]) < 0.01) continue;
+
+      xargs.nrealisations = E3_NREALS;
+      xargs.position[0] = xp[0];
+      xargs.position[1] = xp[1];
+      xargs.position[2] = xp[2];
+      xargs.time_range[0] = time;
+      xargs.time_range[1] = time;
+      xargs.diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
+
+      OK(sdis_solve_persistent_wavefront_probe(scn, &xargs, &est_x));
+      OK(sdis_estimator_get_temperature(est_x, &mc_x));
+
+      ref_x = e3_temperature(xp, time);
+
+      sprintf(sub, "x=%.1f", xp[0]);
+      csv_row(csv, "E3", sub, "gpu_wf", "DS",
+              xp[0], xp[1], xp[2], time,
+              1, E3_NREALS, mc_x.E, mc_x.SE, ref_x);
+
+      fprintf(stdout, "  x=%5.1f  wf=%.6f (SE=%.2e)  ref=%.6f\n",
+              xp[0], mc_x.E, mc_x.SE, ref_x);
+
+      OK(sdis_estimator_ref_put(est_x));
+    }
+
+    csv_close(csv);
+  }
 
   /* ---- Cleanup ---- */
   OK(sdis_estimator_ref_put(est_wf));

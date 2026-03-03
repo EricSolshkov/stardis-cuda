@@ -17,6 +17,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <rsys/mem_allocator.h>
 #include <stdio.h>
@@ -41,8 +42,15 @@
 #define D1_NREALS  100000  /* convection needs higher count */
 #define D1_NPROBES 5
 
+#define D1_TF0    280.0   /* initial fluid temperature [K] */
+#define D1_NU     (6.0 * D1_H / (D1_RHO * D1_CP))  /* = 1.2 /s */
+#define D1_NTIMES 4
+static const double d1_times[D1_NTIMES] = {
+  5.0/6.0, 10.0/6.0, 15.0/6.0, 20.0/6.0
+};
+
 /* ========================================================================== */
-/* Fluid shader (steady-state: T = NONE => MC solves for it)                  */
+/* Fluid shader (returns T_init for t<=0, NONE otherwise)                     */
 /* ========================================================================== */
 static double
 d1_fluid_get_temperature
@@ -50,6 +58,7 @@ d1_fluid_get_temperature
 {
   (void)data;
   CHK(vtx != NULL);
+  if(vtx->time <= 0.0) return D1_TF0;
   return SDIS_TEMPERATURE_NONE;
 }
 
@@ -246,7 +255,51 @@ main(int argc, char** argv)
   {
     struct sdis_solve_probe_args args_arr[D1_NPROBES];
     struct sdis_estimator*       ests[D1_NPROBES];
+    FILE* csv = csv_open("D1");
 
+    /* ---- Transient time sweep at probe_pos[0] ---- */
+    {
+      size_t ti;
+      fprintf(stdout, "  Transient sweep at (%.2f, %.2f, %.2f), %d times ...\n",
+              probe_pos[0][0], probe_pos[0][1], probe_pos[0][2],
+              (int)D1_NTIMES);
+      for(ti = 0; ti < D1_NTIMES; ti++) {
+        struct sdis_solve_probe_args targs;
+        struct sdis_estimator* t_est;
+        struct sdis_mc mc;
+        double t, T_ref;
+
+        t = d1_times[ti];
+        T_ref = D1_TF0 * exp(-D1_NU * t)
+              + D1_TINF * (1.0 - exp(-D1_NU * t));
+
+        targs = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+        targs.nrealisations = D1_NREALS;
+        targs.position[0]   = probe_pos[0][0];
+        targs.position[1]   = probe_pos[0][1];
+        targs.position[2]   = probe_pos[0][2];
+        targs.time_range[0] = t;
+        targs.time_range[1] = t;
+        targs.picard_order  = 1;
+        targs.diff_algo     = SDIS_DIFFUSION_DELTA_SPHERE;
+        t_est = NULL;
+
+        OK(sdis_solve_persistent_wavefront_probe(scn, &targs, &t_est));
+        OK(sdis_estimator_get_temperature(t_est, &mc));
+
+        csv_row(csv, "D1", "transient", "gpu_wf", "DS",
+                probe_pos[0][0], probe_pos[0][1], probe_pos[0][2],
+                t, 1, D1_NREALS, mc.E, mc.SE, T_ref);
+
+        fprintf(stdout, "  t=%.4f  E=%.4f  ref=%.4f  SE=%.4e  sigma=%.2f\n",
+                t, mc.E, T_ref, mc.SE,
+                mc.SE > 1e-15 ? fabs(mc.E - T_ref) / mc.SE : 0.0);
+
+        OK(sdis_estimator_ref_put(t_est));
+      }
+    }
+
+    /* ---- Steady-state batch probes ---- */
     for(i = 0; i < D1_NPROBES; i++) {
       args_arr[i] = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
       args_arr[i].nrealisations = D1_NREALS;
@@ -264,8 +317,15 @@ main(int argc, char** argv)
     for(i = 0; i < D1_NPROBES; i++) {
       double T_ref = D1_TINF;
       struct sdis_estimator *est_df = NULL;
+      struct sdis_mc mc_csv;
 
       n_pass_primary += p0_compare_analytic(ests[i], T_ref, P0_TOL_SIGMA);
+      OK(sdis_estimator_get_temperature(ests[i], &mc_csv));
+
+      csv_row(csv, "D1", "default", "gpu_wf", "DS",
+              probe_pos[i][0], probe_pos[i][1], probe_pos[i][2],
+              INF, 1, D1_NREALS,
+              mc_csv.E, mc_csv.SE, T_ref);
 
       if(P0_ENABLE_DIAG) {
         OK(sdis_solve_probe(scn, &args_arr[i], &est_df));
@@ -278,6 +338,8 @@ main(int argc, char** argv)
       if(est_df)
         OK(sdis_estimator_ref_put(est_df));
     }
+
+    csv_close(csv);
   }
 
   fprintf(stdout, "  Primary:    %d/%d probes pass (%.1f%%)\n",

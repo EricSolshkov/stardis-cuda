@@ -16,6 +16,7 @@
 #include "sdis.h"
 #include "test_sdis_utils.h"
 #include "test_sdis_wf_p0_utils.h"
+#include "test_sdis_csv_utils.h"
 
 #include <rsys/mem_allocator.h>
 #include <stdio.h>
@@ -224,13 +225,55 @@ main(int argc, char** argv)
   OK(sdis_interface_ref_put(interf_adiabatic));
   OK(sdis_interface_ref_put(interf_t0));
 
-  /* ---- Run dual-validation probe sweep ---- */
-  pass = p0_run_probe_sweep(
-    scn, a2_analytic,
-    P0_NPROBES, P0_NREALISATIONS,
-    1,  /* picard_order */
-    SDIS_DIFFUSION_DELTA_SPHERE,
-    0.5, 0.5);
+  /* ---- Run probe sweep with CSV output ---- */
+  {
+    struct sdis_solve_probe_args args_arr[P0_MAX_PROBES_BATCH];
+    struct sdis_estimator* ests[P0_MAX_PROBES_BATCH];
+    int n_pass_primary = 0;
+    size_t i;
+    FILE* csv = csv_open("A2");
+
+    fprintf(stdout, "  Running %d probes (batch), %d realisations each ...\n",
+      P0_NPROBES, P0_NREALISATIONS);
+
+    for(i = 0; i < P0_NPROBES; i++) {
+      double x = 0.05 + (double)i * 0.9 / (double)(P0_NPROBES - 1);
+      args_arr[i] = SDIS_SOLVE_PROBE_ARGS_DEFAULT;
+      args_arr[i].nrealisations = P0_NREALISATIONS;
+      args_arr[i].position[0] = x;
+      args_arr[i].position[1] = 0.5;
+      args_arr[i].position[2] = 0.5;
+      args_arr[i].picard_order = 1;
+      args_arr[i].diff_algo = SDIS_DIFFUSION_DELTA_SPHERE;
+      ests[i] = NULL;
+    }
+
+    OK(sdis_solve_persistent_wavefront_probe_batch(
+      scn, P0_NPROBES, args_arr, ests));
+
+    for(i = 0; i < P0_NPROBES; i++) {
+      double x = args_arr[i].position[0];
+      double T_ref = a2_analytic(x);
+      struct sdis_mc mc;
+
+      n_pass_primary += p0_compare_analytic(ests[i], T_ref, P0_TOL_SIGMA);
+      OK(sdis_estimator_get_temperature(ests[i], &mc));
+
+      csv_row(csv, "A2", "default", "gpu_wf", "DS",
+              x, 0.5, 0.5, INF, 1, P0_NREALISATIONS,
+              mc.E, mc.SE, T_ref);
+
+      p0_print_probe_result(x, ests[i], NULL, T_ref);
+      OK(sdis_estimator_ref_put(ests[i]));
+    }
+
+    csv_close(csv);
+
+    fprintf(stdout, "  Primary: %d/%d probes pass (%.1f%%)\n",
+      n_pass_primary, P0_NPROBES,
+      100.0 * (double)n_pass_primary / (double)P0_NPROBES);
+    pass = (double)n_pass_primary / (double)P0_NPROBES >= P0_PASS_RATE;
+  }
 
   CHK(pass);
   printf("WF-A2: PASS\n");
