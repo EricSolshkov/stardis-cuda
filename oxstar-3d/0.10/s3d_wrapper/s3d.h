@@ -418,6 +418,21 @@ S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_wait(
   const struct s3d_ray_request* requests, size_t nrays,
   struct s3d_hit* hits, struct s3d_batch_trace_stats* stats);
 
+/* L3: sync compute kernel only — no D2H transfer */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_sync_kernel(
+  struct s3d_batch_trace_context* ctx);
+
+/* L3: launch async D2H download — returns immediately */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_start_d2h(
+  struct s3d_batch_trace_context* ctx, size_t nrays);
+
+/* L3: wait for D2H transfer, then CPU post-process + retrace */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_wait_d2h(
+  struct s3d_scene_view* scnview,
+  struct s3d_batch_trace_context* ctx,
+  const struct s3d_ray_request* requests, size_t nrays,
+  struct s3d_hit* hits, struct s3d_batch_trace_stats* stats);
+
 /*******************************************************************************
  * Batch Closest Point API (GPU-accelerated)
  ******************************************************************************/
