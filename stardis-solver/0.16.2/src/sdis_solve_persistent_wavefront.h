@@ -185,6 +185,8 @@ struct pool_view {
   size_t    bucket_radiative_n;
   uint32_t* bucket_conductive;
   size_t    bucket_conductive_n;
+  uint32_t* bucket_other;         /* O2: non-radiative, non-conductive ray paths */
+  size_t    bucket_other_n;
 
   /* ---- Ray buffers ---- */
   struct s3d_ray_request* ray_requests;
@@ -387,6 +389,12 @@ struct wavefront_pool {
   double time_cascade_s;    /* cumulative cascade non-ray time       */
   double time_compact_s;    /* cumulative stream compaction time     */
   double time_harvest_s;    /* cumulative harvest+refill time        */
+  double time_sync_a_s;     /* cumulative SYNC POINT A (dsoa after distribute) */
+  double time_sync_b_s;     /* cumulative SYNC POINT B (dsoa after cascade)    */
+  double time_housekeeping_s; /* cumulative Steps H-L (update/diag/progress)   */
+  double time_trace_cpu_s;  /* trace CPU component (postprocess+retrace) ms→s  */
+  double time_gpu_sync_s;   /* cumulative GPU kernel sync wait (dual-buffer)   */
+  double time_gpu_launch_s; /* cumulative GPU launch+startD2h (dual-buffer)    */
   double time_refill_phase_s; /* wall-clock of refill phase total    */
   double time_drain_phase_s;  /* wall-clock of drain phase total     */
 
