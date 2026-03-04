@@ -418,6 +418,66 @@ S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_wait(
   const struct s3d_ray_request* requests, size_t nrays,
   struct s3d_hit* hits, struct s3d_batch_trace_stats* stats);
 
+/* L3: sync compute kernel only — no D2H transfer */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_sync_kernel(
+  struct s3d_batch_trace_context* ctx);
+
+/* L3: launch async D2H download — returns immediately */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_start_d2h(
+  struct s3d_batch_trace_context* ctx, size_t nrays);
+
+/* L3: wait for D2H transfer, then CPU post-process + retrace */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_wait_d2h(
+  struct s3d_scene_view* scnview,
+  struct s3d_batch_trace_context* ctx,
+  const struct s3d_ray_request* requests, size_t nrays,
+  struct s3d_hit* hits, struct s3d_batch_trace_stats* stats);
+
+/*******************************************************************************
+ * L4: GPU Inline Filter API (Mode A — filtered multi-hit)
+ ******************************************************************************/
+
+/* Per-ray filter data for GPU-side self-intersection / epsilon / enclosure
+ * rejection. Must match FilterPerRayData layout (16 bytes). */
+struct s3d_filter_per_ray {
+  uint32_t hit_from_prim_id;   /* GAS-local prim of origin surface; UINT32_MAX = none */
+  uint32_t hit_from_geom_id;   /* geom_id of origin surface;        UINT32_MAX = none */
+  uint32_t enc_id;             /* ray's current enclosure ID;       UINT32_MAX = skip  */
+  float    epsilon;            /* near-distance self-intersection threshold            */
+};
+
+/* Upload per-shape enclosure IDs (front/back per prim) to GPU.
+ * Must be called before filtered trace; takes effect after rebuild.  */
+S3D_API res_T s3d_scene_view_set_enclosure_data(
+  struct s3d_scene_view* scnview,
+  unsigned int shape_id,
+  const unsigned int* enc_front, const unsigned int* enc_back,
+  size_t num_prims);
+
+/* L4: filtered async launch (Mode A) — GPU filter + single-hit output.
+ * filter_per_ray array [nrays] provides per-ray filter params. */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_filtered_async(
+  struct s3d_scene_view* scnview,
+  struct s3d_batch_trace_context* ctx,
+  const struct s3d_ray_request* requests,
+  const struct s3d_filter_per_ray* filter_per_ray,
+  size_t nrays);
+
+/* L4: sync filtered kernel */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_filtered_sync_kernel(
+  struct s3d_batch_trace_context* ctx);
+
+/* L4: start filtered D2H (downloads HitResult, not MultiHitResult) */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_filtered_start_d2h(
+  struct s3d_batch_trace_context* ctx, size_t nrays);
+
+/* L4: wait filtered D2H, convert to s3d_hit (no retrace needed) */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_filtered_wait_d2h(
+  struct s3d_scene_view* scnview,
+  struct s3d_batch_trace_context* ctx,
+  const struct s3d_ray_request* requests, size_t nrays,
+  struct s3d_hit* hits, struct s3d_batch_trace_stats* stats);
+
 /*******************************************************************************
  * Batch Closest Point API (GPU-accelerated)
  ******************************************************************************/

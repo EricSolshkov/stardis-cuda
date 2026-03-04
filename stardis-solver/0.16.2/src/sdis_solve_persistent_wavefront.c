@@ -130,8 +130,12 @@ pool_view_init(struct pool_view* pv, size_t base, size_t view_size,
   pv->ray_slot_sub = (uint32_t*)calloc(max_rays, sizeof(uint32_t));
   pv->ray_hits     = (struct s3d_hit*)calloc(max_rays, sizeof(struct s3d_hit));
 
+  /* L4: GPU inline filter per-ray data */
+  pv->filter_per_ray = (struct s3d_filter_per_ray*)calloc(
+    max_rays, sizeof(struct s3d_filter_per_ray));
+
   if(!pv->ray_requests || !pv->ray_to_slot
-  || !pv->ray_slot_sub || !pv->ray_hits)
+  || !pv->ray_slot_sub || !pv->ray_hits || !pv->filter_per_ray)
     return RES_MEM_ERR;
 
   /* GPU batch trace context (will hold independent CUDA stream + params) */
@@ -194,6 +198,7 @@ pool_view_destroy(struct pool_view* pv)
   free(pv->ray_to_slot);
   free(pv->ray_slot_sub);
   free(pv->ray_hits);
+  free(pv->filter_per_ray);
 
   if(pv->batch_ctx) s3d_batch_trace_context_destroy(pv->batch_ctx);
 
@@ -1428,6 +1433,29 @@ time_elapsed_sec(const struct time* t0, const struct time* t1)
 
 /* count_path_rays is now static INLINE in persistent_wavefront.h */
 
+/**
+ * fill_filter_per_ray — extract GPU filter data from path_state.
+ * Called for each emitted ray alongside the s3d_ray_request fill.
+ */
+static INLINE void
+fill_filter_per_ray(struct s3d_filter_per_ray* fp,
+                    const struct path_state* p)
+{
+  if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d)) {
+    fp->hit_from_prim_id = p->filter_data_storage.hit_3d.prim.prim_id;
+    fp->hit_from_geom_id = p->filter_data_storage.hit_3d.prim.geom_id;
+    fp->epsilon          = (float)p->filter_data_storage.epsilon;
+    fp->enc_id           = (p->filter_data_storage.scn != NULL)
+                             ? p->filter_data_storage.enc_id
+                             : (uint32_t)0xFFFFFFFFu;
+  } else {
+    fp->hit_from_prim_id = (uint32_t)0xFFFFFFFFu;
+    fp->hit_from_geom_id = (uint32_t)0xFFFFFFFFu;
+    fp->enc_id           = (uint32_t)0xFFFFFFFFu;
+    fp->epsilon          = 0.0f;
+  }
+}
+
 LOCAL_SYM res_T
 pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
                                     struct pool_view* pv)
@@ -1602,6 +1630,8 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
           else
             rr->filter_data = NULL;
 
+          fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
+
           pv->ray_to_slot[ray_idx] = i;
           pv->ray_slot_sub[ray_idx] = 0;
           p->ray_req.batch_idx = (uint32_t)ray_idx;
@@ -1624,6 +1654,8 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
           else
             rr->filter_data = NULL;
           rr->user_id      = i;
+
+          fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
 
           pv->ray_to_slot[ray_idx] = i;
           pv->ray_slot_sub[ray_idx] = 1;
@@ -1650,6 +1682,8 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
             rr->range[1]     = p->ray_req.range[1];
             rr->filter_data  = NULL;
             rr->user_id      = i;
+
+            fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
 
             pv->ray_to_slot[ray_idx] = i;
             pv->ray_slot_sub[ray_idx] = (uint32_t)j;
@@ -1684,6 +1718,8 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
             else
               rr->filter_data = NULL;
             rr->user_id      = i;
+
+            fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
 
             pv->ray_to_slot[ray_idx] = i;
             pv->ray_slot_sub[ray_idx] = (uint32_t)(j + 2);
@@ -2823,39 +2859,47 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
   if(pool->trace_call_count > 0) {
     double avg_batch = (double)pool->trace_batch_size_sum
                      / (double)pool->trace_call_count;
-    double avg_batch_ms = pool->trace_batch_time_ms_sum
-                        / (double)pool->trace_call_count;
+    double avg_kernel_ms = pool->trace_kernel_time_ms_sum
+                         / (double)pool->trace_call_count;
+    double avg_d2h_ms = pool->trace_batch_time_ms_sum
+                      / (double)pool->trace_call_count;
     double avg_post_ms  = pool->trace_post_time_ms_sum
                         / (double)pool->trace_call_count;
-    double total_trace_ms = pool->trace_batch_time_ms_sum
+    double total_trace_ms = pool->trace_kernel_time_ms_sum
+                          + pool->trace_batch_time_ms_sum
                           + pool->trace_post_time_ms_sum
                           + pool->trace_retrace_time_ms_sum;
-    double gpu_pct  = pool->trace_batch_time_ms_sum * 100.0 / total_trace_ms;
+    double kern_pct = pool->trace_kernel_time_ms_sum * 100.0 / total_trace_ms;
+    double d2h_pct  = pool->trace_batch_time_ms_sum * 100.0 / total_trace_ms;
     double post_pct = pool->trace_post_time_ms_sum * 100.0 / total_trace_ms;
     double rtrc_pct = pool->trace_retrace_time_ms_sum * 100.0 / total_trace_ms;
-    double throughput = (double)pool->total_rays_traced
-                      / (pool->trace_batch_time_ms_sum * 1e-3) / 1e6;
+    double tp_kernel = (pool->trace_kernel_time_ms_sum > 0.0)
+                     ? (double)pool->total_rays_traced
+                       / (pool->trace_kernel_time_ms_sum * 1e-3) / 1e6
+                     : 0.0;
 
     log_info(dev,
       "batch trace profiling: calls=%llu  avg_batch=%.0f  "
       "min=%llu  max=%llu\n"
-      "  gpu_kernel+upload: total=%.1fms (%.1f%%)  avg=%.2fms/call\n"
+      "  gpu_kernel:        total=%.1fms (%.1f%%)  avg=%.2fms/call\n"
+      "  d2h_wait:          total=%.1fms (%.1f%%)  avg=%.2fms/call\n"
       "  cpu_postprocess:   total=%.1fms (%.1f%%)  avg=%.2fms/call\n"
       "  fallback_retrace:  total=%.1fms (%.1f%%)  "
       "accepted=%llu  missed=%llu  rejected=%llu\n"
-      "  gpu_throughput: %.1f Mrays/s  (kernel+upload only)\n",
+      "  gpu_throughput: %.1f Mrays/s  (kernel only)\n",
       (unsigned long long)pool->trace_call_count,
       avg_batch,
       (unsigned long long)(pool->trace_batch_size_min == (size_t)-1
                       ? 0 : pool->trace_batch_size_min),
       (unsigned long long)pool->trace_batch_size_max,
-      pool->trace_batch_time_ms_sum, gpu_pct, avg_batch_ms,
+      pool->trace_kernel_time_ms_sum, kern_pct, avg_kernel_ms,
+      pool->trace_batch_time_ms_sum, d2h_pct, avg_d2h_ms,
       pool->trace_post_time_ms_sum, post_pct, avg_post_ms,
       pool->trace_retrace_time_ms_sum, rtrc_pct,
       (unsigned long long)pool->trace_retrace_accepted_sum,
       (unsigned long long)pool->trace_retrace_missed_sum,
       (unsigned long long)pool->trace_filter_rejected_sum,
-      throughput);
+      tp_kernel);
   }
 }
 
@@ -2906,43 +2950,66 @@ gpu_launch_async(struct wavefront_pool* pool, struct pool_view* pv,
                  struct s3d_scene_view* sv)
 {
   res_T res;
-  (void)pool;
 
   if(pv->ray_count == 0) {
     pv->gpu_pending = 0;
     return RES_OK;
   }
 
-  res = s3d_scene_view_trace_rays_batch_ctx_async(
-    sv, pv->batch_ctx, pv->ray_requests, pv->ray_count);
+  if(pool->use_gpu_filter) {
+    res = s3d_scene_view_trace_rays_batch_ctx_filtered_async(
+      sv, pv->batch_ctx, pv->ray_requests,
+      pv->filter_per_ray, pv->ray_count);
+  } else {
+    res = s3d_scene_view_trace_rays_batch_ctx_async(
+      sv, pv->batch_ctx, pv->ray_requests, pv->ray_count);
+  }
   if(res != RES_OK) return res;
   pv->gpu_pending = 1;
   return RES_OK;
 }
 
 /**
- * gpu_wait_and_postprocess — wait for async GPU trace, then distribute
- * ray results, enc_locate, and closest_point batches.
+ * gpu_wait_download — synchronise with async GPU trace and download
+ * results (D2H).  This is the only part that actually blocks on the
+ * GPU; everything after this is pure CPU work.
+ *
+ * Split out from gpu_wait_and_postprocess() so that the opposite pool's
+ * GPU launch can be issued immediately after D2H completes, hiding the
+ * CPU post-processing latency behind GPU execution.
  */
 static res_T
-gpu_wait_and_postprocess(struct wavefront_pool* pool,
-                         struct pool_view* pv,
-                         struct s3d_scene_view* sv,
-                         struct sdis_scene* scn)
+gpu_wait_download(struct wavefront_pool* pool,
+                  struct pool_view* pv,
+                  struct s3d_scene_view* sv)
 {
   struct time t0, t1;
   res_T res;
 
-  /* ---- batch trace wait + postprocess ---- */
+  /* ---- batch trace wait (sync + D2H) ---- */
   time_current(&t0);
   if(pv->ray_count > 0 && pv->gpu_pending) {
     struct s3d_batch_trace_stats stats;
     memset(&stats, 0, sizeof(stats));
 
-    res = s3d_scene_view_trace_rays_batch_ctx_wait(
-      sv, pv->batch_ctx,
-      pv->ray_requests, pv->ray_count,
-      pv->ray_hits, &stats);
+    if(pool->use_gpu_filter) {
+      /* L4: use 3-step filtered path sequentially */
+      res = s3d_scene_view_trace_rays_batch_ctx_filtered_sync_kernel(
+        pv->batch_ctx);
+      if(res != RES_OK) return res;
+      res = s3d_scene_view_trace_rays_batch_ctx_filtered_start_d2h(
+        pv->batch_ctx, pv->ray_count);
+      if(res != RES_OK) return res;
+      res = s3d_scene_view_trace_rays_batch_ctx_filtered_wait_d2h(
+        sv, pv->batch_ctx,
+        pv->ray_requests, pv->ray_count,
+        pv->ray_hits, &stats);
+    } else {
+      res = s3d_scene_view_trace_rays_batch_ctx_wait(
+        sv, pv->batch_ctx,
+        pv->ray_requests, pv->ray_count,
+        pv->ray_hits, &stats);
+    }
     if(res != RES_OK) return res;
     pv->gpu_pending = 0;
 
@@ -2979,6 +3046,24 @@ gpu_wait_and_postprocess(struct wavefront_pool* pool,
   }
   time_current(&t1);
   pool->time_trace_s += time_elapsed_sec(&t0, &t1);
+
+  return RES_OK;
+}
+
+/**
+ * gpu_postprocess — distribute ray results, enc_locate, closest_point
+ * batches, and sync dsoa.  Pure CPU work, no GPU dependency.
+ *
+ * Split out from gpu_wait_and_postprocess() so that it can run while
+ * the opposite pool's GPU trace is already in flight.
+ */
+static res_T
+gpu_postprocess(struct wavefront_pool* pool,
+                struct pool_view* pv,
+                struct sdis_scene* scn)
+{
+  struct time t0, t1;
+  res_T res;
 
   /* ---- distribute ray results ---- */
   time_current(&t0);
@@ -3057,6 +3142,133 @@ gpu_wait_and_postprocess(struct wavefront_pool* pool,
       dispatch_soa_sync_from_path(&pool->dsoa, idx, &pool->slots[idx]);
     }
   }
+
+  return RES_OK;
+}
+
+/**
+ * gpu_wait_and_postprocess — combined wait + postprocess (convenience
+ * wrapper used by merge/drain paths that don't need early-launch).
+ */
+static res_T
+gpu_wait_and_postprocess(struct wavefront_pool* pool,
+                         struct pool_view* pv,
+                         struct s3d_scene_view* sv,
+                         struct sdis_scene* scn)
+{
+  res_T res = gpu_wait_download(pool, pv, sv);
+  if(res != RES_OK) return res;
+  return gpu_postprocess(pool, pv, scn);
+}
+
+/*******************************************************************************
+ * L3: Fine-grained pipeline helper functions (dual-stream)
+ *
+ * Split the old gpu_wait_download into three steps:
+ *   gpu_sync_kernel  — wait for GPU kernel to complete (no D2H)
+ *   gpu_start_d2h    — launch async D2H download (returns immediately)
+ *   gpu_wait_d2h     — wait for D2H, then CPU filter/retrace + stats
+ *
+ * This allows overlapping D2H(A) with H2D(B)+kernel(B) on the bus.
+ ******************************************************************************/
+
+/**
+ * gpu_sync_kernel — wait for GPU compute kernel to finish (no data transfer).
+ * Measures wall-clock wait time and accumulates into pool->trace_kernel_time_ms_sum.
+ */
+static res_T
+gpu_sync_kernel(struct wavefront_pool* pool, struct pool_view* pv)
+{
+  struct time k0, k1;
+  res_T rc;
+  if(pv->ray_count == 0 || !pv->gpu_pending) return RES_OK;
+  time_current(&k0);
+  if(pool->use_gpu_filter)
+    rc = s3d_scene_view_trace_rays_batch_ctx_filtered_sync_kernel(
+      pv->batch_ctx);
+  else
+    rc = s3d_scene_view_trace_rays_batch_ctx_sync_kernel(pv->batch_ctx);
+  time_current(&k1);
+  pool->trace_kernel_time_ms_sum += time_elapsed_sec(&k0, &k1) * 1000.0;
+  return rc;
+}
+
+/**
+ * gpu_start_d2h — launch async D2H download on transfer_stream.
+ * Returns immediately.  Caller must call gpu_wait_d2h() before reading.
+ */
+static res_T
+gpu_start_d2h(struct wavefront_pool* pool, struct pool_view* pv)
+{
+  if(pv->ray_count == 0 || !pv->gpu_pending) return RES_OK;
+  if(pool->use_gpu_filter)
+    return s3d_scene_view_trace_rays_batch_ctx_filtered_start_d2h(
+      pv->batch_ctx, pv->ray_count);
+  return s3d_scene_view_trace_rays_batch_ctx_start_d2h(
+    pv->batch_ctx, pv->ray_count);
+}
+
+/**
+ * gpu_wait_d2h — wait for D2H transfer, CPU filter/retrace, accumulate stats.
+ * Replaces gpu_wait_download() in the L3 pipeline.
+ * L4: when use_gpu_filter, calls the filtered wait (no retrace).
+ */
+static res_T
+gpu_wait_d2h(struct wavefront_pool* pool,
+             struct pool_view* pv,
+             struct s3d_scene_view* sv)
+{
+  struct time t0, t1;
+  res_T res;
+
+  time_current(&t0);
+  if(pv->ray_count > 0 && pv->gpu_pending) {
+    struct s3d_batch_trace_stats stats;
+    memset(&stats, 0, sizeof(stats));
+
+    if(pool->use_gpu_filter) {
+      res = s3d_scene_view_trace_rays_batch_ctx_filtered_wait_d2h(
+        sv, pv->batch_ctx,
+        pv->ray_requests, pv->ray_count,
+        pv->ray_hits, &stats);
+    } else {
+      res = s3d_scene_view_trace_rays_batch_ctx_wait_d2h(
+        sv, pv->batch_ctx,
+        pv->ray_requests, pv->ray_count,
+        pv->ray_hits, &stats);
+    }
+    if(res != RES_OK) return res;
+    pv->gpu_pending = 0;
+
+    pool->total_rays_traced += pv->ray_count;
+
+    /* Promote per-view pending ray stats to pool-level counters */
+    {
+      pool->rays_radiative           += pv->pending_rays_radiative;
+      pool->rays_conductive_ds       += pv->pending_rays_conductive_ds;
+      pool->rays_conductive_ds_retry += pv->pending_rays_conductive_ds_retry;
+      pool->rays_shadow              += pv->pending_rays_shadow;
+      pool->rays_enclosure           += pv->pending_rays_enclosure;
+      pool->rays_startup             += pv->pending_rays_startup;
+      pool->rays_other               += pv->pending_rays_other;
+    }
+
+    pool->trace_call_count++;
+    pool->trace_batch_size_sum   += pv->ray_count;
+    pool->trace_batch_time_ms_sum  += stats.batch_time_ms;
+    pool->trace_post_time_ms_sum   += stats.postprocess_time_ms;
+    pool->trace_retrace_time_ms_sum += stats.retrace_time_ms;
+    pool->trace_retrace_accepted_sum += stats.retrace_accepted;
+    pool->trace_retrace_missed_sum   += stats.retrace_missed;
+    pool->trace_filter_rejected_sum  += stats.filter_rejected;
+
+    if(pv->ray_count < pool->trace_batch_size_min)
+      pool->trace_batch_size_min = pv->ray_count;
+    if(pv->ray_count > pool->trace_batch_size_max)
+      pool->trace_batch_size_max = pv->ray_count;
+  }
+  time_current(&t1);
+  pool->time_trace_s += time_elapsed_sec(&t0, &t1);
 
   return RES_OK;
 }
@@ -3540,6 +3752,22 @@ solve_camera_persistent_wavefront(
   pool.picard_order = picard_order;
   pool.diff_algo    = diff_algo;
 
+  /* ====== 5b. L4: Enable GPU inline filter (Mode A) ====== */
+  /* When set, gpu_launch_async/gpu_sync_kernel/gpu_start_d2h/gpu_wait_d2h
+   * use the filtered trace path that does hit filtering on the GPU,
+   * eliminating the CPU retrace bottleneck (~48% of postprocess time).
+   * Filter ③ (enclosure boundary) requires per-shape enclosure data
+   * upload via s3d_scene_view_set_enclosure_data(); without it, only
+   * filters ①(self-intersection) and ②(near-epsilon) are active. */
+  pool.use_gpu_filter = 1;
+
+  /* TODO(L4): Upload per-shape enclosure arrays to GPU for filter ③.
+   * Requires iterating scn->prim_props per shape, extracting
+   * front_enclosure/back_enclosure arrays, and calling
+   * s3d_scene_view_set_enclosure_data(scn->s3d_view, shape_id,
+   *   enc_front, enc_back, num_prims) for each shape.
+   * Without this, filter ③ is safely skipped (enc_front==NULL). */
+
   /* ====== 6. Fill pool with initial tasks ====== */
   res = fill_pool(&pool);
   if(res != RES_OK) goto cleanup;
@@ -3577,25 +3805,50 @@ solve_camera_persistent_wavefront(
 
     while(pool.active_count > 0 || pool.task_next < pool.task_count) {
       struct time t_pl0, t_pl1;
-      /* P4 timeline: 7 timestamps spanning one full A+B cycle
-       * [0]=start [1]=waitA [2]=launchB [3]=cpuA [4]=waitB [5]=launchA [6]=cpuB */
-      struct time t_cy[7];
+      /* L3 timeline: 11 timestamps spanning one full A+B cycle (dual-stream)
+       * [0]=start
+       * [1]=syncKernA [2]=startD2hA [3]=launchB [4]=waitD2hA [5]=postA [6]=cpuA
+       * [7]=syncKernB [8]=startD2hB [9]=launchA [10]=waitD2hB [11]=postB [12]=cpuB
+       */
+      struct time t_cy[13];
 
-      /* ════════ Phase 1: wait GPU(A) → launch GPU(B) → CPU on A ════════ */
+      /* ════════ Phase 1: syncK(A) → d2h↓(A) → launch(B) → waitD2h(A) → post(A) → CPU(A) ════════ */
       time_current(&t_cy[0]);
+
+      /* 1a. Sync compute kernel only (no D2H yet) */
+      res = gpu_sync_kernel(&pool, pv_a);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_cy[1]);  /* after syncKernel(A) */
+
+      /* 1b. Start async D2H — returns immediately */
+      res = gpu_start_d2h(&pool, pv_a);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_cy[2]);  /* after startD2h(A) */
+
+      /* 1c. Launch GPU(B) — H2D(B) + kernel(B) overlap with D2H(A) */
+      res = gpu_launch_async(&pool, pv_b, scn->s3d_view);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_cy[3]);  /* after launch(B) */
+
+      /* 1d. Wait D2H(A) + CPU filter/retrace */
       time_current(&t_pl0);
-      res = gpu_wait_and_postprocess(&pool, pv_a, scn->s3d_view, scn);
+      res = gpu_wait_d2h(&pool, pv_a, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
       time_current(&t_pl1);
       pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[1] = t_pl1;  /* after wait(A) */
+      t_cy[4] = t_pl1;  /* after waitD2h(A) */
 
-      res = gpu_launch_async(&pool, pv_b, scn->s3d_view);
+      /* 1e. CPU postprocess on A (distribute + enc_locate + cp + dsoa_sync) */
+      time_current(&t_pl0);
+      res = gpu_postprocess(&pool, pv_a, scn);
       if(res != RES_OK) goto cleanup;
-      time_current(&t_cy[2]);  /* after launch(B) */
+      time_current(&t_pl1);
+      pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
+      t_cy[5] = t_pl1;  /* after post(A) */
 
       pool.total_steps++;  /* view A completed one step */
 
+      /* 1f. CPU cascade + harvest + refill + pre_gpu on A */
       time_current(&t_pl0);
       res = cpu_between(&pool, pv_a);
       if(res != RES_OK) goto cleanup;
@@ -3603,7 +3856,7 @@ solve_camera_persistent_wavefront(
       if(res != RES_OK) goto cleanup;
       time_current(&t_pl1);
       pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[3] = t_pl1;  /* after cpu(A) */
+      t_cy[6] = t_pl1;  /* after cpu(A) */
 
       /* -- Housekeeping after A's step -- */
       pool_update_active_count(&pool);
@@ -3672,20 +3925,42 @@ solve_camera_persistent_wavefront(
         goto cleanup;
       }
 
-      /* ════════ Phase 2: wait GPU(B) → launch GPU(A) → CPU on B ════════ */
+      /* ════════ Phase 2: syncK(B) → d2h↓(B) → launch(A) → waitD2h(B) → post(B) → CPU(B) ════════ */
+
+      /* 2a. Sync compute kernel only (no D2H yet) */
+      res = gpu_sync_kernel(&pool, pv_b);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_cy[7]);  /* after syncKernel(B) */
+
+      /* 2b. Start async D2H — returns immediately */
+      res = gpu_start_d2h(&pool, pv_b);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_cy[8]);  /* after startD2h(B) */
+
+      /* 2c. Launch GPU(A) — H2D(A) + kernel(A) overlap with D2H(B) */
+      res = gpu_launch_async(&pool, pv_a, scn->s3d_view);
+      if(res != RES_OK) goto cleanup;
+      time_current(&t_cy[9]);  /* after launch(A) */
+
+      /* 2d. Wait D2H(B) + CPU filter/retrace */
       time_current(&t_pl0);
-      res = gpu_wait_and_postprocess(&pool, pv_b, scn->s3d_view, scn);
+      res = gpu_wait_d2h(&pool, pv_b, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
       time_current(&t_pl1);
       pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[4] = t_pl1;  /* after wait(B) */
+      t_cy[10] = t_pl1;  /* after waitD2h(B) */
 
-      res = gpu_launch_async(&pool, pv_a, scn->s3d_view);
+      /* 2e. CPU postprocess on B */
+      time_current(&t_pl0);
+      res = gpu_postprocess(&pool, pv_b, scn);
       if(res != RES_OK) goto cleanup;
-      time_current(&t_cy[5]);  /* after launch(A) */
+      time_current(&t_pl1);
+      pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
+      t_cy[11] = t_pl1;  /* after post(B) */
 
       pool.total_steps++;  /* view B completed one step */
 
+      /* 2f. CPU cascade + harvest + refill + pre_gpu on B */
       time_current(&t_pl0);
       res = cpu_between(&pool, pv_b);
       if(res != RES_OK) goto cleanup;
@@ -3693,7 +3968,7 @@ solve_camera_persistent_wavefront(
       if(res != RES_OK) goto cleanup;
       time_current(&t_pl1);
       pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[6] = t_pl1;  /* after cpu(B) */
+      t_cy[12] = t_pl1;  /* after cpu(B) */
 
       /* -- Housekeeping after B's step -- */
       pool_update_active_count(&pool);
@@ -3762,26 +4037,32 @@ solve_camera_persistent_wavefront(
         goto cleanup;
       }
 
-      /* ════════ P4 Timeline output (STARDIS_PIPELINE_LOG=2) ════════ */
+      /* ════════ L3 Timeline output (STARDIS_PIPELINE_LOG=2) ════════ */
       {
         const char* env_tl = getenv("STARDIS_PIPELINE_LOG");
         env_tl="2";
         if(env_tl && env_tl[0] == '2' && pool.total_steps % 500 == 0) {
-          double waitA   = time_elapsed_sec(&t_cy[0], &t_cy[1]) * 1000.0;
-          double launchB = time_elapsed_sec(&t_cy[1], &t_cy[2]) * 1000.0;
-          double cpuA    = time_elapsed_sec(&t_cy[2], &t_cy[3]) * 1000.0;
-          double waitB   = time_elapsed_sec(&t_cy[3], &t_cy[4]) * 1000.0;
-          double launchA = time_elapsed_sec(&t_cy[4], &t_cy[5]) * 1000.0;
-          double cpuB    = time_elapsed_sec(&t_cy[5], &t_cy[6]) * 1000.0;
-          double cycle   = time_elapsed_sec(&t_cy[0], &t_cy[6]) * 1000.0;
+          double syncKA   = time_elapsed_sec(&t_cy[0],  &t_cy[1])  * 1000.0;
+          double startDA  = time_elapsed_sec(&t_cy[1],  &t_cy[2])  * 1000.0;
+          double launchB  = time_elapsed_sec(&t_cy[2],  &t_cy[3])  * 1000.0;
+          double waitDA   = time_elapsed_sec(&t_cy[3],  &t_cy[4])  * 1000.0;
+          double postA    = time_elapsed_sec(&t_cy[4],  &t_cy[5])  * 1000.0;
+          double cpuA     = time_elapsed_sec(&t_cy[5],  &t_cy[6])  * 1000.0;
+          double syncKB   = time_elapsed_sec(&t_cy[6],  &t_cy[7])  * 1000.0;
+          double startDB  = time_elapsed_sec(&t_cy[7],  &t_cy[8])  * 1000.0;
+          double launchA  = time_elapsed_sec(&t_cy[8],  &t_cy[9])  * 1000.0;
+          double waitDB   = time_elapsed_sec(&t_cy[9],  &t_cy[10]) * 1000.0;
+          double postB    = time_elapsed_sec(&t_cy[10], &t_cy[11]) * 1000.0;
+          double cpuB     = time_elapsed_sec(&t_cy[11], &t_cy[12]) * 1000.0;
+          double cycle    = time_elapsed_sec(&t_cy[0],  &t_cy[12]) * 1000.0;
           log_info(scn->dev,
             "[TIMELINE] step=%llu "
-            "|waitA=%.2fms|launchB=%.2fms|cpuA=%.2fms"
-            "|waitB=%.2fms|launchA=%.2fms|cpuB=%.2fms"
+            "|syncKA=%.2f|startDA=%.2f|launchB=%.2f|waitDA=%.2f|postA=%.2f|cpuA=%.2f"
+            "|syncKB=%.2f|startDB=%.2f|launchA=%.2f|waitDB=%.2f|postB=%.2f|cpuB=%.2f"
             "|cycle=%.2fms raysA=%llu raysB=%llu\n",
             (unsigned long long)pool.total_steps,
-            waitA, launchB, cpuA,
-            waitB, launchA, cpuB,
+            syncKA, startDA, launchB, waitDA, postA, cpuA,
+            syncKB, startDB, launchA, waitDB, postB, cpuB,
             cycle,
             (unsigned long long)pv_a->ray_count,
             (unsigned long long)pv_b->ray_count);
@@ -3873,17 +4154,42 @@ solve_camera_persistent_wavefront(
     time_current(&t_phase1);
     pool.time_collect_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
-    /* Step C: Batch trace via Phase B-1 */
+    /* Step C: Batch trace via Phase B-1 (or L4 filtered path) */
     time_current(&t_phase0);
     if(pv->ray_count > 0) {
       struct s3d_batch_trace_stats stats;
       memset(&stats, 0, sizeof(stats));
 
-      res = s3d_scene_view_trace_rays_batch_ctx(
-        scn->s3d_view, pv->batch_ctx,
-        pv->ray_requests, pv->ray_count,
-        pv->ray_hits, &stats);
-      if(res != RES_OK) goto cleanup;
+      if(pool.use_gpu_filter) {
+        /* L4: single-pool filtered trace (sync 3-step) */
+        res = s3d_scene_view_trace_rays_batch_ctx_filtered_async(
+          scn->s3d_view, pv->batch_ctx, pv->ray_requests,
+          pv->filter_per_ray, pv->ray_count);
+        if(res != RES_OK) goto cleanup;
+        {
+          struct time k0, k1;
+          time_current(&k0);
+          res = s3d_scene_view_trace_rays_batch_ctx_filtered_sync_kernel(
+            pv->batch_ctx);
+          if(res != RES_OK) goto cleanup;
+          time_current(&k1);
+          pool.trace_kernel_time_ms_sum += time_elapsed_sec(&k0, &k1) * 1000.0;
+        }
+        res = s3d_scene_view_trace_rays_batch_ctx_filtered_start_d2h(
+          pv->batch_ctx, pv->ray_count);
+        if(res != RES_OK) goto cleanup;
+        res = s3d_scene_view_trace_rays_batch_ctx_filtered_wait_d2h(
+          scn->s3d_view, pv->batch_ctx,
+          pv->ray_requests, pv->ray_count,
+          pv->ray_hits, &stats);
+        if(res != RES_OK) goto cleanup;
+      } else {
+        res = s3d_scene_view_trace_rays_batch_ctx(
+          scn->s3d_view, pv->batch_ctx,
+          pv->ray_requests, pv->ray_count,
+          pv->ray_hits, &stats);
+        if(res != RES_OK) goto cleanup;
+      }
 
       pool.total_rays_traced += pv->ray_count;
 
@@ -4267,6 +4573,9 @@ solve_persistent_wavefront_probe(
   pool.picard_order = picard_order;
   pool.diff_algo    = diff_algo;
 
+  /* L4: GPU inline filter (Mode A) — see camera solver for docs */
+  pool.use_gpu_filter = 1;
+
   /* ====== 6. Fill pool ====== */
   res = fill_pool(&pool);
   if(res != RES_OK) goto cleanup;
@@ -4406,6 +4715,9 @@ solve_persistent_wavefront_probe_batch(
   pool.time_range   = time_range;
   pool.picard_order = picard_order;
   pool.diff_algo    = diff_algo;
+
+  /* L4: GPU inline filter (Mode A) — see camera solver for docs */
+  pool.use_gpu_filter = 1;
 
   /* ====== 6. Fill pool ====== */
   res = fill_pool(&pool);

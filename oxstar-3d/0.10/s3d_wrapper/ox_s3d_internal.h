@@ -270,11 +270,18 @@ struct s3d_batch_trace_context {
     CudaBuffer<MultiHitResult>  d_multi_hits;
 
     /* === P0: async support === */
-    cudaStream_t                stream;          /* per-ctx CUDA stream */
-    std::vector<Ray>            host_rays;       /* pre-allocated host staging */
-    std::vector<MultiHitResult> host_mhits;      /* pre-allocated host staging */
+    cudaStream_t                compute_stream;  /* kernel execution stream */
     bool                        async_pending;   /* async operation in flight */
     size_t                      async_nrays;     /* ray count for current async */
+
+    /* === L3: dual-stream + pinned memory === */
+    cudaStream_t                transfer_stream; /* D2H download stream */
+    cudaEvent_t                 evt_upload_done; /* H2D upload completed */
+    cudaEvent_t                 evt_kernel_done; /* kernel completed */
+    Ray*                        h_rays_pinned;   /* pinned host staging (rays) */
+    MultiHitResult*             h_mhits_pinned;  /* pinned host staging (hits) */
+    size_t                      pinned_capacity; /* allocated pinned count */
+    bool                        d2h_pending;     /* D2H transfer in flight */
 
     /* === P1 placeholder: per-ctx launch params + retrace buffers === */
     CUdeviceptr                 params_ptr;      /* per-ctx params device mem */
@@ -282,19 +289,41 @@ struct s3d_batch_trace_context {
     CudaBuffer<Ray>             rt_d_rays;       /* retrace buffer (per-ctx) */
     CudaBuffer<MultiHitResult>  rt_d_mhits;      /* retrace buffer (per-ctx) */
 
+    /* === L4: GPU inline filter (Mode A) === */
+    CudaBuffer<FilterPerRayData> d_filter_data;  /* per-ray filter input     */
+    CudaBuffer<HitResult>        d_hits_filtered; /* single-hit output        */
+    FilterPerRayData*            h_filter_pinned; /* pinned host (filter H2D) */
+    HitResult*                   h_hits_pinned;   /* pinned host (hits D2H)   */
+
     s3d_batch_trace_context(size_t max)
         : max_rays(max)
-        , stream(nullptr)
+        , compute_stream(nullptr)
         , async_pending(false)
         , async_nrays(0)
+        , transfer_stream(nullptr)
+        , evt_upload_done(nullptr)
+        , evt_kernel_done(nullptr)
+        , h_rays_pinned(nullptr)
+        , h_mhits_pinned(nullptr)
+        , pinned_capacity(max)
+        , d2h_pending(false)
         , params_ptr(0)
         , params_allocated(false)
+        , h_filter_pinned(nullptr)
+        , h_hits_pinned(nullptr)
     {
         d_rays.alloc(static_cast<unsigned int>(max));
         d_multi_hits.alloc(static_cast<unsigned int>(max));
-        CUDA_CHECK(cudaStreamCreate(&stream));
-        host_rays.reserve(max);
-        host_mhits.reserve(max);
+        d_filter_data.alloc(static_cast<unsigned int>(max));
+        d_hits_filtered.alloc(static_cast<unsigned int>(max));
+        CUDA_CHECK(cudaStreamCreate(&compute_stream));
+        CUDA_CHECK(cudaStreamCreate(&transfer_stream));
+        CUDA_CHECK(cudaEventCreateWithFlags(&evt_upload_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&evt_kernel_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaHostAlloc(&h_rays_pinned,   max * sizeof(Ray),             cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&h_mhits_pinned,  max * sizeof(MultiHitResult),  cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&h_filter_pinned,  max * sizeof(FilterPerRayData), cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&h_hits_pinned,    max * sizeof(HitResult),        cudaHostAllocDefault));
     }
 
     ~s3d_batch_trace_context() {
@@ -302,10 +331,14 @@ struct s3d_batch_trace_context {
             cudaFree(reinterpret_cast<void*>(params_ptr));
             params_ptr = 0;
         }
-        if (stream) {
-            cudaStreamDestroy(stream);
-            stream = nullptr;
-        }
+        if (h_rays_pinned)   { cudaFreeHost(h_rays_pinned);   h_rays_pinned   = nullptr; }
+        if (h_mhits_pinned)  { cudaFreeHost(h_mhits_pinned);  h_mhits_pinned  = nullptr; }
+        if (h_filter_pinned) { cudaFreeHost(h_filter_pinned);  h_filter_pinned = nullptr; }
+        if (h_hits_pinned)   { cudaFreeHost(h_hits_pinned);    h_hits_pinned   = nullptr; }
+        if (evt_upload_done) { cudaEventDestroy(evt_upload_done); evt_upload_done = nullptr; }
+        if (evt_kernel_done) { cudaEventDestroy(evt_kernel_done); evt_kernel_done = nullptr; }
+        if (transfer_stream) { cudaStreamDestroy(transfer_stream); transfer_stream = nullptr; }
+        if (compute_stream)  { cudaStreamDestroy(compute_stream);  compute_stream  = nullptr; }
     }
 
     /* Non-copyable */
