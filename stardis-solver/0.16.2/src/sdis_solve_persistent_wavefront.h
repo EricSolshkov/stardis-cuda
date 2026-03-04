@@ -194,6 +194,9 @@ struct pool_view {
   size_t                   ray_count;
   size_t                   max_rays;      /* capacity * 6 */
 
+  /* ---- L4: GPU inline filter per-ray data ---- */
+  struct s3d_filter_per_ray* filter_per_ray;
+
   /* ---- Ray bucket offsets ---- */
   size_t bucket_offsets[RAY_BUCKET_COUNT + 1];
   size_t bucket_counts[RAY_BUCKET_COUNT];
@@ -398,7 +401,8 @@ struct wavefront_pool {
   size_t cascade_total_iterations;              /* total inner-loop iterations  */
 
   /* === Experiment 7: Batch trace per-call timing === */
-  double trace_batch_time_ms_sum;    /* sum of batch_time_ms   */
+  double trace_kernel_time_ms_sum;   /* sum of gpu_sync_kernel wait time */
+  double trace_batch_time_ms_sum;    /* sum of batch_time_ms (D2H wait)  */
   double trace_post_time_ms_sum;     /* sum of postprocess_time_ms */
   double trace_retrace_time_ms_sum;  /* sum of retrace_time_ms */
   size_t trace_call_count;           /* number of batch trace calls */
@@ -417,6 +421,9 @@ struct wavefront_pool {
   double time_pipeline_cpu_pre_s;
   double time_pipeline_cpu_between_s;
   double time_pipeline_gpu_idle_s;
+
+  /* === L4: GPU inline filter mode === */
+  int use_gpu_filter;  /* 1 = filtered trace (Mode A), 0 = legacy retrace */
 };
 
 /*******************************************************************************

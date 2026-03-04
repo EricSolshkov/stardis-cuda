@@ -2489,6 +2489,280 @@ res_T s3d_scene_view_trace_rays_batch_ctx_wait_d2h(
                                       hits, stats);
 }
 
+/* ===========================================================================
+ * L4: GPU Inline Filter (Mode A) — filtered async/sync/d2h pipeline
+ * No CPU filter, no retrace. GPU does inline ①②③ checks in any-hit.
+ * Output is HitResult (40B/ray) instead of MultiHitResult (120B/ray).
+ * =========================================================================*/
+
+/* L4: filtered async launch — uploads rays + filter data, launches filtered kernel */
+static res_T batch_trace_filtered_async_impl(
+    s3d_scene_view* sv,
+    s3d_batch_trace_context* ctx,
+    const s3d_ray_request* requests,
+    const s3d_filter_per_ray* filter_per_ray,
+    size_t nrays)
+{
+    res_T rc = ensure_built(sv);
+    if (rc != RES_OK) return rc;
+
+    if (!sv->has_geometry || nrays == 0) {
+        ctx->async_pending = false;
+        ctx->async_nrays   = nrays;
+        return RES_OK;
+    }
+
+    /* AoS → SoA ray conversion into pinned staging + copy filter data */
+    for (size_t i = 0; i < nrays; i++) {
+        ctx->h_rays_pinned[i].origin    = make_float3(
+            requests[i].origin[0], requests[i].origin[1], requests[i].origin[2]);
+        ctx->h_rays_pinned[i].direction = make_float3(
+            requests[i].direction[0], requests[i].direction[1], requests[i].direction[2]);
+        ctx->h_rays_pinned[i].tmin      = requests[i].range[0];
+        ctx->h_rays_pinned[i].tmax      = requests[i].range[1];
+    }
+
+    /* Copy filter per-ray data to pinned staging (same layout as FilterPerRayData) */
+    static_assert(sizeof(s3d_filter_per_ray) == sizeof(FilterPerRayData),
+                  "s3d_filter_per_ray must match FilterPerRayData layout");
+    memcpy(ctx->h_filter_pinned, filter_per_ray, nrays * sizeof(FilterPerRayData));
+
+    /* H2D uploads on transfer_stream */
+    unsigned int count = static_cast<unsigned int>(nrays);
+    ctx->d_rays.uploadAsync(ctx->h_rays_pinned, count, ctx->transfer_stream);
+    ctx->d_filter_data.uploadAsync(
+        reinterpret_cast<FilterPerRayData*>(ctx->h_filter_pinned),
+        count, ctx->transfer_stream);
+    CUDA_CHECK(cudaEventRecord(ctx->evt_upload_done, ctx->transfer_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->compute_stream, ctx->evt_upload_done, 0));
+
+    /* Ensure per-ctx params buffer */
+    if (!ctx->params_allocated) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ctx->params_ptr),
+                              sizeof(UnifiedParams)));
+        ctx->params_allocated = true;
+    }
+
+    /* L4: filtered kernel launch on compute_stream */
+    sv->tracer.traceBatchMultiHitFiltered(
+        ctx->d_rays.get(),
+        ctx->d_hits_filtered.get(),
+        ctx->d_multi_hits.get(),         /* device scratch for any-hit Top-K */
+        ctx->d_filter_data.get(),
+        count,
+        ctx->compute_stream,
+        ctx->params_ptr);
+    CUDA_CHECK(cudaEventRecord(ctx->evt_kernel_done, ctx->compute_stream));
+
+    ctx->async_pending = true;
+    ctx->async_nrays   = nrays;
+    return RES_OK;
+}
+
+/* L4: sync filtered compute kernel */
+static res_T batch_trace_filtered_sync_kernel_impl(
+    s3d_batch_trace_context* ctx)
+{
+    if (ctx->async_pending) {
+        cudaStreamSynchronize(ctx->compute_stream);
+        ctx->async_pending = false;
+    }
+    return RES_OK;
+}
+
+/* L4: start filtered D2H — downloads HitResult (40B/ray) */
+static res_T batch_trace_filtered_start_d2h_impl(
+    s3d_batch_trace_context* ctx,
+    size_t nrays)
+{
+    if (nrays == 0) { ctx->d2h_pending = false; return RES_OK; }
+    unsigned int count = static_cast<unsigned int>(nrays);
+    ctx->d_hits_filtered.downloadAsync(
+        reinterpret_cast<HitResult*>(ctx->h_hits_pinned),
+        count, ctx->transfer_stream);
+    ctx->d2h_pending = true;
+    return RES_OK;
+}
+
+/* L4: wait filtered D2H, convert HitResult → s3d_hit (NO retrace!) */
+static res_T batch_trace_filtered_wait_d2h_impl(
+    s3d_scene_view* sv,
+    s3d_batch_trace_context* ctx,
+    const s3d_ray_request* requests,
+    size_t nrays,
+    s3d_hit* hits,
+    s3d_batch_trace_stats* stats)
+{
+    if (stats) memset(stats, 0, sizeof(*stats));
+    if (stats) stats->total_rays = nrays;
+
+    if (!sv->has_geometry || nrays == 0) {
+        for (size_t i = 0; i < nrays; i++) hits[i] = S3D_HIT_NULL;
+        if (stats) stats->batch_accepted = nrays;
+        ctx->d2h_pending = false;
+        return RES_OK;
+    }
+
+    double t0 = now_ms();
+
+    /* Wait for D2H transfer */
+    if (ctx->d2h_pending) {
+        cudaStreamSynchronize(ctx->transfer_stream);
+        ctx->d2h_pending = false;
+    }
+
+    double t1 = now_ms();
+    if (stats) stats->batch_time_ms = t1 - t0;
+
+    /* Convert HitResult → s3d_hit (no CPU filter, no retrace) */
+    const HitResult* h_hits = reinterpret_cast<const HitResult*>(ctx->h_hits_pinned);
+    unsigned int count = static_cast<unsigned int>(nrays);
+
+    size_t accepted = 0;
+
+#ifdef _OPENMP
+    {
+      int pp_use_omp = 1;
+      int pp_nthreads = omp_get_max_threads();
+      {
+        const char* env = std::getenv("STARDIS_POSTPROCESS_OMP");
+        if (env && env[0] == '0') pp_use_omp = 0;
+      }
+      {
+        const char* thr_env = std::getenv("STARDIS_POSTPROCESS_THREADS");
+        if (thr_env) {
+          int ct = std::atoi(thr_env);
+          if (ct > 0) pp_nthreads = ct;
+        }
+      }
+      if ((int)nrays < 256) pp_use_omp = 0;
+      if (pp_nthreads < 2)  pp_use_omp = 0;
+
+      if (pp_use_omp) {
+        size_t omp_accepted = 0;
+
+        #pragma omp parallel for num_threads(pp_nthreads) \
+          schedule(static) reduction(+: omp_accepted)
+        for (int ii = 0; ii < (int)count; ii++) {
+            const HitResult& hr = h_hits[ii];
+            if (hr.t < 0.0f) {
+                hits[ii] = S3D_HIT_NULL;
+                continue;
+            }
+            unsigned int shape_id = 0;
+            s3d_shape* shape = resolve_shape(sv, hr.geom_id, shape_id);
+            s3d_shape* inst = nullptr;
+            if (sv->geom_to_inst.count(hr.geom_id))
+                inst = sv->geom_to_inst.at(hr.geom_id);
+            hitresult_to_s3d_hit(sv, hr, shape, shape_id, hr.prim_idx,
+                                 &hits[ii], inst);
+            omp_accepted++;
+        }
+        accepted = omp_accepted;
+        goto postprocess_done_filtered;
+      }
+    }
+#endif
+
+    for (unsigned int i = 0; i < count; i++) {
+        const HitResult& hr = h_hits[i];
+        if (hr.t < 0.0f) {
+            hits[i] = S3D_HIT_NULL;
+            continue;
+        }
+        unsigned int shape_id = 0;
+        s3d_shape* shape = resolve_shape(sv, hr.geom_id, shape_id);
+        s3d_shape* inst = nullptr;
+        if (sv->geom_to_inst.count(hr.geom_id))
+            inst = sv->geom_to_inst.at(hr.geom_id);
+
+        hitresult_to_s3d_hit(sv, hr, shape, shape_id, hr.prim_idx, &hits[i], inst);
+        accepted++;
+    }
+
+postprocess_done_filtered:
+    double t2 = now_ms();
+    if (stats) {
+        stats->batch_accepted      = accepted;
+        stats->filter_rejected     = 0;     /* GPU filter, not tracked here */
+        stats->retrace_accepted    = 0;
+        stats->retrace_missed      = 0;
+        stats->postprocess_time_ms = t2 - t1;
+        stats->retrace_time_ms     = 0.0;
+    }
+    return RES_OK;
+}
+
+/* L4: enclosure data upload */
+static res_T set_enclosure_data_impl(
+    s3d_scene_view* sv,
+    unsigned int shape_id,
+    const unsigned int* enc_front,
+    const unsigned int* enc_back,
+    size_t num_prims)
+{
+    auto it = sv->shape_to_geom.find(shape_id);
+    if (it == sv->shape_to_geom.end()) return RES_BAD_ARG;
+    unsigned int geom_id = it->second;
+
+    sv->tracer.setGeometryEnclosureData(geom_id, enc_front, enc_back, num_prims);
+
+    /* Rebuild MHF SBT so updated enc pointers appear in SBT records */
+    sv->tracer.rebuildMHFilteredSBT();
+
+    return RES_OK;
+}
+
+/* ---- L4 Public API Wrappers ---- */
+
+res_T s3d_scene_view_set_enclosure_data(
+    s3d_scene_view* scnview,
+    unsigned int shape_id,
+    const unsigned int* enc_front, const unsigned int* enc_back,
+    size_t num_prims)
+{
+    if (!scnview) return RES_BAD_ARG;
+    return set_enclosure_data_impl(scnview, shape_id, enc_front, enc_back, num_prims);
+}
+
+res_T s3d_scene_view_trace_rays_batch_ctx_filtered_async(
+    s3d_scene_view* scnview,
+    s3d_batch_trace_context* ctx,
+    const s3d_ray_request* requests,
+    const s3d_filter_per_ray* filter_per_ray,
+    size_t nrays)
+{
+    if (!scnview || !ctx || !requests || !filter_per_ray) return RES_BAD_ARG;
+    return batch_trace_filtered_async_impl(scnview, ctx, requests,
+                                            filter_per_ray, nrays);
+}
+
+res_T s3d_scene_view_trace_rays_batch_ctx_filtered_sync_kernel(
+    s3d_batch_trace_context* ctx)
+{
+    if (!ctx) return RES_BAD_ARG;
+    return batch_trace_filtered_sync_kernel_impl(ctx);
+}
+
+res_T s3d_scene_view_trace_rays_batch_ctx_filtered_start_d2h(
+    s3d_batch_trace_context* ctx, size_t nrays)
+{
+    if (!ctx) return RES_BAD_ARG;
+    return batch_trace_filtered_start_d2h_impl(ctx, nrays);
+}
+
+res_T s3d_scene_view_trace_rays_batch_ctx_filtered_wait_d2h(
+    s3d_scene_view* scnview,
+    s3d_batch_trace_context* ctx,
+    const s3d_ray_request* requests, size_t nrays,
+    s3d_hit* hits,
+    s3d_batch_trace_stats* stats)
+{
+    if (!scnview || !ctx || !hits) return RES_BAD_ARG;
+    return batch_trace_filtered_wait_d2h_impl(scnview, ctx, requests, nrays,
+                                               hits, stats);
+}
+
 /* ================================================================
  * Single closest-point query
  * ================================================================ */

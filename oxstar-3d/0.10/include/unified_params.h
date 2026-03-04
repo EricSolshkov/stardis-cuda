@@ -64,6 +64,9 @@ struct UnifiedParams {
 
     /* CP prim-to-geom mapping table (E7: host-side resolution) */
     unsigned int     nn_num_prims;         /* total prims in query mesh */
+
+    /* L4: GPU inline filter (Mode A) */
+    FilterPerRayData* filter_data;    /* per-ray filter input; NULL = Mode B (unfiltered) */
 };
 
 /* ---- SBT Hit Group Data (E1/E4/E6/E7) ---- */
@@ -80,6 +83,10 @@ struct HitGroupData {
     /* Sphere data (valid when geom_type == GEOM_TYPE_SPHERE) */
     float3*      sphere_centers;
     float*       sphere_radii;
+
+    /* L4: per-prim enclosure IDs for GPU inline filter */
+    unsigned int* enc_front;    /* enc_front[prim_idx] = front enclosure ID; NULL = no enc data */
+    unsigned int* enc_back;     /* enc_back[prim_idx]  = back enclosure ID                      */
 };
 
 /* ---- Ray Type Enum (SBT addressing) ---- */

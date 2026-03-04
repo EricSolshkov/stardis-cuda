@@ -46,3 +46,11 @@ struct SphereData {
     float3 center;
     float  radius;
 };
+
+/* ---- Per-Ray Filter Data (L4: GPU inline filter) ---- */
+struct FilterPerRayData {
+    unsigned int hit_from_prim_id;  /* GAS-local prim_idx of origin surface; 0xFFFFFFFF = none    */
+    unsigned int hit_from_geom_id;  /* geom_id of origin surface; 0xFFFFFFFF = none               */
+    unsigned int enc_id;            /* enclosure ID the ray is in; 0xFFFFFFFF = no enc filter     */
+    float        epsilon;           /* near-distance self-intersection threshold                  */
+};

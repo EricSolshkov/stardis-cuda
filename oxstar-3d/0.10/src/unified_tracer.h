@@ -49,6 +49,10 @@ struct GeometryDesc {
     CUdeviceptr             d_centers;     /* float3*  (SPHERE only) */
     CUdeviceptr             d_radii;       /* float*   (SPHERE only) */
 
+    /* L4: Per-prim enclosure IDs for GPU inline filter */
+    CUdeviceptr             d_enc_front;   /* unsigned int* (per-prim front enclosure) */
+    CUdeviceptr             d_enc_back;    /* unsigned int* (per-prim back enclosure)  */
+
     float                   transform[12]; /* 3x4 row-major (identity if unset) */
     bool                    enabled;
     bool                    flip_normal;   /* E7: flip geometric normal */
@@ -113,6 +117,7 @@ public:
     void removeGeometry(unsigned int geom_id);
     void enableGeometry(unsigned int geom_id, bool enable);
     void rebuildScene();
+    void rebuildMHFilteredSBT();   /* L4: public for enclosure data update */
     void clearAllGeometry();
 
     /* ================================================================
@@ -168,6 +173,35 @@ public:
                             CUdeviceptr external_params_ptr);
 
     std::vector<MultiHitResult> traceBatchMultiHit(const std::vector<Ray>& rays);
+
+    /* ================================================================
+     * Filtered Multi-Hit Queries (L4: GPU inline filter, Mode A)
+     * ================================================================*/
+
+    /*
+     * Trace rays with GPU-side inline filter.
+     * d_hits:        output single best filtered hit per ray
+     * d_multi_hits:  device scratch buffer for any-hit Top-K collection
+     * d_filter_data: per-ray filter input (self-intersection, epsilon, enclosure)
+     */
+    void traceBatchMultiHitFiltered(
+        Ray*              d_rays,
+        HitResult*        d_hits,
+        MultiHitResult*   d_multi_hits,
+        FilterPerRayData* d_filter_data,
+        unsigned int      count,
+        CUstream          stream,
+        CUdeviceptr       external_params_ptr);
+
+    /* ================================================================
+     * Geometry Enclosure Data (L4: per-prim enclosure IDs)
+     * ================================================================*/
+
+    void setGeometryEnclosureData(
+        unsigned int         geom_id,
+        const unsigned int*  enc_front,   /* host array [num_prims] */
+        const unsigned int*  enc_back,    /* host array [num_prims] */
+        size_t               num_prims);
 
     /* ================================================================
      * Closest-Point Queries (simple NNResult interface)
@@ -305,6 +339,11 @@ private:
     OptixProgramGroup m_hitgroup_aabb_pg     = nullptr;
     OptixProgramGroup m_hitgroup_aabb_sphere_pg = nullptr;
 
+    /* L4: Filtered multi-hit program groups */
+    OptixProgramGroup m_raygen_mhf_pg          = nullptr;
+    OptixProgramGroup m_hitgroup_tri_mhf_pg    = nullptr;
+    OptixProgramGroup m_hitgroup_sphere_mhf_pg = nullptr;
+
     /* ---- RT SBT (single-hit) ---- */
     OptixShaderBindingTable m_sbt_rt = {};
     CUdeviceptr m_d_rt_raygen_record    = 0;
@@ -318,6 +357,13 @@ private:
     CUdeviceptr m_d_mh_miss_record      = 0;
     CUdeviceptr m_d_mh_hitgroup_records = 0;
     unsigned int m_mh_hitgroup_count    = 0;
+
+    /* ---- MHF SBT (filtered multi-hit, L4) ---- */
+    OptixShaderBindingTable m_sbt_mhf = {};
+    CUdeviceptr m_d_mhf_raygen_record    = 0;
+    CUdeviceptr m_d_mhf_miss_record      = 0;
+    CUdeviceptr m_d_mhf_hitgroup_records = 0;
+    unsigned int m_mhf_hitgroup_count    = 0;
 
     /* ---- NN SBT (closest-point) ---- */
     OptixShaderBindingTable m_sbt_nn = {};

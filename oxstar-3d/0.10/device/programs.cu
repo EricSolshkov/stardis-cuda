@@ -312,6 +312,194 @@ extern "C" __global__ void __anyhit__mh()
 }
 
 /* ===========================================================================
+ * __raygen__mh_filtered — filtered multi-hit ray tracing (L4 Mode A)
+ * Same as __raygen__mh, but uses __anyhit__mh_filtered via MHF SBT.
+ * After trace, reduces MultiHitResult (device scratch) to single HitResult
+ * in params.hits[], which is the only buffer downloaded to host.
+ * =========================================================================*/
+extern "C" __global__ void __raygen__mh_filtered()
+{
+    const uint3        idx        = optixGetLaunchIndex();
+    const uint3        dim        = optixGetLaunchDimensions();
+    const unsigned int linear_idx = idx.y * dim.x + idx.x;
+
+    if (linear_idx >= params.count)
+        return;
+
+    /* Initialize multi-hit result (device scratch for any-hit Top-K) */
+    params.multi_hits[linear_idx].count = 0;
+
+    const Ray ray = params.rays[linear_idx];
+
+    unsigned int p0 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, p7 = 0, p8 = 0, p9 = 0;
+    optixTrace(
+        params.handle,
+        ray.origin,
+        ray.direction,
+        ray.tmin,
+        ray.tmax,
+        0.0f,
+        OptixVisibilityMask(255),
+        OPTIX_RAY_FLAG_NONE,   /* DO NOT disable any-hit */
+        RAY_TYPE_RADIANCE,
+        RAY_TYPE_COUNT,
+        RAY_TYPE_RADIANCE,
+        p0, p1, p2, p3, p4, p5, p6, p7, p8, p9
+    );
+
+    /* Sort hits by distance (ascending) — bubble sort for K=2 */
+    MultiHitResult& result = params.multi_hits[linear_idx];
+    if (result.count == 2 && result.hits[0].t > result.hits[1].t) {
+        HitResult tmp    = result.hits[0];
+        result.hits[0]   = result.hits[1];
+        result.hits[1]   = tmp;
+    }
+
+    /* Reduce Top-K to single HitResult: closest filtered hit → params.hits[] */
+    if (result.count > 0) {
+        params.hits[linear_idx] = result.hits[0];
+    } else {
+        HitResult miss_hit;
+        miss_hit.t         = -1.0f;
+        miss_hit.bary_u    = 0.0f;
+        miss_hit.bary_v    = 0.0f;
+        miss_hit.prim_idx  = 0xFFFFFFFFu;
+        miss_hit.geom_id   = 0xFFFFFFFFu;
+        miss_hit.inst_id   = 0xFFFFFFFFu;
+        miss_hit.normal[0] = 0.0f;
+        miss_hit.normal[1] = 0.0f;
+        miss_hit.normal[2] = 0.0f;
+        params.hits[linear_idx] = miss_hit;
+    }
+}
+
+/* ===========================================================================
+ * __anyhit__mh_filtered — filtered multi-hit any-hit program (L4 Mode A)
+ * Same Top-K collection as __anyhit__mh, but with three inline filters
+ * applied BEFORE normal computation and hit insertion:
+ *   ①  Self-intersection:  reject if prim == origin prim (same GAS)
+ *   ②  Near-distance:      reject if 0 < t < epsilon
+ *   ③  Enclosure boundary: reject if neither front nor back enclosure
+ *                           matches the ray's current enclosure ID
+ * =========================================================================*/
+extern "C" __global__ void __anyhit__mh_filtered()
+{
+    const uint3        idx        = optixGetLaunchIndex();
+    const uint3        dim        = optixGetLaunchDimensions();
+    const unsigned int linear_idx = idx.y * dim.x + idx.x;
+
+    const float          t_new = optixGetRayTmax();
+    const unsigned int   prim  = optixGetPrimitiveIndex();
+    const HitGroupData*  data  = reinterpret_cast<const HitGroupData*>(optixGetSbtDataPointer());
+    const unsigned int   gid   = data->geom_id;
+    const unsigned int   iid   = optixGetInstanceId();
+
+    /* ---- L4: Read per-ray filter data ---- */
+    const FilterPerRayData filter = params.filter_data[linear_idx];
+
+    /* ---- Filter ①: Self-intersection rejection ---- */
+    if (prim == filter.hit_from_prim_id && gid == filter.hit_from_geom_id) {
+        optixIgnoreIntersection();
+        return;
+    }
+
+    /* ---- Filter ②: Near-distance epsilon rejection ---- */
+    if (t_new > 0.0f && t_new < filter.epsilon) {
+        optixIgnoreIntersection();
+        return;
+    }
+
+    /* ---- Filter ③: Enclosure boundary check ---- */
+    if (filter.enc_id != 0xFFFFFFFFu && data->enc_front) {
+        const unsigned int ef = data->enc_front[prim];
+        const unsigned int eb = data->enc_back[prim];
+        if (ef != filter.enc_id && eb != filter.enc_id) {
+            optixIgnoreIntersection();
+            return;
+        }
+    }
+
+    /* ---- All filters passed — compute barycentrics & normal ---- */
+    float bu = 0.0f, bv = 0.0f;
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+
+    if (optixIsTriangleHit()) {
+        const float2 bary = optixGetTriangleBarycentrics();
+        bu = bary.x;
+        bv = bary.y;
+        if (data->vertices && data->indices) {
+            const uint3  tri = data->indices[prim];
+            const float3 v0  = data->vertices[tri.x];
+            const float3 v1  = data->vertices[tri.y];
+            const float3 v2  = data->vertices[tri.z];
+            const float3 e1  = { v1.x - v0.x, v1.y - v0.y, v1.z - v0.z };
+            const float3 e2  = { v2.x - v0.x, v2.y - v0.y, v2.z - v0.z };
+            nx = e1.y * e2.z - e1.z * e2.y;
+            ny = e1.z * e2.x - e1.x * e2.z;
+            nz = e1.x * e2.y - e1.y * e2.x;
+        }
+        /* Transform normal from object space to world space (IAS instance) */
+        const float3 wn = optixTransformNormalFromObjectToWorldSpace(
+                              make_float3(nx, ny, nz));
+        nx = wn.x;  ny = wn.y;  nz = wn.z;
+    } else {
+        if (data->sphere_centers) {
+            const float3 origin = optixGetWorldRayOrigin();
+            const float3 dir    = optixGetWorldRayDirection();
+            const float3 hp     = { origin.x + t_new * dir.x,
+                                    origin.y + t_new * dir.y,
+                                    origin.z + t_new * dir.z };
+            const float3 center = data->sphere_centers[prim];
+            nx = hp.x - center.x;
+            ny = hp.y - center.y;
+            nz = hp.z - center.z;
+        }
+    }
+
+    /* E7: flip normal if geometry has flip_surface set */
+    if (data->flip_normal) {
+        nx = -nx; ny = -ny; nz = -nz;
+    }
+
+    /* Build hit record */
+    HitResult new_hit;
+    new_hit.t         = t_new;
+    new_hit.bary_u    = bu;
+    new_hit.bary_v    = bv;
+    new_hit.prim_idx  = prim;
+    new_hit.geom_id   = gid;
+    new_hit.inst_id   = iid;
+    new_hit.normal[0] = nx;
+    new_hit.normal[1] = ny;
+    new_hit.normal[2] = nz;
+
+    /* ---- Top-K insertion (same as __anyhit__mh) ---- */
+    MultiHitResult& result = params.multi_hits[linear_idx];
+    unsigned int cnt = result.count;
+
+    if (cnt < MAX_MULTI_HITS) {
+        result.hits[cnt] = new_hit;
+        result.count     = cnt + 1;
+    } else {
+        /* Find farthest hit and replace if new hit is closer */
+        unsigned int farthest = 0;
+        float max_t = result.hits[0].t;
+        for (unsigned int i = 1; i < MAX_MULTI_HITS; ++i) {
+            if (result.hits[i].t > max_t) {
+                max_t    = result.hits[i].t;
+                farthest = i;
+            }
+        }
+        if (t_new < max_t) {
+            result.hits[farthest] = new_hit;
+        }
+    }
+
+    /* Always ignore: we manage Top-K ourselves */
+    optixIgnoreIntersection();
+}
+
+/* ===========================================================================
  * __intersection__sphere — ray-sphere analytic intersection (E4)
  * Solves |O + t*D - C|^2 = r^2 for the nearest positive t in [tmin, tmax].
  * Reports intersection via optixReportIntersection (hit kind = 0).

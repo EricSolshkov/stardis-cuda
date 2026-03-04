@@ -254,7 +254,42 @@ void UnifiedTracer::createProgramGroups()
             s_optix_log, &s_optix_log_size, &m_hitgroup_aabb_sphere_pg));
     }
 
-    std::cerr << "  [UnifiedTracer] 12 program groups created.\n";
+    /* ---- MHF Raygen (filtered multi-hit, L4) ---- */
+    {
+        OptixProgramGroupDesc desc = {};
+        desc.kind                     = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+        desc.raygen.module            = m_rt_module;
+        desc.raygen.entryFunctionName = "__raygen__mh_filtered";
+        OPTIX_CHECK_LOG(optixProgramGroupCreate(
+            m_context, &desc, 1, &pg_options,
+            s_optix_log, &s_optix_log_size, &m_raygen_mhf_pg));
+    }
+
+    /* ---- MHF HitGroup: triangle (built-in IS + filtered anyhit, L4) ---- */
+    {
+        OptixProgramGroupDesc desc = {};
+        desc.kind                         = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+        desc.hitgroup.moduleAH            = m_rt_module;
+        desc.hitgroup.entryFunctionNameAH = "__anyhit__mh_filtered";
+        OPTIX_CHECK_LOG(optixProgramGroupCreate(
+            m_context, &desc, 1, &pg_options,
+            s_optix_log, &s_optix_log_size, &m_hitgroup_tri_mhf_pg));
+    }
+
+    /* ---- MHF HitGroup: sphere (IS + filtered anyhit, L4) ---- */
+    {
+        OptixProgramGroupDesc desc = {};
+        desc.kind                         = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+        desc.hitgroup.moduleIS            = m_rt_module;
+        desc.hitgroup.entryFunctionNameIS = "__intersection__sphere";
+        desc.hitgroup.moduleAH            = m_rt_module;
+        desc.hitgroup.entryFunctionNameAH = "__anyhit__mh_filtered";
+        OPTIX_CHECK_LOG(optixProgramGroupCreate(
+            m_context, &desc, 1, &pg_options,
+            s_optix_log, &s_optix_log_size, &m_hitgroup_sphere_mhf_pg));
+    }
+
+    std::cerr << "  [UnifiedTracer] 15 program groups created.\n";
 }
 
 /* ===========================================================================
@@ -269,7 +304,9 @@ void UnifiedTracer::createPipeline()
         m_hitgroup_tri_pg, m_hitgroup_sphere_pg,
         m_hitgroup_tri_mh_pg, m_hitgroup_sphere_mh_pg,
         m_raygen_nn_pg, m_raygen_cp_pg,
-        m_hitgroup_aabb_pg, m_hitgroup_aabb_sphere_pg
+        m_hitgroup_aabb_pg, m_hitgroup_aabb_sphere_pg,
+        /* L4: filtered multi-hit program groups */
+        m_raygen_mhf_pg, m_hitgroup_tri_mhf_pg, m_hitgroup_sphere_mhf_pg
     };
 
     OptixPipelineLinkOptions link_options = {};
@@ -279,7 +316,7 @@ void UnifiedTracer::createPipeline()
         m_context,
         &m_pipeline_compile_options,
         &link_options,
-        pgs, 12,
+        pgs, 15,
         s_optix_log, &s_optix_log_size,
         &m_pipeline));
 
@@ -300,7 +337,7 @@ void UnifiedTracer::createPipeline()
         continuation,
         2 /* maxTraversalDepth: IAS -> GAS */));
 
-    std::cerr << "  [UnifiedTracer] Pipeline created (12 PGs, stack configured).\n";
+    std::cerr << "  [UnifiedTracer] Pipeline created (15 PGs, stack configured).\n";
 }
 
 /* ===========================================================================
@@ -368,6 +405,35 @@ void UnifiedTracer::createBaseSBTs()
         m_mh_hitgroup_count = 1;
     }
 
+    /* ---- MHF SBT: raygen + miss (L4 filtered multi-hit) ---- */
+    {
+        RaygenRecord rg = {};
+        OPTIX_CHECK(optixSbtRecordPackHeader(m_raygen_mhf_pg, &rg));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_d_mhf_raygen_record), sizeof(RaygenRecord)));
+        CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(m_d_mhf_raygen_record), &rg, sizeof(RaygenRecord), cudaMemcpyHostToDevice));
+
+        MissRecord ms = {};
+        OPTIX_CHECK(optixSbtRecordPackHeader(m_miss_rt_pg, &ms));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_d_mhf_miss_record), sizeof(MissRecord)));
+        CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(m_d_mhf_miss_record), &ms, sizeof(MissRecord), cudaMemcpyHostToDevice));
+
+        HitGroupRecord hg = {};
+        memset(&hg.data, 0, sizeof(HitGroupData));
+        OPTIX_CHECK(optixSbtRecordPackHeader(m_hitgroup_tri_mhf_pg, &hg));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_d_mhf_hitgroup_records), sizeof(HitGroupRecord)));
+        CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(m_d_mhf_hitgroup_records), &hg, sizeof(HitGroupRecord), cudaMemcpyHostToDevice));
+
+        m_sbt_mhf = {};
+        m_sbt_mhf.raygenRecord                = m_d_mhf_raygen_record;
+        m_sbt_mhf.missRecordBase              = m_d_mhf_miss_record;
+        m_sbt_mhf.missRecordStrideInBytes     = sizeof(MissRecord);
+        m_sbt_mhf.missRecordCount             = 1;
+        m_sbt_mhf.hitgroupRecordBase          = m_d_mhf_hitgroup_records;
+        m_sbt_mhf.hitgroupRecordStrideInBytes = sizeof(HitGroupRecord);
+        m_sbt_mhf.hitgroupRecordCount         = 1;
+        m_mhf_hitgroup_count = 1;
+    }
+
     /* ---- NN SBT ---- */
     {
         RaygenRecord rg = {};
@@ -412,7 +478,7 @@ void UnifiedTracer::createBaseSBTs()
         m_sbt_cp.hitgroupRecordCount         = 1;
     }
 
-    std::cerr << "  [UnifiedTracer] Base SBTs created (RT + MH + NN + CP).\n";
+    std::cerr << "  [UnifiedTracer] Base SBTs created (RT + MH + MHF + NN + CP).\n";
 }
 
 /* ===========================================================================
@@ -664,6 +730,10 @@ void UnifiedTracer::freeGeometryGAS(GeometryDesc& desc)
     if (desc.d_indices)  { cudaFree(reinterpret_cast<void*>(desc.d_indices));  desc.d_indices = 0; }
     if (desc.d_centers)  { cudaFree(reinterpret_cast<void*>(desc.d_centers));  desc.d_centers = 0; }
     if (desc.d_radii)    { cudaFree(reinterpret_cast<void*>(desc.d_radii));    desc.d_radii = 0; }
+
+    /* L4: enclosure data */
+    if (desc.d_enc_front) { cudaFree(reinterpret_cast<void*>(desc.d_enc_front)); desc.d_enc_front = 0; }
+    if (desc.d_enc_back)  { cudaFree(reinterpret_cast<void*>(desc.d_enc_back));  desc.d_enc_back  = 0; }
 }
 
 /* ===========================================================================
@@ -951,6 +1021,58 @@ void UnifiedTracer::rebuildMHSBT()
     m_mh_hitgroup_count = static_cast<unsigned int>(records.size());
 }
 
+void UnifiedTracer::rebuildMHFilteredSBT()
+{
+    if (m_d_mhf_hitgroup_records) {
+        cudaFree(reinterpret_cast<void*>(m_d_mhf_hitgroup_records));
+        m_d_mhf_hitgroup_records = 0;
+    }
+
+    std::vector<HitGroupRecord> records;
+    for (auto& kv : m_geometries) {
+        auto& desc = kv.second;
+        if (!desc.enabled || desc.gas_handle == 0) continue;
+
+        HitGroupRecord rec = {};
+        OptixProgramGroup pg = (desc.type == GeometryDesc::MESH)
+                                ? m_hitgroup_tri_mhf_pg
+                                : m_hitgroup_sphere_mhf_pg;
+        OPTIX_CHECK(optixSbtRecordPackHeader(pg, &rec));
+
+        rec.data.geom_id  = kv.first;
+        rec.data.geom_type = (desc.type == GeometryDesc::MESH) ? GEOM_TYPE_TRIANGLE : GEOM_TYPE_SPHERE;
+        rec.data.flip_normal = desc.flip_normal ? 1u : 0u;
+        rec.data.pad0 = 0;
+        rec.data.vertices       = reinterpret_cast<float3*>(desc.d_vertices);
+        rec.data.indices        = reinterpret_cast<uint3*>(desc.d_indices);
+        rec.data.sphere_centers = reinterpret_cast<float3*>(desc.d_centers);
+        rec.data.sphere_radii   = reinterpret_cast<float*>(desc.d_radii);
+
+        /* L4: bind per-prim enclosure arrays (may be 0 if not set) */
+        rec.data.enc_front = reinterpret_cast<unsigned int*>(desc.d_enc_front);
+        rec.data.enc_back  = reinterpret_cast<unsigned int*>(desc.d_enc_back);
+
+        records.push_back(rec);
+    }
+
+    if (records.empty()) {
+        HitGroupRecord dummy = {};
+        memset(&dummy.data, 0, sizeof(HitGroupData));
+        OPTIX_CHECK(optixSbtRecordPackHeader(m_hitgroup_tri_mhf_pg, &dummy));
+        records.push_back(dummy);
+    }
+
+    size_t bytes = records.size() * sizeof(HitGroupRecord);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_d_mhf_hitgroup_records), bytes));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(m_d_mhf_hitgroup_records),
+                          records.data(), bytes, cudaMemcpyHostToDevice));
+
+    m_sbt_mhf.hitgroupRecordBase          = m_d_mhf_hitgroup_records;
+    m_sbt_mhf.hitgroupRecordStrideInBytes = sizeof(HitGroupRecord);
+    m_sbt_mhf.hitgroupRecordCount         = static_cast<unsigned int>(records.size());
+    m_mhf_hitgroup_count = static_cast<unsigned int>(records.size());
+}
+
 /* ===========================================================================
  * rebuildScene — rebuilds IAS + SBTs + bbox
  * =========================================================================*/
@@ -960,6 +1082,7 @@ void UnifiedTracer::rebuildScene()
     buildIAS();
     rebuildRTSBT();
     rebuildMHSBT();
+    rebuildMHFilteredSBT();
     computeSceneBBox();
 }
 
@@ -1354,6 +1477,78 @@ std::vector<MultiHitResult> UnifiedTracer::traceBatchMultiHit(const std::vector<
 }
 
 /* ===========================================================================
+ * Filtered Multi-Hit Queries (L4) — dispatch via MHF SBT
+ * GPU-side inline filter: self-intersection + epsilon + enclosure.
+ * Raygen reduces Top-K to single HitResult in hits[].
+ * =========================================================================*/
+
+void UnifiedTracer::traceBatchMultiHitFiltered(
+    Ray*              d_rays,
+    HitResult*        d_hits,
+    MultiHitResult*   d_multi_hits,
+    FilterPerRayData* d_filter_data,
+    unsigned int      count,
+    CUstream          stream,
+    CUdeviceptr       external_params_ptr)
+{
+    UnifiedParams lp = {};
+    lp.handle      = activeRTHandle();
+    lp.count       = count;
+    lp.rays        = d_rays;
+    lp.hits        = d_hits;
+    lp.multi_hits  = d_multi_hits;
+    lp.filter_data = d_filter_data;
+
+    /* Use caller-provided params buffer — per-ctx, no race */
+    CUDA_CHECK(cudaMemcpyAsync(
+        reinterpret_cast<void*>(external_params_ptr),
+        &lp, sizeof(UnifiedParams),
+        cudaMemcpyHostToDevice, stream));
+
+    unsigned int w, h;
+    if (count <= 65536) { w = count; h = 1; }
+    else { w = 8192; h = (count + w - 1) / w; }
+
+    OPTIX_CHECK(optixLaunch(m_pipeline, stream, external_params_ptr,
+                            sizeof(UnifiedParams), &m_sbt_mhf, w, h, 1));
+}
+
+/* ===========================================================================
+ * Geometry Enclosure Data (L4) — per-prim front/back enclosure IDs
+ * =========================================================================*/
+
+void UnifiedTracer::setGeometryEnclosureData(
+    unsigned int         geom_id,
+    const unsigned int*  enc_front,
+    const unsigned int*  enc_back,
+    size_t               num_prims)
+{
+    auto it = m_geometries.find(geom_id);
+    if (it == m_geometries.end()) {
+        std::cerr << "  [UnifiedTracer] setGeometryEnclosureData: geom_id "
+                  << geom_id << " not found.\n";
+        return;
+    }
+    auto& desc = it->second;
+
+    /* Free old buffers if any */
+    if (desc.d_enc_front) { cudaFree(reinterpret_cast<void*>(desc.d_enc_front)); desc.d_enc_front = 0; }
+    if (desc.d_enc_back)  { cudaFree(reinterpret_cast<void*>(desc.d_enc_back));  desc.d_enc_back  = 0; }
+
+    if (num_prims == 0 || !enc_front || !enc_back)
+        return;
+
+    size_t bytes = num_prims * sizeof(unsigned int);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&desc.d_enc_front), bytes));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&desc.d_enc_back),  bytes));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(desc.d_enc_front), enc_front, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(desc.d_enc_back),  enc_back,  bytes, cudaMemcpyHostToDevice));
+
+    /* NOTE: caller must call rebuildScene() or rebuildMHFilteredSBT()
+     * to propagate updated enc pointers to SBT records. */
+}
+
+/* ===========================================================================
  * Closest-Point Queries — dispatch via NN SBT (simple NNResult)
  * =========================================================================*/
 
@@ -1685,6 +1880,11 @@ void UnifiedTracer::cleanup()
     if (m_d_mh_miss_record)      { cudaFree(reinterpret_cast<void*>(m_d_mh_miss_record));      m_d_mh_miss_record      = 0; }
     if (m_d_mh_hitgroup_records) { cudaFree(reinterpret_cast<void*>(m_d_mh_hitgroup_records)); m_d_mh_hitgroup_records = 0; }
 
+    /* MHF SBT device memory (L4) */
+    if (m_d_mhf_raygen_record)    { cudaFree(reinterpret_cast<void*>(m_d_mhf_raygen_record));    m_d_mhf_raygen_record    = 0; }
+    if (m_d_mhf_miss_record)      { cudaFree(reinterpret_cast<void*>(m_d_mhf_miss_record));      m_d_mhf_miss_record      = 0; }
+    if (m_d_mhf_hitgroup_records) { cudaFree(reinterpret_cast<void*>(m_d_mhf_hitgroup_records)); m_d_mhf_hitgroup_records = 0; }
+
     /* NN SBT device memory */
     if (m_d_nn_raygen_record)   { cudaFree(reinterpret_cast<void*>(m_d_nn_raygen_record));   m_d_nn_raygen_record   = 0; }
     if (m_d_nn_miss_record)     { cudaFree(reinterpret_cast<void*>(m_d_nn_miss_record));     m_d_nn_miss_record     = 0; }
@@ -1700,6 +1900,9 @@ void UnifiedTracer::cleanup()
     if (m_pipeline)                 { optixPipelineDestroy(m_pipeline);                             m_pipeline                 = nullptr; }
     if (m_hitgroup_aabb_sphere_pg)  { optixProgramGroupDestroy(m_hitgroup_aabb_sphere_pg);          m_hitgroup_aabb_sphere_pg  = nullptr; }
     if (m_hitgroup_aabb_pg)         { optixProgramGroupDestroy(m_hitgroup_aabb_pg);                 m_hitgroup_aabb_pg         = nullptr; }
+    if (m_hitgroup_sphere_mhf_pg)   { optixProgramGroupDestroy(m_hitgroup_sphere_mhf_pg);           m_hitgroup_sphere_mhf_pg   = nullptr; }
+    if (m_hitgroup_tri_mhf_pg)      { optixProgramGroupDestroy(m_hitgroup_tri_mhf_pg);              m_hitgroup_tri_mhf_pg      = nullptr; }
+    if (m_raygen_mhf_pg)            { optixProgramGroupDestroy(m_raygen_mhf_pg);                    m_raygen_mhf_pg            = nullptr; }
     if (m_hitgroup_sphere_mh_pg)    { optixProgramGroupDestroy(m_hitgroup_sphere_mh_pg);            m_hitgroup_sphere_mh_pg    = nullptr; }
     if (m_hitgroup_tri_mh_pg)       { optixProgramGroupDestroy(m_hitgroup_tri_mh_pg);               m_hitgroup_tri_mh_pg       = nullptr; }
     if (m_hitgroup_sphere_pg)       { optixProgramGroupDestroy(m_hitgroup_sphere_pg);               m_hitgroup_sphere_pg       = nullptr; }
