@@ -448,10 +448,10 @@ pool_create(struct wavefront_pool* pool, size_t per_view_size,
     return RES_MEM_ERR;
   }
 
-  /* P1: Dispatch-layer SoA arrays */
+  /* P0_OPT: path_hot array (replaces P1 dispatch_soa) */
   {
-    res_T soa_res = dispatch_soa_alloc(&pool->dsoa, pool_size);
-    if(soa_res != RES_OK) return soa_res;
+    res_T hot_res = path_hot_arr_alloc(&pool->hot_arr, pool_size);
+    if(hot_res != RES_OK) return hot_res;
   }
 
   /* P1: Cold-block SoA arrays (separated from path_state slots) */
@@ -545,8 +545,8 @@ pool_destroy(struct wavefront_pool* pool)
   free(pool->cp_hits);
   free(pool->cp_to_slot);
 
-  /* P1: Dispatch-layer SoA arrays */
-  dispatch_soa_free(&pool->dsoa);
+  /* P0_OPT: path_hot array */
+  path_hot_arr_free(&pool->hot_arr);
 
   /* P1: Cold-block SoA arrays */
   free(pool->sfn_arr);
@@ -644,6 +644,7 @@ generate_task_queue(
 static res_T
 init_single_path(
   struct path_state* p,
+  struct path_hot* hot,
   struct ssp_rng* rng,
   const struct pixel_task* task,
   struct sdis_scene* scn,
@@ -732,10 +733,12 @@ init_single_path(
   p->rad_bounce_count = 0;
   p->rad_retry_count  = 0;
 
-  /* Set lifecycle */
-  p->phase   = PATH_INIT;
-  p->active  = 1;
-  p->needs_ray = 0;
+  /* Set lifecycle — P0_OPT: write hot fields to path_hot */
+  hot->phase   = (uint8_t)PATH_INIT;
+  hot->active  = 1;
+  hot->needs_ray = 0;
+  hot->ray_bucket = 0;
+  hot->ray_count_ext = 0;
 
   /* Zero scratch areas */
   p->ds_delta_solid = 0;
@@ -774,6 +777,7 @@ camera_generate_tasks(struct wavefront_pool* pool, const void* mode_ctx)
 /* camera_init_path: init a single camera path from a pixel_task */
 static res_T
 camera_init_path(struct path_state* p,
+                 struct path_hot* hot,
                  struct ssp_rng* rng,
                  const struct pixel_task* task,
                  struct sdis_scene* scn,
@@ -787,7 +791,7 @@ camera_init_path(struct path_state* p,
 {
   const struct camera_mode_ctx* ctx =
     (const struct camera_mode_ctx*)mode_ctx;
-  return init_single_path(p, rng, task, scn, enc_id,
+  return init_single_path(p, hot, rng, task, scn, enc_id,
     ctx->cam, time_range, ctx->pix_sz,
     picard_order, diff_algo, path_id, global_seed);
 }
@@ -857,6 +861,7 @@ probe_generate_tasks(struct wavefront_pool* pool, const void* mode_ctx)
  * version with CBRNG seeding instead of shared RNG). */
 static res_T
 probe_init_path(struct path_state* p,
+                struct path_hot* hot,
                 struct ssp_rng* rng,
                 const struct pixel_task* task,
                 struct sdis_scene* scn,
@@ -930,14 +935,16 @@ probe_init_path(struct path_state* p,
   p->rad_bounce_count = 0;
   p->rad_retry_count  = 0;
 
-  /* Lifecycle — start at COUPLED_CONDUCTIVE/CONVECTIVE, not PATH_INIT */
+  /* Lifecycle — P0_OPT: write hot fields to path_hot */
   if(ctx->mdm_type == SDIS_SOLID) {
-    p->phase = PATH_COUPLED_CONDUCTIVE;
+    hot->phase = (uint8_t)PATH_COUPLED_CONDUCTIVE;
   } else {
-    p->phase = PATH_COUPLED_CONVECTIVE;
+    hot->phase = (uint8_t)PATH_COUPLED_CONVECTIVE;
   }
-  p->active  = 1;
-  p->needs_ray = 0;
+  hot->active  = 1;
+  hot->needs_ray = 0;
+  hot->ray_bucket = 0;
+  hot->ray_count_ext = 0;
 
   /* Zero scratch areas */
   p->ds_delta_solid = 0;
@@ -1026,6 +1033,7 @@ probe_batch_generate_tasks(struct wavefront_pool* pool, const void* mode_ctx)
  * mdm_type from batch arrays indexed by task->ipix_image[0]. */
 static res_T
 probe_batch_init_path(struct path_state* p,
+                      struct path_hot* hot,
                       struct ssp_rng* rng,
                       const struct pixel_task* task,
                       struct sdis_scene* scn,
@@ -1098,13 +1106,16 @@ probe_batch_init_path(struct path_state* p,
   p->rad_bounce_count = 0;
   p->rad_retry_count  = 0;
 
+  /* P0_OPT: write hot fields to path_hot */
   if(mdm_type == SDIS_SOLID) {
-    p->phase = PATH_COUPLED_CONDUCTIVE;
+    hot->phase = (uint8_t)PATH_COUPLED_CONDUCTIVE;
   } else {
-    p->phase = PATH_COUPLED_CONVECTIVE;
+    hot->phase = (uint8_t)PATH_COUPLED_CONVECTIVE;
   }
-  p->active  = 1;
-  p->needs_ray = 0;
+  hot->active  = 1;
+  hot->needs_ray = 0;
+  hot->ray_bucket = 0;
+  hot->ray_count_ext = 0;
 
   p->ds_delta_solid = 0;
   p->ds_initialized = 0;
@@ -1163,18 +1174,23 @@ advance_path_to_first_ray(struct path_state* p,
                           struct wavefront_pool* pool,
                           size_t slot_idx)
 {
+  /* P0_OPT: hot was already initialised by init_path().  Step functions
+   * write to hot directly.  No SYNC POINT C needed afterward. */
+  struct path_hot* hot = &pool->hot_arr[slot_idx];
   res_T res = RES_OK;
-  while(p->active && !p->needs_ray && p->phase != PATH_DONE
-      && p->phase != PATH_ERROR) {
-    int advanced = 0;
-    if(path_phase_is_ray_pending(p->phase)) break;
 
-    res = advance_one_step_no_ray(p, scn, &advanced, pool, slot_idx);
+  while(hot->active && !hot->needs_ray
+      && (enum path_phase)hot->phase != PATH_DONE
+      && (enum path_phase)hot->phase != PATH_ERROR) {
+    int advanced = 0;
+    if(path_phase_is_ray_pending((enum path_phase)hot->phase)) break;
+
+    res = advance_one_step_no_ray(p, hot, scn, &advanced, pool, slot_idx);
     if(res != RES_OK && res != RES_BAD_OP
     && res != RES_BAD_OP_IRRECOVERABLE) return res;
     if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
-      p->phase = PATH_DONE;
-      p->active = 0;
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
       p->done_reason = -1;
       #pragma omp atomic
       pool->paths_failed++;
@@ -1183,9 +1199,10 @@ advance_path_to_first_ray(struct path_state* p,
     }
     if(!advanced) break;
     /* M8: intercept PATH_DONE when sfn_stack_depth > 0 */
-    if(p->phase == PATH_DONE && pool->sfn_arr[slot_idx].depth > 0) {
-      p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
-      p->active = 1;
+    if((enum path_phase)hot->phase == PATH_DONE
+    && pool->sfn_arr[slot_idx].depth > 0) {
+      hot->phase = (uint8_t)PATH_BND_SFN_COMPUTE_Ti_RESUME;
+      hot->active = 1;
     }
     p->steps_taken++;
   }
@@ -1207,7 +1224,7 @@ fill_pool(struct wavefront_pool* pool)
     const struct pixel_task* task = &pool->task_queue[pool->task_next];
 
     res = pool->ops->init_path(
-      &pool->slots[i], pool->slot_rngs[i], task,
+      &pool->slots[i], &pool->hot_arr[i], pool->slot_rngs[i], task,
       pool->scn, pool->enc_id, pool->mode_ctx,
       pool->time_range,
       pool->picard_order, pool->diff_algo,
@@ -1217,17 +1234,15 @@ fill_pool(struct wavefront_pool* pool)
     /* Advance past PATH_INIT to first ray request */
     res = advance_path_to_first_ray(&pool->slots[i], pool->scn, pool, i);
     if(res != RES_OK) return res;
-
-    /* P1 SYNC POINT C: sync new path to SoA */
-    dispatch_soa_sync_from_path(&pool->dsoa, (uint32_t)i, &pool->slots[i]);
+    /* P0_OPT: hot_arr[i] already written by advance_path_to_first_ray */
 
     pool->task_next++;
   }
 
-  /* Count active paths */
+  /* Count active paths (P0_OPT: read from hot_arr) */
   pool->active_count = 0;
   for(i = 0; i < pool->pool_size; i++) {
-    if(pool->slots[i].active) pool->active_count++;
+    if(pool->hot_arr[i].active) pool->active_count++;
   }
 
   return RES_OK;
@@ -1236,9 +1251,8 @@ fill_pool(struct wavefront_pool* pool)
 /*******************************************************************************
  * Stream Compaction (M2.5 + P1 SoA) -- rebuild compact index arrays each step.
  *
- * P1: reads phase/active/needs_ray from dsoa (SoA) instead of path_state
- * (AoS), reducing cache footprint from ~4KB/path to 12B/path for the
- * common case (needs_ray==0).
+ * P0_OPT: reads phase/active/needs_ray from hot_arr (8B AoS) instead of
+ * path_state (~2KB AoS), reducing cache footprint.  8 slots / cache line.
  *
  * After this function:
  *   active_indices[0..active_compact-1]   = indices of active, non-done slots
@@ -1253,7 +1267,6 @@ compact_active_paths(struct wavefront_pool* pool, struct pool_view* pv)
   size_t base = pv->base;
   size_t end  = base + pv->view_size;
   size_t i;
-  struct dispatch_soa* dsoa = &pool->dsoa;
 
   pv->active_compact      = 0;
   pv->need_ray_count      = 0;
@@ -1263,9 +1276,9 @@ compact_active_paths(struct wavefront_pool* pool, struct pool_view* pv)
   pv->bucket_other_n      = 0;
 
   for(i = base; i < end; i++) {
-    enum path_phase ph = dsoa->phase[i];
-    int act = dsoa->active[i];
-    int nr  = dsoa->needs_ray[i];
+    enum path_phase ph = (enum path_phase)pool->hot_arr[i].phase;
+    int act = pool->hot_arr[i].active;
+    int nr  = pool->hot_arr[i].needs_ray;
 
     if(ph == PATH_DONE || ph == PATH_ERROR
     || ph == PATH_HARVESTED) {
@@ -1273,10 +1286,9 @@ compact_active_paths(struct wavefront_pool* pool, struct pool_view* pv)
        * parent picardN frame still needs to resume.  Re-activate.
        * Need to access AoS for sfn_stack_depth (rare path). */
       if(ph == PATH_DONE && pool->sfn_arr[i].depth > 0) {
-        pool->slots[i].phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
-        pool->slots[i].active = 1;
-        dsoa->phase[i] = PATH_BND_SFN_COMPUTE_Ti_RESUME;
-        dsoa->active[i] = 1;
+        /* P0_OPT: hot_arr is canonical; no slots[i].phase/active */
+        pool->hot_arr[i].phase = (uint8_t)PATH_BND_SFN_COMPUTE_Ti_RESUME;
+        pool->hot_arr[i].active = 1;
         ph = PATH_BND_SFN_COMPUTE_Ti_RESUME;
         act = 1;
         /* Fall through to treat as active path */
@@ -1326,16 +1338,19 @@ pool_collect_ray_requests_compact(struct wavefront_pool* pool)
   for(k = 0; k < pool->need_ray_count; k++) {
     uint32_t i = pool->need_ray_indices[k];
     struct path_state* p = &pool->slots[i];
+    enum path_phase cph = (enum path_phase)pool->hot_arr[i].phase;
 
-    ASSERT(p->active && p->needs_ray && p->ray_req.ray_count >= 1);
+    ASSERT(pool->hot_arr[i].active && pool->hot_arr[i].needs_ray
+        && p->ray_req.ray_count >= 1);
 
     /* Detailed stats by phase — semantic layer + per-phase layer.
-     * NOTE: compact collect lacks SoA; inline count_path_rays logic. */
+     * NOTE: compact collect lacks SoA; inline count_path_rays logic.
+     * P0_OPT: read phase from hot_arr (source of truth). */
     {
-      size_t nrays = (p->phase == PATH_ENC_QUERY_EMIT
+      size_t nrays = (cph == PATH_ENC_QUERY_EMIT
                    && p->ray_req.ray_count >= 2) ? 6
                    : (size_t)p->ray_req.ray_count;
-      switch(p->phase) {
+      switch(cph) {
       case PATH_RAD_TRACE_PENDING:
       case PATH_BND_SF_NULLCOLL_RAD_TRACE:
       case PATH_BND_SFN_RAD_TRACE:
@@ -1431,12 +1446,13 @@ pool_collect_ray_requests_compact(struct wavefront_pool* pool)
  * fall through to a generic fallback loop.
  ******************************************************************************/
 
-/* Helper: mark a failed path as done */
+/* Helper: mark a failed path as done (P0_OPT: write to hot) */
 static INLINE void
-mark_path_failed(struct path_state* p, struct wavefront_pool* pool)
+mark_path_failed(struct path_state* p, struct path_hot* hot,
+                 struct wavefront_pool* pool)
 {
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   pool->paths_failed++;
 }
@@ -1553,8 +1569,8 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
         uint32_t i = pv->need_ray_indices[kk];
         struct path_state* p = &pool->slots[i];
         size_t nrays = count_path_rays_soa(
-          pool->dsoa.phase[i], pool->dsoa.ray_count_ext[i], p);
-        int bkt = (int)pool->dsoa.ray_bucket[i];
+          (enum path_phase)pool->hot_arr[i].phase, pool->hot_arr[i].ray_count_ext, p);
+        int bkt = (int)pool->hot_arr[i].ray_bucket;
         tl_ray_counts[tid][bkt] += nrays;
       }
     }
@@ -1609,13 +1625,13 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
       for(kk = 0; kk < (int)pv->need_ray_count; kk++) {
         uint32_t i = pv->need_ray_indices[kk];
         struct path_state* p = &pool->slots[i];
-        int bkt = (int)pool->dsoa.ray_bucket[i];  /* P1: from SoA */
-        enum path_phase ph_i = pool->dsoa.phase[i]; /* P1: from SoA */
+        int bkt = (int)pool->hot_arr[i].ray_bucket;  /* P0_OPT: from hot_arr */
+        enum path_phase ph_i = (enum path_phase)pool->hot_arr[i].phase; /* P0_OPT */
 
         /* Thread-local stats accumulation — semantic + per-phase */
         {
           size_t nrays = count_path_rays_soa(
-            ph_i, pool->dsoa.ray_count_ext[i], p);
+            ph_i, pool->hot_arr[i].ray_count_ext, p);
           switch(ph_i) {
           case PATH_RAD_TRACE_PENDING:
           case PATH_BND_SF_NULLCOLL_RAD_TRACE:
@@ -1696,8 +1712,8 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
           p->ray_req.batch_idx2 = (uint32_t)ray_idx;
         }
 
-        /* --- Rays 2..5 for 6-ray enclosure query (P1: phase from SoA) --- */
-        if(pool->dsoa.ray_count_ext[i] == 6
+        /* --- Rays 2..5 for 6-ray enclosure query (P0_OPT: from hot_arr) --- */
+        if(pool->hot_arr[i].ray_count_ext == 6
         && ph_i == PATH_ENC_QUERY_EMIT) {
           int j;
           pool->enc_arr[i].batch_indices[0] = p->ray_req.batch_idx;
@@ -1730,7 +1746,7 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
          * emitted in the persistent wavefront collect, causing
          * step_bnd_ss_reinject_process to read stale/zero hits for
          * ray_bck[0] and ray_bck[1]. */
-        if(pool->dsoa.ray_count_ext[i] == 4
+        if(pool->hot_arr[i].ray_count_ext == 4
         && ph_i == PATH_BND_SS_REINJECT_SAMPLE) {
           int j;
           p->locals.bnd_ss.batch_idx_frt0 = p->ray_req.batch_idx;
@@ -1792,13 +1808,13 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
 
     memset(pv->bucket_counts, 0, sizeof(pv->bucket_counts));
 
-    /* P1: Serial fallback Pass 1 — read bucket + ray_count from SoA */
+    /* P0_OPT: Serial fallback Pass 1 — read bucket + ray_count from hot_arr */
     for(k = 0; k < pv->need_ray_count; k++) {
       uint32_t i = pv->need_ray_indices[k];
       struct path_state* p = &pool->slots[i];
       size_t nrays = count_path_rays_soa(
-        pool->dsoa.phase[i], pool->dsoa.ray_count_ext[i], p);
-      int bkt = (int)pool->dsoa.ray_bucket[i];
+        (enum path_phase)pool->hot_arr[i].phase, pool->hot_arr[i].ray_count_ext, p);
+      int bkt = (int)pool->hot_arr[i].ray_bucket;
       ASSERT(bkt >= 0 && bkt < RAY_BUCKET_COUNT);
       pv->bucket_counts[bkt] += nrays;
     }
@@ -1815,14 +1831,14 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
     for(k = 0; k < pv->need_ray_count; k++) {
       uint32_t i = pv->need_ray_indices[k];
       struct path_state* p = &pool->slots[i];
-      int bkt = (int)pool->dsoa.ray_bucket[i];   /* P1: from SoA */
-      enum path_phase ph_i = pool->dsoa.phase[i]; /* P1: from SoA */
+      int bkt = (int)pool->hot_arr[i].ray_bucket;   /* P0_OPT: from hot_arr */
+      enum path_phase ph_i = (enum path_phase)pool->hot_arr[i].phase; /* P0_OPT */
 
       /* Semantic + per-phase stats (written to pv->pending_*,
        * promoted to pool after trace completes) */
       {
         size_t nrays = count_path_rays_soa(
-          ph_i, pool->dsoa.ray_count_ext[i], p);
+          ph_i, pool->hot_arr[i].ray_count_ext, p);
         switch(ph_i) {
         case PATH_RAD_TRACE_PENDING:
         case PATH_BND_SF_NULLCOLL_RAD_TRACE:
@@ -1870,6 +1886,8 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
         else
           rr->filter_data = NULL;
 
+        fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
+
         pv->ray_to_slot[ray_idx] = i;
         pv->ray_slot_sub[ray_idx] = 0;
         p->ray_req.batch_idx = (uint32_t)ray_idx;
@@ -1892,13 +1910,15 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
           rr->filter_data = NULL;
         rr->user_id      = i;
 
+        fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
+
         pv->ray_to_slot[ray_idx] = i;
         pv->ray_slot_sub[ray_idx] = 1;
         p->ray_req.batch_idx2 = (uint32_t)ray_idx;
       }
 
-      /* P1: read phase + ray_count_ext from SoA */
-      if(pool->dsoa.ray_count_ext[i] == 6
+      /* P0_OPT: read phase + ray_count_ext from hot_arr */
+      if(pool->hot_arr[i].ray_count_ext == 6
       && ph_i == PATH_ENC_QUERY_EMIT) {
         int j;
         pool->enc_arr[i].batch_indices[0] = p->ray_req.batch_idx;
@@ -1918,6 +1938,8 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
           rr->filter_data  = NULL;
           rr->user_id      = i;
 
+          fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
+
           pv->ray_to_slot[ray_idx] = i;
           pv->ray_slot_sub[ray_idx] = (uint32_t)j;
           pool->enc_arr[i].batch_indices[j] = (uint32_t)ray_idx;
@@ -1925,7 +1947,7 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
       }
 
       /* B-4 M3: Rays 2..3 for SS 4-ray reinjection (serial path) */
-      if(pool->dsoa.ray_count_ext[i] == 4
+      if(pool->hot_arr[i].ray_count_ext == 4
       && ph_i == PATH_BND_SS_REINJECT_SAMPLE) {
         int j;
         p->locals.bnd_ss.batch_idx_frt0 = p->ray_req.batch_idx;
@@ -1947,6 +1969,8 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
           else
             rr->filter_data = NULL;
           rr->user_id      = i;
+
+          fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
 
           pv->ray_to_slot[ray_idx] = i;
           pv->ray_slot_sub[ray_idx] = (uint32_t)(j + 2);
@@ -1976,9 +2000,8 @@ pool_collect_enc_locate_requests(struct wavefront_pool* pool,
 
   for(k = 0; k < pv->active_compact; k++) {
     uint32_t i = pv->active_indices[k];
-    struct path_state* p = &pool->slots[i];
 
-    if(p->phase == PATH_ENC_LOCATE_PENDING) {
+    if((enum path_phase)pool->hot_arr[i].phase == PATH_ENC_LOCATE_PENDING) {
       struct s3d_enc_locate_request* req = &pv->enc_locate_requests[n];
       req->pos[0] = (float)pool->enc_arr[i].locate.query_pos[0];
       req->pos[1] = (float)pool->enc_arr[i].locate.query_pos[1];
@@ -2009,13 +2032,12 @@ pool_distribute_enc_locate_results(struct wavefront_pool* pool,
 
   for(k = 0; k < pv->enc_locate_count; k++) {
     uint32_t slot_id = pv->enc_locate_to_slot[k];
-    struct path_state* p = &pool->slots[slot_id];
     const struct s3d_enc_locate_result* r = &pv->enc_locate_results[k];
 
     pool->enc_arr[slot_id].locate.prim_id  = r->prim_id;
     pool->enc_arr[slot_id].locate.side     = r->side;
     pool->enc_arr[slot_id].locate.distance = r->distance;
-    p->phase = PATH_ENC_LOCATE_RESULT;
+    pool->hot_arr[slot_id].phase = (uint8_t)PATH_ENC_LOCATE_RESULT;
   }
 
   return RES_OK;
@@ -2044,7 +2066,7 @@ pool_collect_cp_requests(struct wavefront_pool* pool,
     uint32_t i = pv->active_indices[k];
     struct path_state* p = &pool->slots[i];
 
-    if(path_phase_is_cp_pending(p->phase)) {
+    if(path_phase_is_cp_pending((enum path_phase)pool->hot_arr[i].phase)) {
       struct s3d_cp_request* req = &pv->cp_requests[n];
       req->pos[0] = (float)p->locals.cnd_wos.query_pos[0];
       req->pos[1] = (float)p->locals.cnd_wos.query_pos[1];
@@ -2083,13 +2105,14 @@ pool_distribute_cp_results(struct wavefront_pool* pool,
   for(k = 0; k < pv->cp_count; k++) {
     uint32_t slot_id = pv->cp_to_slot[k];
     struct path_state* p = &pool->slots[slot_id];
+    enum path_phase cp_ph = (enum path_phase)pool->hot_arr[slot_id].phase;
 
     p->locals.cnd_wos.cached_hit = pv->cp_hits[k];
 
-    if(p->phase == PATH_CND_WOS_DIFFUSION_CHECK)
-      p->phase = PATH_CND_WOS_DIFFUSION_CHECK_RESULT;
+    if(cp_ph == PATH_CND_WOS_DIFFUSION_CHECK)
+      pool->hot_arr[slot_id].phase = (uint8_t)PATH_CND_WOS_DIFFUSION_CHECK_RESULT;
     else
-      p->phase = PATH_CND_WOS_CLOSEST_RESULT;
+      pool->hot_arr[slot_id].phase = (uint8_t)PATH_CND_WOS_CLOSEST_RESULT;
   }
 
   return RES_OK;
@@ -2128,20 +2151,22 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
       for(kk = 0; kk < (int)pv->bucket_radiative_n; kk++) {
         uint32_t i = pv->bucket_radiative[kk];
         struct path_state* p;
+        struct path_hot* hot;
         const struct s3d_hit* h0;
         res_T lr;
         /* O7: prefetch slot 4 iterations ahead */
         if(kk + 4 < (int)pv->bucket_radiative_n)
           PREFETCH_T0(&pool->slots[pv->bucket_radiative[kk + 4]]);
         p = &pool->slots[i];
+        hot = &pool->hot_arr[i];
         h0 = &pv->ray_hits[p->ray_req.batch_idx];
 
-        p->needs_ray = 0;
-        lr = step_radiative_trace(p, scn, h0);
+        hot->needs_ray = 0;
+        lr = step_radiative_trace(p, hot, scn, h0);
         if(lr != RES_OK && lr != RES_BAD_OP
         && lr != RES_BAD_OP_IRRECOVERABLE) { tl_fatal = 1; }
         else if(lr == RES_BAD_OP || lr == RES_BAD_OP_IRRECOVERABLE) {
-          p->phase = PATH_DONE; p->active = 0; p->done_reason = -1;
+          hot->phase = (uint8_t)PATH_DONE; hot->active = 0; p->done_reason = -1;
           tl_paths_failed++;
         }
         p->steps_taken++;
@@ -2165,6 +2190,7 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
       for(kk = 0; kk < (int)pv->bucket_conductive_n; kk++) {
         uint32_t i = pv->bucket_conductive[kk];
         struct path_state* p;
+        struct path_hot* hot;
         const struct s3d_hit* h0;
         const struct s3d_hit* h1 = NULL;
         res_T lr;
@@ -2175,17 +2201,18 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
           PREFETCH_T0(&pool->enc_arr[i_next]);
         }
         p = &pool->slots[i];
+        hot = &pool->hot_arr[i];
         h0 = &pv->ray_hits[p->ray_req.batch_idx];
         if(p->ray_req.ray_count >= 2)
           h1 = &pv->ray_hits[p->ray_req.batch_idx2];
 
-        p->needs_ray = 0;
-        lr = step_conductive_ds_process(p, scn, h0, h1,
+        hot->needs_ray = 0;
+        lr = step_conductive_ds_process(p, hot, scn, h0, h1,
                                          &pool->enc_arr[i]);
         if(lr != RES_OK && lr != RES_BAD_OP
         && lr != RES_BAD_OP_IRRECOVERABLE) { tl_fatal = 1; }
         else if(lr == RES_BAD_OP || lr == RES_BAD_OP_IRRECOVERABLE) {
-          p->phase = PATH_DONE; p->active = 0; p->done_reason = -1;
+          hot->phase = (uint8_t)PATH_DONE; hot->active = 0; p->done_reason = -1;
           tl_paths_failed++;
         }
         p->steps_taken++;
@@ -2211,28 +2238,30 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
         for(kk = 0; kk < (int)pv->bucket_other_n; kk++) {
           uint32_t i = pv->bucket_other[kk];
           struct path_state* p = &pool->slots[i];
+          struct path_hot* hot = &pool->hot_arr[i];
 
           {
             const struct s3d_hit* h0 = &pv->ray_hits[p->ray_req.batch_idx];
             const struct s3d_hit* h1 = NULL;
             res_T lr;
+            enum path_phase ph_before = (enum path_phase)hot->phase;
             if(p->ray_req.ray_count >= 2)
               h1 = &pv->ray_hits[p->ray_req.batch_idx2];
 
-            if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6) {
+            if(ph_before == PATH_ENC_QUERY_EMIT && hot->ray_count_ext == 6) {
               int j;
               for(j = 0; j < 6; j++) {
                 pool->enc_arr[i].dir_hits[j] =
                   pv->ray_hits[pool->enc_arr[i].batch_indices[j]];
               }
             }
-            if(p->phase == PATH_ENC_QUERY_FB_EMIT) {
+            if(ph_before == PATH_ENC_QUERY_FB_EMIT) {
               pool->enc_arr[i].fb_hit = pv->ray_hits[p->ray_req.batch_idx];
             }
 
             /* B-4 M3: SS 4-ray pre-delivery (BUG-FIX) */
-            if(p->phase == PATH_BND_SS_REINJECT_SAMPLE
-            && p->ray_count_ext == 4) {
+            if(ph_before == PATH_BND_SS_REINJECT_SAMPLE
+            && hot->ray_count_ext == 4) {
               p->locals.bnd_ss.ray_frt[0] =
                 pv->ray_hits[p->locals.bnd_ss.batch_idx_frt0];
               p->locals.bnd_ss.ray_frt[1] =
@@ -2244,18 +2273,17 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
             }
 
             {
-              enum path_phase phase_before = p->phase;
-              p->needs_ray = 0;
-              lr = advance_one_step_with_ray(p, scn, h0, h1,
+              hot->needs_ray = 0;
+              lr = advance_one_step_with_ray(p, hot, scn, h0, h1,
                                              pool, (size_t)i);
               if(lr != RES_OK && lr != RES_BAD_OP
               && lr != RES_BAD_OP_IRRECOVERABLE) { tl_fatal = 1; }
               else if(lr == RES_BAD_OP || lr == RES_BAD_OP_IRRECOVERABLE) {
-                p->phase = PATH_DONE; p->active = 0; p->done_reason = -1;
+                hot->phase = (uint8_t)PATH_DONE; hot->active = 0; p->done_reason = -1;
                 tl_paths_failed++;
               }
-              if(phase_before == PATH_ENC_QUERY_FB_EMIT
-              && p->phase == PATH_ENC_LOCATE_PENDING) {
+              if(ph_before == PATH_ENC_QUERY_FB_EMIT
+              && (enum path_phase)hot->phase == PATH_ENC_LOCATE_PENDING) {
                 tl_enc_escalated++;
               }
               p->steps_taken++;
@@ -2284,14 +2312,15 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
     for(k = 0; k < pv->bucket_radiative_n; k++) {
       uint32_t i = pv->bucket_radiative[k];
       struct path_state* p = &pool->slots[i];
+      struct path_hot* hot = &pool->hot_arr[i];
       const struct s3d_hit* h0 = &pv->ray_hits[p->ray_req.batch_idx];
 
-      p->needs_ray = 0;
-      res = step_radiative_trace(p, scn, h0);
+      hot->needs_ray = 0;
+      res = step_radiative_trace(p, hot, scn, h0);
       if(res != RES_OK && res != RES_BAD_OP
       && res != RES_BAD_OP_IRRECOVERABLE) return res;
       if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
-        mark_path_failed(p, pool);
+        mark_path_failed(p, hot, pool);
         res = RES_OK;
       }
       p->steps_taken++;
@@ -2301,18 +2330,19 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
     for(k = 0; k < pv->bucket_conductive_n; k++) {
       uint32_t i = pv->bucket_conductive[k];
       struct path_state* p = &pool->slots[i];
+      struct path_hot* hot = &pool->hot_arr[i];
       const struct s3d_hit* h0 = &pv->ray_hits[p->ray_req.batch_idx];
       const struct s3d_hit* h1 = NULL;
       if(p->ray_req.ray_count >= 2)
         h1 = &pv->ray_hits[p->ray_req.batch_idx2];
 
-      p->needs_ray = 0;
-      res = step_conductive_ds_process(p, scn, h0, h1,
+      hot->needs_ray = 0;
+      res = step_conductive_ds_process(p, hot, scn, h0, h1,
                                        &pool->enc_arr[i]);
       if(res != RES_OK && res != RES_BAD_OP
       && res != RES_BAD_OP_IRRECOVERABLE) return res;
       if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
-        mark_path_failed(p, pool);
+        mark_path_failed(p, hot, pool);
         res = RES_OK;
       }
       p->steps_taken++;
@@ -2323,27 +2353,29 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
       for(k = 0; k < pv->bucket_other_n; k++) {
         uint32_t i = pv->bucket_other[k];
         struct path_state* p = &pool->slots[i];
+        struct path_hot* hot = &pool->hot_arr[i];
 
         {
           const struct s3d_hit* h0 = &pv->ray_hits[p->ray_req.batch_idx];
           const struct s3d_hit* h1 = NULL;
+          enum path_phase ph_before = (enum path_phase)hot->phase;
           if(p->ray_req.ray_count >= 2)
             h1 = &pv->ray_hits[p->ray_req.batch_idx2];
 
-          if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6) {
+          if(ph_before == PATH_ENC_QUERY_EMIT && hot->ray_count_ext == 6) {
             int j;
             for(j = 0; j < 6; j++) {
               pool->enc_arr[i].dir_hits[j] =
                 pv->ray_hits[pool->enc_arr[i].batch_indices[j]];
             }
           }
-          if(p->phase == PATH_ENC_QUERY_FB_EMIT) {
+          if(ph_before == PATH_ENC_QUERY_FB_EMIT) {
             pool->enc_arr[i].fb_hit = pv->ray_hits[p->ray_req.batch_idx];
           }
 
           /* B-4 M3: SS 4-ray pre-delivery (BUG-FIX) */
-          if(p->phase == PATH_BND_SS_REINJECT_SAMPLE
-          && p->ray_count_ext == 4) {
+          if(ph_before == PATH_BND_SS_REINJECT_SAMPLE
+          && hot->ray_count_ext == 4) {
             p->locals.bnd_ss.ray_frt[0] =
               pv->ray_hits[p->locals.bnd_ss.batch_idx_frt0];
             p->locals.bnd_ss.ray_frt[1] =
@@ -2355,18 +2387,17 @@ pool_distribute_ray_results(struct wavefront_pool* pool,
           }
 
           {
-            enum path_phase phase_before = p->phase;
-            p->needs_ray = 0;
-            res = advance_one_step_with_ray(p, scn, h0, h1,
+            hot->needs_ray = 0;
+            res = advance_one_step_with_ray(p, hot, scn, h0, h1,
                                             pool, (size_t)i);
             if(res != RES_OK && res != RES_BAD_OP
             && res != RES_BAD_OP_IRRECOVERABLE) return res;
             if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
-              mark_path_failed(p, pool);
+              mark_path_failed(p, hot, pool);
               res = RES_OK;
             }
-            if(phase_before == PATH_ENC_QUERY_FB_EMIT
-            && p->phase == PATH_ENC_LOCATE_PENDING) {
+            if(ph_before == PATH_ENC_QUERY_FB_EMIT
+            && (enum path_phase)hot->phase == PATH_ENC_LOCATE_PENDING) {
               pool->enc_query_escalated_to_m10++;
             }
             p->steps_taken++;
@@ -2404,6 +2435,7 @@ cascade_advance_single_path(
 #endif
 )
 {
+  struct path_hot* hot = &pool->hot_arr[slot_idx];
   for(;;) {
     int advanced = 0;
     enum path_phase phase_before;
@@ -2412,27 +2444,29 @@ cascade_advance_single_path(
 #endif
     res_T res;
 
-    if(p->needs_ray) break;
-    if(p->phase == PATH_DONE || p->phase == PATH_ERROR) {
+    if(hot->needs_ray) break;
+    if((enum path_phase)hot->phase == PATH_DONE
+    || (enum path_phase)hot->phase == PATH_ERROR) {
       /* M8: intercept PATH_DONE when sfn_stack_depth > 0. */
-      if(p->phase == PATH_DONE && pool->sfn_arr[slot_idx].depth > 0) {
-        p->phase = PATH_BND_SFN_COMPUTE_Ti_RESUME;
-        p->active = 1;
+      if((enum path_phase)hot->phase == PATH_DONE
+      && pool->sfn_arr[slot_idx].depth > 0) {
+        hot->phase = (uint8_t)PATH_BND_SFN_COMPUTE_Ti_RESUME;
+        hot->active = 1;
         continue;
       }
       break;
     }
-    if(path_phase_is_ray_pending(p->phase)) break;
-    if(path_phase_is_enc_locate_pending(p->phase)) break;
-    if(path_phase_is_cp_pending(p->phase)) break;
+    if(path_phase_is_ray_pending((enum path_phase)hot->phase)) break;
+    if(path_phase_is_enc_locate_pending((enum path_phase)hot->phase)) break;
+    if(path_phase_is_cp_pending((enum path_phase)hot->phase)) break;
 
     (*local_iterations)++;
-    phase_before = p->phase;
+    phase_before = (enum path_phase)hot->phase;
 #ifdef SDIS_CASCADE_PROFILE
     time_current(&t_step0);
 #endif
 
-    res = advance_one_step_no_ray(p, scn, &advanced, pool, slot_idx);
+    res = advance_one_step_no_ray(p, hot, scn, &advanced, pool, slot_idx);
 
 #ifdef SDIS_CASCADE_PROFILE
     time_current(&t_step1);
@@ -2450,8 +2484,8 @@ cascade_advance_single_path(
     if(res != RES_OK && res != RES_BAD_OP
     && res != RES_BAD_OP_IRRECOVERABLE) return 1; /* fatal */
     if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
-      p->phase = PATH_DONE;
-      p->active = 0;
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
       p->done_reason = -1;
       (*local_paths_failed)++;
       break;
@@ -2524,7 +2558,7 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
       for(ph = 0; ph < (int)n; ph++) {
         uint32_t idx = pv->active_indices[ph];
         struct path_state* p = &pool->slots[idx];
-        if(!p->active) continue;
+        if(!pool->hot_arr[idx].active) continue;
 
         if(cascade_advance_single_path(
               p, scn, pool, (size_t)idx,
@@ -2591,7 +2625,7 @@ pool_cascade_non_ray_steps_compact(struct wavefront_pool* pool,
     for(k = 0; k < n; k++) {
       uint32_t idx = pv->active_indices[k];
       struct path_state* p = &pool->slots[idx];
-      if(!p->active) continue;
+      if(!pool->hot_arr[idx].active) continue;
 
       if(cascade_advance_single_path(
             p, scn, pool, (size_t)idx,
@@ -2661,10 +2695,10 @@ harvest_completed_paths(
       for(kk = 0; kk < (int)pv->done_count; kk++) {
         uint32_t i = pv->done_indices[kk];
         struct path_state* p = &pool->slots[i];
-        enum path_phase ph = pool->dsoa.phase[i];
+        enum path_phase ph = (enum path_phase)pool->hot_arr[i].phase;
 
         if(ph == PATH_HARVESTED) continue;
-        if(!pool->dsoa.active[i] && ph != PATH_DONE && ph != PATH_ERROR)
+        if(!pool->hot_arr[i].active && ph != PATH_DONE && ph != PATH_ERROR)
           continue;
 
         /* Mode-specific per-path result accumulation (atomic-safe) */
@@ -2679,7 +2713,7 @@ harvest_completed_paths(
               (unsigned)p->ipix_image[0], (unsigned)p->ipix_image[1],
               (unsigned)p->realisation_idx,
               p->T.value, (int)p->T.done, p->done_reason,
-              (unsigned long long)p->steps_taken, (int)p->phase);
+              (unsigned long long)p->steps_taken, (int)ph);
           }
         }
 
@@ -2696,10 +2730,9 @@ harvest_completed_paths(
         default: break;
         }
 
-        p->active = 0;
-        p->phase  = PATH_HARVESTED;
-        pool->dsoa.active[i] = 0;
-        pool->dsoa.phase[i]  = PATH_HARVESTED;
+        /* P0_OPT: hot_arr is the canonical source for phase/active */
+        pool->hot_arr[i].active = 0;
+        pool->hot_arr[i].phase  = (uint8_t)PATH_HARVESTED;
       }
 
       /* Reduction: thread-local → pool */
@@ -2727,10 +2760,10 @@ harvest_completed_paths(
     for(k = 0; k < pv->done_count; k++) {
       uint32_t i = pv->done_indices[k];
       struct path_state* p = &pool->slots[i];
-      enum path_phase ph = pool->dsoa.phase[i];
+      enum path_phase ph = (enum path_phase)pool->hot_arr[i].phase;
 
       if(ph == PATH_HARVESTED) continue;
-      if(!pool->dsoa.active[i] && ph != PATH_DONE && ph != PATH_ERROR)
+      if(!pool->hot_arr[i].active && ph != PATH_DONE && ph != PATH_ERROR)
         continue;
 
       pool->ops->accumulate_result(p, pool->result_ctx);
@@ -2742,7 +2775,7 @@ harvest_completed_paths(
             (unsigned)p->ipix_image[0], (unsigned)p->ipix_image[1],
             (unsigned)p->realisation_idx,
             p->T.value, (int)p->T.done, p->done_reason,
-            (unsigned long long)p->steps_taken, (int)p->phase);
+            (unsigned long long)p->steps_taken, (int)ph);
         }
       }
 
@@ -2759,10 +2792,9 @@ harvest_completed_paths(
       default: break;
       }
 
-      p->active = 0;
-      p->phase  = PATH_HARVESTED;
-      pool->dsoa.active[i] = 0;
-      pool->dsoa.phase[i]  = PATH_HARVESTED;
+      /* P0_OPT: hot_arr is the canonical source for phase/active */
+      pool->hot_arr[i].active = 0;
+      pool->hot_arr[i].phase  = (uint8_t)PATH_HARVESTED;
     }
   }
 
@@ -2807,9 +2839,12 @@ refill_pool(struct wavefront_pool* pool, struct pool_view* pv,
     uint32_t i = pv->done_indices[k];
     struct path_state* p = &pool->slots[i];
 
-    if(p->active) continue;
-    if(p->phase != PATH_DONE && p->phase != PATH_ERROR
-    && p->phase != PATH_HARVESTED) continue;
+    /* P0_OPT: read dispatch fields from hot_arr (source of truth) */
+    if(pool->hot_arr[i].active) continue;
+    { enum path_phase rph = (enum path_phase)pool->hot_arr[i].phase;
+      if(rph != PATH_DONE && rph != PATH_ERROR
+      && rph != PATH_HARVESTED) continue;
+    }
 
     pv->done_indices[refill_n++] = i;  /* compact in-place; refill_n <= k */
   }
@@ -2845,7 +2880,7 @@ refill_pool(struct wavefront_pool* pool, struct pool_view* pv,
         res_T lr;
 
         lr = pool->ops->init_path(
-          p, pool->slot_rngs[i], task,
+          p, &pool->hot_arr[i], pool->slot_rngs[i], task,
           pool->scn, pool->enc_id, pool->mode_ctx,
           pool->time_range,
           pool->picard_order, pool->diff_algo,
@@ -2854,9 +2889,7 @@ refill_pool(struct wavefront_pool* pool, struct pool_view* pv,
 
         lr = advance_path_to_first_ray(p, pool->scn, pool, i);
         if(lr != RES_OK) { had_error = 1; continue; }
-
-        /* P1 SYNC POINT C: sync new path to SoA */
-        dispatch_soa_sync_from_path(&pool->dsoa, i, p);
+        /* P0_OPT: hot_arr[i] already written by advance_path_to_first_ray */
       }
 
       if(tl_paths_failed > 0) {
@@ -2873,7 +2906,7 @@ refill_pool(struct wavefront_pool* pool, struct pool_view* pv,
       res_T lr;
 
       lr = pool->ops->init_path(
-        p, pool->slot_rngs[i], task,
+        p, &pool->hot_arr[i], pool->slot_rngs[i], task,
         pool->scn, pool->enc_id, pool->mode_ctx,
         pool->time_range,
         pool->picard_order, pool->diff_algo,
@@ -2882,8 +2915,7 @@ refill_pool(struct wavefront_pool* pool, struct pool_view* pv,
 
       lr = advance_path_to_first_ray(p, pool->scn, pool, i);
       if(lr != RES_OK) return lr;
-
-      dispatch_soa_sync_from_path(&pool->dsoa, i, p);
+      /* P0_OPT: hot_arr[i] already written by advance_path_to_first_ray */
     }
   }
 
@@ -2961,9 +2993,7 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
               + pool->time_distribute_s
               + pool->time_enc_locate_s
               + pool->time_cp_s
-              + pool->time_sync_a_s
               + pool->time_cascade_s
-              + pool->time_sync_b_s
               + pool->time_harvest_s
               + pool->time_housekeeping_s
               + pool->time_gpu_sync_s
@@ -2986,7 +3016,7 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     "  refills=%llu\n"
     "  timing: compact=%.3fs  collect=%.3fs  trace=%.3fs(gpu=%.3fs cpu=%.3fs)\n"
     "          distribute=%.3fs  enc_locate=%.3fs  cp=%.3fs\n"
-    "          sync_a=%.3fs  cascade=%.3fs  sync_b=%.3fs\n"
+    "          cascade=%.3fs\n"
     "          harvest+refill=%.3fs  housekeeping=%.3fs\n"
     "          gpu_sync=%.3fs  gpu_launch=%.3fs\n"
     "          total_timed=%.3fs  wall=%.3fs  coverage=%.1f%%\n",
@@ -3021,9 +3051,7 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     pool->time_distribute_s,
     pool->time_enc_locate_s,
     pool->time_cp_s,
-    pool->time_sync_a_s,
     pool->time_cascade_s,
-    pool->time_sync_b_s,
     pool->time_harvest_s,
     pool->time_housekeeping_s,
     pool->time_gpu_sync_s,
@@ -3302,7 +3330,7 @@ gpu_wait_download(struct wavefront_pool* pool,
 
 /**
  * gpu_postprocess — distribute ray results, enc_locate, closest_point
- * batches, and sync dsoa.  Pure CPU work, no GPU dependency.
+ * batches.  Pure CPU work, no GPU dependency.  P0_OPT: no sync needed.
  *
  * Split out from gpu_wait_and_postprocess() so that it can run while
  * the opposite pool's GPU trace is already in flight.
@@ -3372,29 +3400,7 @@ gpu_postprocess(struct wavefront_pool* pool,
   time_current(&t1);
   pool->time_cp_s += time_elapsed_sec(&t0, &t1);
 
-  /* ---- P1 SYNC POINT A: distribute finished — refresh dsoa for slots
-   *      that received ray/enc_locate/cp results.  Sync all slots that
-   *      had pending rays (need_ray_indices from the preceding compact). */
-  time_current(&t0);
-  {
-    size_t k;
-    for(k = 0; k < pv->need_ray_count; k++) {
-      uint32_t idx = pv->need_ray_indices[k];
-      dispatch_soa_sync_from_path(&pool->dsoa, idx, &pool->slots[idx]);
-    }
-    /* Also sync enc_locate slots (may have transitioned phase) */
-    for(k = 0; k < pv->enc_locate_count; k++) {
-      uint32_t idx = pv->enc_locate_to_slot[k];
-      dispatch_soa_sync_from_path(&pool->dsoa, idx, &pool->slots[idx]);
-    }
-    /* Also sync closest_point slots */
-    for(k = 0; k < pv->cp_count; k++) {
-      uint32_t idx = pv->cp_to_slot[k];
-      dispatch_soa_sync_from_path(&pool->dsoa, idx, &pool->slots[idx]);
-    }
-  }
-  time_current(&t1);
-  pool->time_sync_a_s += time_elapsed_sec(&t0, &t1);
+  /* P0_OPT: SYNC POINT A removed — step functions write hot_arr directly */
 
   return RES_OK;
 }
@@ -3543,26 +3549,7 @@ cpu_between(struct wavefront_pool* pool, struct pool_view* pv)
   time_current(&t1);
   pool->time_cascade_s += time_elapsed_sec(&t0, &t1);
 
-  /* P1 SYNC POINT B: cascade finished — refresh dsoa for modified slots.
-   * O6: skip sync for paths where dispatch fields are unchanged (path
-   * exited cascade on first check without advancing).  Phase comparison
-   * is a reliable indicator since all state-machine transitions change phase. */
-  time_current(&t0);
-  {
-    size_t k;
-    for(k = 0; k < pv->active_compact; k++) {
-      uint32_t idx = pv->active_indices[k];
-      struct path_state* pp = &pool->slots[idx];
-      /* O6: skip if dispatch fields unchanged since last sync */
-      if(pool->dsoa.phase[idx]     == pp->phase
-      && pool->dsoa.active[idx]    == pp->active
-      && pool->dsoa.needs_ray[idx] == pp->needs_ray)
-        continue;
-      dispatch_soa_sync_from_path(&pool->dsoa, idx, pp);
-    }
-  }
-  time_current(&t1);
-  pool->time_sync_b_s += time_elapsed_sec(&t0, &t1);
+  /* P0_OPT: SYNC POINT B removed — step functions write hot_arr directly */
 
   /* rebuild done_indices after cascade + harvest + refill */
   time_current(&t0);
@@ -4105,7 +4092,7 @@ solve_camera_persistent_wavefront(
       pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
       t_cy[4] = t_pl1;  /* after waitD2h(A) */
 
-      /* 1e. CPU postprocess on A (distribute + enc_locate + cp + dsoa_sync) */
+      /* 1e. CPU postprocess on A (distribute + enc_locate + cp) */
       time_current(&t_pl0);
       res = gpu_postprocess(&pool, pv_a, scn);
       if(res != RES_OK) goto cleanup;
@@ -4560,27 +4547,7 @@ solve_camera_persistent_wavefront(
     time_current(&t_phase1);
     pool.time_cp_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
-    /* P1 SYNC POINT A (single-pool): distribute + enc_locate + cp finished
-     * — refresh dsoa for all modified slots before cascade and next cycle's
-     * compact/collect which read from dsoa. */
-    time_current(&t_phase0);
-    {
-      size_t k;
-      for(k = 0; k < pv->need_ray_count; k++) {
-        uint32_t idx = pv->need_ray_indices[k];
-        dispatch_soa_sync_from_path(&pool.dsoa, idx, &pool.slots[idx]);
-      }
-      for(k = 0; k < pv->enc_locate_count; k++) {
-        uint32_t idx = pv->enc_locate_to_slot[k];
-        dispatch_soa_sync_from_path(&pool.dsoa, idx, &pool.slots[idx]);
-      }
-      for(k = 0; k < pv->cp_count; k++) {
-        uint32_t idx = pv->cp_to_slot[k];
-        dispatch_soa_sync_from_path(&pool.dsoa, idx, &pool.slots[idx]);
-      }
-    }
-    time_current(&t_phase1);
-    pool.time_sync_a_s += time_elapsed_sec(&t_phase0, &t_phase1);
+    /* P0_OPT: SYNC POINT A removed — step functions write hot_arr directly */
 
     /* Step E: Cascade non-ray steps (compact) */
     time_current(&t_phase0);
@@ -4589,23 +4556,7 @@ solve_camera_persistent_wavefront(
     time_current(&t_phase1);
     pool.time_cascade_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
-    /* P1 SYNC POINT B (single-pool): cascade finished — refresh dsoa for
-     * modified slots.  O6: skip unchanged paths. */
-    time_current(&t_phase0);
-    {
-      size_t k;
-      for(k = 0; k < pv->active_compact; k++) {
-        uint32_t idx = pv->active_indices[k];
-        struct path_state* pp = &pool.slots[idx];
-        if(pool.dsoa.phase[idx]     == pp->phase
-        && pool.dsoa.active[idx]    == pp->active
-        && pool.dsoa.needs_ray[idx] == pp->needs_ray)
-          continue;
-        dispatch_soa_sync_from_path(&pool.dsoa, idx, pp);
-      }
-    }
-    time_current(&t_phase1);
-    pool.time_sync_b_s += time_elapsed_sec(&t_phase0, &t_phase1);
+    /* P0_OPT: SYNC POINT B removed — step functions write hot_arr directly */
 
     /* Step F+G: Harvest completed paths + refill (timed together) */
     time_current(&t_phase0);

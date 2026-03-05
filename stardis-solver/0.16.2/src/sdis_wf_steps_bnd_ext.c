@@ -65,7 +65,8 @@
 
 /* --- PATH_BND_EXT_CHECK: initialise ext flux, decide shadow ray ---------- */
 LOCAL_SYM res_T
-step_bnd_ext_check(struct path_state* p, struct sdis_scene* scn,
+step_bnd_ext_check(struct path_state* p, struct path_hot* hot,
+                   struct sdis_scene* scn,
                    struct path_ext_data* ext)
 {
   struct sdis_interface* interf = NULL;
@@ -109,8 +110,8 @@ step_bnd_ext_check(struct path_state* p, struct sdis_scene* scn,
   handle_flux = handle_flux && (scn->source != NULL);
   if(!handle_flux) {
     /* No external flux â†?skip directly to caller */
-    p->phase = ext->return_state;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)ext->return_state;
+    hot->needs_ray = 0;
     goto exit;
   }
 
@@ -123,8 +124,8 @@ step_bnd_ext_check(struct path_state* p, struct sdis_scene* scn,
   if(res != RES_OK) goto error;
 
   if(ext->emissivity == 0) {
-    p->phase = ext->return_state;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)ext->return_state;
+    hot->needs_ray = 0;
     goto exit;
   }
 
@@ -185,10 +186,10 @@ step_bnd_ext_check(struct path_state* p, struct sdis_scene* scn,
     p->filter_data_storage.scn = scn;
     p->filter_data_storage.enc_id = ext->enc_id_fluid;
 
-    p->ray_bucket = RAY_BUCKET_SHADOW;
-    p->ray_count_ext = 1;
-    p->needs_ray = 1;
-    p->phase = PATH_BND_EXT_DIRECT_TRACE;
+    hot->ray_bucket = (uint8_t)RAY_BUCKET_SHADOW;
+    hot->ray_count_ext = (uint8_t)1;
+    hot->needs_ray = 1;
+    hot->phase = (uint8_t)PATH_BND_EXT_DIRECT_TRACE;
   } else {
     /* Source behind surface â†?skip direct contribution, go to diffuse */
     ext->flux_direct = 0;
@@ -230,25 +231,26 @@ step_bnd_ext_check(struct path_state* p, struct sdis_scene* scn,
       p->filter_data_storage.scn = scn;
       p->filter_data_storage.enc_id = ext->enc_id_fluid;
 
-      p->ray_bucket = RAY_BUCKET_RADIATIVE;
-      p->ray_count_ext = 1;
-      p->needs_ray = 1;
-      p->phase = PATH_BND_EXT_DIFFUSE_TRACE;
+      hot->ray_bucket = (uint8_t)RAY_BUCKET_RADIATIVE;
+      hot->ray_count_ext = (uint8_t)1;
+      hot->needs_ray = 1;
+      hot->phase = (uint8_t)PATH_BND_EXT_DIFFUSE_TRACE;
     }
   }
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_BND_EXT_DIRECT_RESULT: process shadow ray result --------------- */
 LOCAL_SYM res_T
-step_bnd_ext_direct_result(struct path_state* p, struct sdis_scene* scn,
+step_bnd_ext_direct_result(struct path_state* p, struct path_hot* hot,
+                           struct sdis_scene* scn,
                            const struct s3d_hit* hit,
                            struct path_ext_data* ext)
 {
@@ -302,17 +304,18 @@ step_bnd_ext_direct_result(struct path_state* p, struct sdis_scene* scn,
   p->filter_data_storage.scn = scn;
   p->filter_data_storage.enc_id = ext->enc_id_fluid;
 
-  p->ray_bucket = RAY_BUCKET_RADIATIVE;
-  p->ray_count_ext = 1;
-  p->needs_ray = 1;
-  p->phase = PATH_BND_EXT_DIFFUSE_TRACE;
+  hot->ray_bucket = (uint8_t)RAY_BUCKET_RADIATIVE;
+  hot->ray_count_ext = (uint8_t)1;
+  hot->needs_ray = 1;
+  hot->phase = (uint8_t)PATH_BND_EXT_DIFFUSE_TRACE;
 
   return res;
 }
 
 /* --- PATH_BND_EXT_DIFFUSE_RESULT: process diffuse bounce ray result ------ */
 LOCAL_SYM res_T
-step_bnd_ext_diffuse_result(struct path_state* p, struct sdis_scene* scn,
+step_bnd_ext_diffuse_result(struct path_state* p, struct path_hot* hot,
+                            struct sdis_scene* scn,
                             const struct s3d_hit* hit,
                             struct path_ext_data* ext)
 {
@@ -327,8 +330,8 @@ step_bnd_ext_diffuse_result(struct path_state* p, struct sdis_scene* scn,
     ext->scattered_dir[1] = ext->dir[1];
     ext->scattered_dir[2] = ext->dir[2];
 
-    p->phase = PATH_BND_EXT_FINALIZE;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_BND_EXT_FINALIZE;
+    hot->needs_ray = 0;
     goto exit;
   }
 
@@ -387,8 +390,8 @@ step_bnd_ext_diffuse_result(struct path_state* p, struct sdis_scene* scn,
       /* Absorption test */
       if(ssp_rng_canonical(p->rng) < brdf.emissivity) {
         /* Absorbed â†?diffuse bounce terminates with no further contribution */
-        p->phase = PATH_BND_EXT_FINALIZE;
-        p->needs_ray = 0;
+        hot->phase = (uint8_t)PATH_BND_EXT_FINALIZE;
+        hot->needs_ray = 0;
         goto exit;
       }
 
@@ -438,10 +441,10 @@ step_bnd_ext_diffuse_result(struct path_state* p, struct sdis_scene* scn,
           p->filter_data_storage.scn = scn;
           p->filter_data_storage.enc_id = ext->enc_id_fluid;
 
-          p->ray_bucket = RAY_BUCKET_SHADOW;
-          p->ray_count_ext = 1;
-          p->needs_ray = 1;
-          p->phase = PATH_BND_EXT_DIFFUSE_SHADOW_TRACE;
+          hot->ray_bucket = (uint8_t)RAY_BUCKET_SHADOW;
+          hot->ray_count_ext = (uint8_t)1;
+          hot->needs_ray = 1;
+          hot->phase = (uint8_t)PATH_BND_EXT_DIFFUSE_SHADOW_TRACE;
 
           /* Save the specular bounce direction as the next diffuse dir */
           /* (will be used after shadow result to continue bouncing) */
@@ -489,10 +492,10 @@ step_bnd_ext_diffuse_result(struct path_state* p, struct sdis_scene* scn,
           p->filter_data_storage.scn = scn;
           p->filter_data_storage.enc_id = ext->enc_id_fluid;
 
-          p->ray_bucket = RAY_BUCKET_SHADOW;
-          p->ray_count_ext = 1;
-          p->needs_ray = 1;
-          p->phase = PATH_BND_EXT_DIFFUSE_SHADOW_TRACE;
+          hot->ray_bucket = (uint8_t)RAY_BUCKET_SHADOW;
+          hot->ray_count_ext = (uint8_t)1;
+          hot->needs_ray = 1;
+          hot->phase = (uint8_t)PATH_BND_EXT_DIFFUSE_SHADOW_TRACE;
 
           /* Save bounce direction for next diffuse bounce */
           ext->dir[0] = (float)bounce.dir[0];
@@ -526,18 +529,18 @@ step_bnd_ext_diffuse_result(struct path_state* p, struct sdis_scene* scn,
       p->filter_data_storage.scn = scn;
       p->filter_data_storage.enc_id = ext->enc_id_fluid;
 
-      p->ray_bucket = RAY_BUCKET_RADIATIVE;
-      p->ray_count_ext = 1;
-      p->needs_ray = 1;
-      p->phase = PATH_BND_EXT_DIFFUSE_TRACE;
+      hot->ray_bucket = (uint8_t)RAY_BUCKET_RADIATIVE;
+      hot->ray_count_ext = (uint8_t)1;
+      hot->needs_ray = 1;
+      hot->phase = (uint8_t)PATH_BND_EXT_DIFFUSE_TRACE;
     }
   }
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
@@ -545,6 +548,7 @@ error:
 /* --- PATH_BND_EXT_DIFFUSE_SHADOW_RESULT: shadow ray at bounce position --- */
 LOCAL_SYM res_T
 step_bnd_ext_diffuse_shadow_result(struct path_state* p,
+                                   struct path_hot* hot,
                                    struct sdis_scene* scn,
                                    const struct s3d_hit* hit,
                                    struct path_ext_data* ext)
@@ -593,17 +597,18 @@ step_bnd_ext_diffuse_shadow_result(struct path_state* p,
   p->filter_data_storage.scn = scn;
   p->filter_data_storage.enc_id = ext->enc_id_fluid;
 
-  p->ray_bucket = RAY_BUCKET_RADIATIVE;
-  p->ray_count_ext = 1;
-  p->needs_ray = 1;
-  p->phase = PATH_BND_EXT_DIFFUSE_TRACE;
+  hot->ray_bucket = (uint8_t)RAY_BUCKET_RADIATIVE;
+  hot->ray_count_ext = (uint8_t)1;
+  hot->needs_ray = 1;
+  hot->phase = (uint8_t)PATH_BND_EXT_DIFFUSE_TRACE;
 
   return res;
 }
 
 /* --- PATH_BND_EXT_FINALIZE: sum flux, apply to T, return to caller ------- */
 LOCAL_SYM res_T
-step_bnd_ext_finalize(struct path_state* p, struct sdis_scene* scn,
+step_bnd_ext_finalize(struct path_state* p, struct path_hot* hot,
+                      struct sdis_scene* scn,
                       struct path_ext_data* ext)
 {
   struct sdis_green_external_flux_terms green =
@@ -653,14 +658,14 @@ step_bnd_ext_finalize(struct path_state* p, struct sdis_scene* scn,
   }
 
   /* Return to caller */
-  p->phase = ext->return_state;
-  p->needs_ray = 0;
+  hot->phase = (uint8_t)ext->return_state;
+  hot->needs_ray = 0;
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }

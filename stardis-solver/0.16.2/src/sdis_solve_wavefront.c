@@ -30,6 +30,14 @@
  */
 
 #include "sdis_solve_wavefront.h"
+
+#ifdef SDIS_P0_OPT
+/* P0_OPT: old per-tile wavefront disabled — hot fields (phase, active,
+ * needs_ray, ray_bucket, ray_count_ext) moved to path_hot and the legacy
+ * code that reads them from path_state cannot compile.  The persistent
+ * wavefront (sdis_solve_persistent_wavefront.c) is the only active path. */
+#else  /* !SDIS_P0_OPT */
+
 #include "sdis_solve_persistent_wavefront.h"  /* P1: wavefront_pool for cold-block proxy */
 #include "sdis_wf_steps.h"
 #include "sdis.h"
@@ -1721,3 +1729,5 @@ exit_batch:
   if(rng && !args_array[0].rng_state) ssp_rng_ref_put(rng);
   return res;
 }
+
+#endif  /* !SDIS_P0_OPT */

@@ -49,7 +49,7 @@
 
 #include "sdis.h"
 #include "sdis_solve_wavefront.h"  /* path_state, path_phase, ray_request */
-#include "sdis_wf_soa.h"              /* P1: dispatch_soa */
+#include "sdis_wf_hot.h"               /* P0_OPT: path_hot */
 
 #include <star/s3d.h>
 #include <star/ssp.h>
@@ -99,8 +99,10 @@ struct wavefront_ops {
 
   /* Initialise a single path in slot from a pixel_task.
    * Camera: camera_ray + PATH_INIT.
-   * Probe:  position + PATH_COUPLED_CONDUCTIVE/CONVECTIVE. */
+   * Probe:  position + PATH_COUPLED_CONDUCTIVE/CONVECTIVE.
+   * P0_OPT: hot receives the 5 dispatch-hot fields (phase, active, ...). */
   res_T (*init_path)(struct path_state* p,
+                     struct path_hot* hot,
                      struct ssp_rng* rng,
                      const struct pixel_task* task,
                      struct sdis_scene* scn,
@@ -322,8 +324,8 @@ struct wavefront_pool {
   size_t                       cp_count;     /* queries this step */
   size_t                       max_cps;      /* pool_size */
 
-  /* --- P1: Dispatch-layer SoA mirror --- */
-  struct dispatch_soa  dsoa;
+  /* --- P0_OPT: Dispatch-hot compact array --- */
+  struct path_hot*     hot_arr;         /* [pool_size], 8B per slot */
 
   /* --- P1: Cold-block SoA arrays (separated from path_state slots) --- */
   struct path_sfn_data *sfn_arr;     /* [pool_size], PicardN stack        */
@@ -389,8 +391,7 @@ struct wavefront_pool {
   double time_cascade_s;    /* cumulative cascade non-ray time       */
   double time_compact_s;    /* cumulative stream compaction time     */
   double time_harvest_s;    /* cumulative harvest+refill time        */
-  double time_sync_a_s;     /* cumulative SYNC POINT A (dsoa after distribute) */
-  double time_sync_b_s;     /* cumulative SYNC POINT B (dsoa after cascade)    */
+  /* P0_OPT: sync timers removed (sync_a, sync_b eliminated) */
   double time_housekeeping_s; /* cumulative Steps H-L (update/diag/progress)   */
   double time_trace_cpu_s;  /* trace CPU component (postprocess+retrace) ms→s  */
   double time_gpu_sync_s;   /* cumulative GPU kernel sync wait (dual-buffer)   */
@@ -446,10 +447,18 @@ struct wavefront_pool {
 static INLINE size_t
 count_path_rays(const struct path_state* p)
 {
-  /* B-4 M1-v2: 6-ray enc_query uses ray_count_ext for extra rays */
+  /* B-4 M1-v2: 6-ray enc_query uses ray_count_ext for extra rays.
+   * P0_OPT: phase/ray_count_ext moved to path_hot; this legacy helper
+   * is only compiled for the old wavefront path (sdis_solve_wavefront.c).
+   * The persistent wavefront uses count_path_rays_soa() instead. */
+#ifdef SDIS_P0_OPT
+  (void)p;
+  return (size_t)p->ray_req.ray_count;  /* hot fields unavailable */
+#else
   if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6)
     return 6;
   return (size_t)p->ray_req.ray_count;
+#endif
 }
 
 /* P1: SoA-friendly variant — reads phase + ray_count_ext from SoA,

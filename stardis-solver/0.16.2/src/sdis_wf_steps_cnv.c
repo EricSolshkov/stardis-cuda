@@ -51,7 +51,7 @@
 
 /* --- PATH_CNV_INIT: check known fluid temp + decide startup ray or loop -- */
 LOCAL_SYM res_T
-step_cnv_init(struct path_state* p, struct sdis_scene* scn)
+step_cnv_init(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   const struct enclosure* enc = NULL;
   struct sdis_medium* mdm = NULL;
@@ -93,8 +93,8 @@ step_cnv_init(struct path_state* p, struct sdis_scene* scn)
     if(p->ctx.heat_path) {
       heat_path_get_last_vertex(p->ctx.heat_path)->weight = p->T.value;
     }
-    p->phase = PATH_DONE;
-    p->active = 0;
+    hot->phase = (uint8_t)PATH_DONE;
+    hot->active = 0;
     p->done_reason = 2; /* temperature known */
     goto exit;
   }
@@ -102,8 +102,8 @@ step_cnv_init(struct path_state* p, struct sdis_scene* scn)
   /* Check if path starts from fluid interior (HIT_NONE) */
   if(S3D_HIT_NONE(&p->rwalk.hit_3d)) {
     /* Need startup ray along +Z to find initial hit */
-    setup_convective_startup_ray(p);
-    p->phase = PATH_CNV_STARTUP_TRACE;
+    setup_convective_startup_ray(p, hot);
+    hot->phase = (uint8_t)PATH_CNV_STARTUP_TRACE;
     goto exit;
   }
 
@@ -132,8 +132,8 @@ step_cnv_init(struct path_state* p, struct sdis_scene* scn)
       if(p->ctx.heat_path) {
         heat_path_get_last_vertex(p->ctx.heat_path)->weight = p->T.value;
       }
-      p->phase = PATH_DONE;
-      p->active = 0;
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
       p->done_reason = 2;
     } else {
       log_err(scn->dev,
@@ -146,20 +146,21 @@ step_cnv_init(struct path_state* p, struct sdis_scene* scn)
   }
 
   /* Ready for sampling loop */
-  p->phase = PATH_CNV_SAMPLE_LOOP;
+  hot->phase = (uint8_t)PATH_CNV_SAMPLE_LOOP;
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_CNV_STARTUP_RESULT: process startup ray result ----------------- */
 LOCAL_SYM res_T
-step_cnv_startup_result(struct path_state* p, struct sdis_scene* scn,
+step_cnv_startup_result(struct path_state* p, struct path_hot* hot,
+                        struct sdis_scene* scn,
                         const struct s3d_hit* hit)
 {
   const struct enclosure* enc = NULL;
@@ -207,8 +208,8 @@ step_cnv_startup_result(struct path_state* p, struct sdis_scene* scn,
     if(SDIS_TEMPERATURE_IS_KNOWN(temperature)) {
       p->T.value += temperature;
       p->T.done = 1;
-      p->phase = PATH_DONE;
-      p->active = 0;
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
       p->done_reason = 2;
     } else {
       log_err(scn->dev,
@@ -220,20 +221,21 @@ step_cnv_startup_result(struct path_state* p, struct sdis_scene* scn,
     goto exit;
   }
 
-  p->phase = PATH_CNV_SAMPLE_LOOP;
+  hot->phase = (uint8_t)PATH_CNV_SAMPLE_LOOP;
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_CNV_SAMPLE_LOOP: null-collision sampling (pure compute) -------- */
 LOCAL_SYM res_T
-step_cnv_sample_loop(struct path_state* p, struct sdis_scene* scn)
+step_cnv_sample_loop(struct path_state* p, struct path_hot* hot,
+                     struct sdis_scene* scn)
 {
   const struct enclosure* enc = NULL;
   struct sdis_medium* mdm = NULL;
@@ -263,8 +265,8 @@ step_cnv_sample_loop(struct path_state* p, struct sdis_scene* scn)
   res = time_rewind(scn, mu, props.t0, p->rng, &p->rwalk, &p->ctx, &p->T);
   if(res != RES_OK) goto error;
   if(p->T.done) {
-    p->phase = PATH_DONE;
-    p->active = 0;
+    hot->phase = (uint8_t)PATH_DONE;
+    hot->active = 0;
     p->done_reason = 4; /* time rewind */
     goto exit;
   }
@@ -328,19 +330,19 @@ step_cnv_sample_loop(struct path_state* p, struct sdis_scene* scn)
     p->rwalk.hit_3d.distance = 0;
     p->rwalk.enc_id = ENCLOSURE_ID_NULL;
     p->T.func = boundary_path_3d;
-    p->phase = PATH_BND_DISPATCH;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_BND_DISPATCH;
+    hot->needs_ray = 0;
   } else {
     /* Null-collision → loop back to self */
-    p->phase = PATH_CNV_SAMPLE_LOOP;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_CNV_SAMPLE_LOOP;
+    hot->needs_ray = 0;
   }
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
@@ -351,7 +353,8 @@ error:
 
 /* --- PATH_BND_DISPATCH: Dirichlet check + 3-way dispatch ----------------- */
 LOCAL_SYM res_T
-step_bnd_dispatch(struct path_state* p, struct sdis_scene* scn)
+step_bnd_dispatch(struct path_state* p, struct path_hot* hot,
+                  struct sdis_scene* scn)
 {
   struct sdis_interface* interf = NULL;
   struct sdis_interface_fragment frag = SDIS_INTERFACE_FRAGMENT_NULL;
@@ -388,8 +391,8 @@ step_bnd_dispatch(struct path_state* p, struct sdis_scene* scn)
     if(p->ctx.heat_path) {
       heat_path_get_last_vertex(p->ctx.heat_path)->weight = p->T.value;
     }
-    p->phase = PATH_DONE;
-    p->active = 0;
+    hot->phase = (uint8_t)PATH_DONE;
+    hot->active = 0;
     p->done_reason = 3; /* boundary done */
     goto exit;
   }
@@ -400,7 +403,7 @@ step_bnd_dispatch(struct path_state* p, struct sdis_scene* scn)
   /* 3-way dispatch */
   if(mdm_front->type == mdm_back->type) {
     /* solid/solid → M3 batched reinjection */
-    res = step_bnd_ss_reinject_sample(p, scn);
+    res = step_bnd_ss_reinject_sample(p, hot, scn);
   } else if(p->ctx.nbranchings == p->ctx.max_branchings) {
     /* solid/fluid picard1 → M5 batched state machine.
      * Reset h_hat so that step_bnd_sf_prob_dispatch re-computes transfer
@@ -410,7 +413,7 @@ step_bnd_dispatch(struct path_state* p, struct sdis_scene* scn)
      * handle_net_flux call) is skipped entirely. */
     p->locals.bnd_sf.is_picardn = 0;
     p->locals.bnd_sf.h_hat = 0;
-    res = step_bnd_sf_reinject_sample(p, scn);
+    res = step_bnd_sf_reinject_sample(p, hot, scn);
   } else {
     /* solid/fluid picardN → M8 batched state machine.
      * Reuse M5 SF reinjection setup but mark as picardN so that
@@ -420,21 +423,22 @@ step_bnd_dispatch(struct path_state* p, struct sdis_scene* scn)
      * so the stack must nest properly. */
     p->locals.bnd_sf.is_picardn = 1;
     p->locals.bnd_sf.h_hat = 0;        /* force init in sfn_prob_dispatch  */
-    res = step_bnd_sf_reinject_sample(p, scn);
+    res = step_bnd_sf_reinject_sample(p, hot, scn);
   }
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_BND_POST_ROBIN_CHECK: Robin boundary condition post-check ------ */
 LOCAL_SYM res_T
-step_bnd_post_robin_check(struct path_state* p, struct sdis_scene* scn)
+step_bnd_post_robin_check(struct path_state* p, struct path_hot* hot,
+                          struct sdis_scene* scn)
 {
   res_T res = RES_OK;
 
@@ -445,8 +449,8 @@ step_bnd_post_robin_check(struct path_state* p, struct sdis_scene* scn)
    * This catches radiative miss-accept paths (T.done=1, T.func still
    * boundary_path_3d) that must NOT re-enter PATH_BND_DISPATCH. */
   if(p->T.done) {
-    p->phase = PATH_DONE;
-    p->active = 0;
+    hot->phase = (uint8_t)PATH_DONE;
+    hot->active = 0;
     p->done_reason = 2; /* temperature known */
     goto exit;
   }
@@ -459,8 +463,8 @@ step_bnd_post_robin_check(struct path_state* p, struct sdis_scene* scn)
       scn, &p->ctx, &p->rwalk, &p->T);
     if(res != RES_OK) goto error;
     if(p->T.done) {
-      p->phase = PATH_DONE;
-      p->active = 0;
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
       p->done_reason = 2; /* temperature known */
       goto exit;
     }
@@ -468,23 +472,23 @@ step_bnd_post_robin_check(struct path_state* p, struct sdis_scene* scn)
 
   /* Temperature not known — route to next path type */
   if(p->T.func == convective_path_3d) {
-    p->phase = PATH_COUPLED_CONVECTIVE;
+    hot->phase = (uint8_t)PATH_COUPLED_CONVECTIVE;
   } else if(p->T.func == conductive_path_3d) {
-    p->phase = PATH_COUPLED_CONDUCTIVE;
+    hot->phase = (uint8_t)PATH_COUPLED_CONDUCTIVE;
   } else if(p->T.func == radiative_path_3d) {
-    p->phase = PATH_COUPLED_RADIATIVE;
+    hot->phase = (uint8_t)PATH_COUPLED_RADIATIVE;
   } else if(p->T.func == boundary_path_3d) {
-    p->phase = PATH_BND_DISPATCH;
+    hot->phase = (uint8_t)PATH_BND_DISPATCH;
   } else {
     FATAL("wavefront M6: unexpected T.func in post-robin check\n");
   }
-  p->needs_ray = 0;
+  hot->needs_ray = 0;
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }

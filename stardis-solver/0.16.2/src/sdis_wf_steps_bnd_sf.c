@@ -59,7 +59,7 @@
 
 /* Helper: set up 2-ray request for SF reinjection (dir0 + reflect(dir0)) */
 LOCAL_SYM void
-setup_sf_reinject_rays(struct path_state* p)
+setup_sf_reinject_rays(struct path_state* p, struct path_hot* hot)
 {
   float pos[3];
 
@@ -89,15 +89,15 @@ setup_sf_reinject_rays(struct path_state* p)
   p->ray_req.range2[1] = FLT_MAX;
   p->ray_req.ray_count = 2;
 
-  p->ray_count_ext = 2;
-  p->ray_bucket = RAY_BUCKET_STEP_PAIR;
-  p->needs_ray = 1;
-  p->phase = PATH_BND_SF_REINJECT_SAMPLE;
+  hot->ray_count_ext = (uint8_t)2;
+  hot->ray_bucket = (uint8_t)RAY_BUCKET_STEP_PAIR;
+  hot->needs_ray = 1;
+  hot->phase = (uint8_t)PATH_BND_SF_REINJECT_SAMPLE;
 }
 
 /* --- PATH_BND_SF_REINJECT_SAMPLE entry: prepare interface + emit 2 rays -- */
 LOCAL_SYM res_T
-step_bnd_sf_reinject_sample(struct path_state* p, struct sdis_scene* scn)
+step_bnd_sf_reinject_sample(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   struct sdis_interface* interf = NULL;
   struct sdis_medium* solid = NULL;
@@ -174,10 +174,10 @@ step_bnd_sf_reinject_sample(struct path_state* p, struct sdis_scene* scn)
     p->locals.bnd_sf.retry_count = 0;
 
     /* Skip ray trace, go directly to prob_dispatch via solid_reinjection */
-    p->phase = p->locals.bnd_sf.is_picardn
+    hot->phase = (uint8_t)(p->locals.bnd_sf.is_picardn
              ? PATH_BND_SFN_PROB_DISPATCH
-             : PATH_BND_SF_PROB_DISPATCH;
-    p->needs_ray = 0;
+             : PATH_BND_SF_PROB_DISPATCH);
+    hot->needs_ray = 0;
     return RES_OK;
   }
 
@@ -205,12 +205,12 @@ step_bnd_sf_reinject_sample(struct path_state* p, struct sdis_scene* scn)
   p->locals.bnd_sf.enc1_id = ENCLOSURE_ID_NULL;
 
   /* Emit 2 reinjection rays */
-  setup_sf_reinject_rays(p);
+  setup_sf_reinject_rays(p, hot);
   return RES_OK;
 
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   return res;
 }
@@ -219,6 +219,7 @@ error:
 LOCAL_SYM res_T
 step_bnd_sf_reinject_process(
   struct path_state* p,
+  struct path_hot* hot,
   struct sdis_scene* scn,
   const struct s3d_hit* hit0,
   const struct s3d_hit* hit1,
@@ -354,7 +355,7 @@ step_bnd_sf_reinject_process(
     p->locals.bnd_sf.enc1_id = ENCLOSURE_ID_NULL;
     p->locals.bnd_sf.need_enc = 0;
 
-    setup_sf_reinject_rays(p);
+    setup_sf_reinject_rays(p, hot);
     return RES_OK; /* re-emit rays */
   }
 
@@ -364,27 +365,27 @@ step_bnd_sf_reinject_process(
     d3_set(pos, p->rwalk.vtx.P);
     move_pos_3d(pos, p->locals.bnd_sf.chosen_dir,
                 p->locals.bnd_sf.chosen_dst);
-    step_enc_query_emit(p, enc, pos, PATH_BND_SF_REINJECT_ENC);
+    step_enc_query_emit(p, hot, enc, pos, PATH_BND_SF_REINJECT_ENC);
     return RES_OK;
   }
 
   /* Reinjection resolved — proceed to probability dispatch */
-  p->phase = p->locals.bnd_sf.is_picardn
+  hot->phase = (uint8_t)(p->locals.bnd_sf.is_picardn
            ? PATH_BND_SFN_PROB_DISPATCH
-           : PATH_BND_SF_PROB_DISPATCH;
-  p->needs_ray = 0;
+           : PATH_BND_SF_PROB_DISPATCH);
+  hot->needs_ray = 0;
   return RES_OK;
 
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   return res;
 }
 
 /* --- PATH_BND_SF_REINJECT_ENC: ENC verification result ------------------- */
 LOCAL_SYM res_T
-step_bnd_sf_reinject_enc_result(struct path_state* p, struct sdis_scene* scn,
+step_bnd_sf_reinject_enc_result(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn,
                                struct path_enc_data* enc)
 {
   unsigned enc_id;
@@ -417,8 +418,8 @@ step_bnd_sf_reinject_enc_result(struct path_state* p, struct sdis_scene* scn,
         (double)p->locals.bnd_sf.chosen_dir[1],
         (double)p->locals.bnd_sf.chosen_dir[2],
         (double)p->locals.bnd_sf.chosen_dst);*/
-      p->phase = PATH_DONE;
-      p->active = 0;
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
       p->done_reason = -1;
       return RES_BAD_OP_IRRECOVERABLE;
     }
@@ -443,21 +444,21 @@ step_bnd_sf_reinject_enc_result(struct path_state* p, struct sdis_scene* scn,
     p->locals.bnd_sf.enc1_id = ENCLOSURE_ID_NULL;
     p->locals.bnd_sf.need_enc = 0;
 
-    setup_sf_reinject_rays(p);
+    setup_sf_reinject_rays(p, hot);
     return RES_OK;
   }
 
   /* ENC verified — proceed to probability dispatch */
-  p->phase = p->locals.bnd_sf.is_picardn
+  hot->phase = (uint8_t)(p->locals.bnd_sf.is_picardn
            ? PATH_BND_SFN_PROB_DISPATCH
-           : PATH_BND_SF_PROB_DISPATCH;
-  p->needs_ray = 0;
+           : PATH_BND_SF_PROB_DISPATCH);
+  hot->needs_ray = 0;
   return RES_OK;
 }
 
 /* --- PATH_BND_SF_PROB_DISPATCH: solid_reinjection + prob dispatch --------- */
 LOCAL_SYM res_T
-step_bnd_sf_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
+step_bnd_sf_prob_dispatch(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn,
                          struct path_ext_data* ext)
 {
   struct reinjection_step reinject_step = REINJECTION_STEP_NULL;
@@ -528,9 +529,9 @@ step_bnd_sf_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
      * When EXT completes, it returns to PATH_BND_SF_PROB_DISPATCH where
      * h_hat != 0 → goes directly to null-collision dispatch. */
     ext->return_state = PATH_BND_SF_PROB_DISPATCH;
-    p->phase = PATH_BND_EXT_CHECK;
-    p->needs_ray = 0;
-    return step_bnd_ext_check(p, scn, ext);
+    hot->phase = (uint8_t)PATH_BND_EXT_CHECK;
+    hot->needs_ray = 0;
+    return step_bnd_ext_check(p, hot, scn, ext);
   }
 
   /* === Null-collision dispatch === */
@@ -542,8 +543,8 @@ step_bnd_sf_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
     p->T.func = convective_path_3d;
     p->rwalk.enc_id = p->locals.bnd_sf.enc_ids[p->locals.bnd_sf.fluid_side];
     p->rwalk.hit_side = p->locals.bnd_sf.fluid_side;
-    p->phase = PATH_BND_POST_ROBIN_CHECK;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_BND_POST_ROBIN_CHECK;
+    hot->needs_ray = 0;
     goto exit;
   }
 
@@ -565,8 +566,8 @@ step_bnd_sf_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
     if(res != RES_OK) goto error;
 
     if(p->T.done) {
-      p->phase = PATH_DONE;
-      p->active = 0;
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
       p->done_reason = 4;
       goto exit;
     }
@@ -575,13 +576,13 @@ step_bnd_sf_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
     if(p->T.func == conductive_path_3d) {
       p->ds_initialized = 0; /* reset for fresh conductive entry */
       p->locals.cnd_wos.wos_initialized = 0; /* union was bnd_sf — clear */
-      p->phase = PATH_COUPLED_CONDUCTIVE;
+      hot->phase = (uint8_t)PATH_COUPLED_CONDUCTIVE;
     } else if(p->T.func == boundary_path_3d) {
-      p->phase = PATH_COUPLED_BOUNDARY;
+      hot->phase = (uint8_t)PATH_COUPLED_BOUNDARY;
     } else {
       FATAL("wavefront M5: unexpected T.func after solid_reinjection\n");
     }
-    p->needs_ray = 0;
+    hot->needs_ray = 0;
     goto exit;
   }
 
@@ -638,18 +639,18 @@ step_bnd_sf_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
       p->filter_data_storage.scn = scn;
       p->filter_data_storage.enc_id = p->rwalk.enc_id;
 
-      p->ray_bucket = RAY_BUCKET_RADIATIVE;
-      p->ray_count_ext = 1;
-      p->needs_ray = 1;
-      p->phase = PATH_BND_SF_NULLCOLL_RAD_TRACE;
+      hot->ray_bucket = (uint8_t)RAY_BUCKET_RADIATIVE;
+      hot->ray_count_ext = (uint8_t)1;
+      hot->needs_ray = 1;
+      hot->phase = (uint8_t)PATH_BND_SF_NULLCOLL_RAD_TRACE;
     }
   }
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
@@ -658,6 +659,7 @@ error:
 LOCAL_SYM res_T
 step_bnd_sf_nullcoll_rad_trace(
   struct path_state* p,
+  struct path_hot* hot,
   struct sdis_scene* scn,
   const struct s3d_hit* trace_hit)
 {
@@ -698,8 +700,8 @@ step_bnd_sf_nullcoll_rad_trace(
     p->rwalk.hit_3d = S3D_HIT_NULL;
     p->rwalk.hit_side = SDIS_SIDE_NULL__;
 
-    p->phase = PATH_BND_SF_NULLCOLL_DECIDE;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_BND_SF_NULLCOLL_DECIDE;
+    hot->needs_ray = 0;
     goto exit;
   }
 
@@ -784,10 +786,10 @@ step_bnd_sf_nullcoll_rad_trace(
           p->filter_data_storage.scn = scn;
           p->filter_data_storage.enc_id = p->rwalk.enc_id;
 
-          p->ray_bucket = RAY_BUCKET_RADIATIVE;
-          p->ray_count_ext = 1;
-          p->needs_ray = 1;
-          p->phase = PATH_BND_SF_NULLCOLL_RAD_TRACE;
+          hot->ray_bucket = (uint8_t)RAY_BUCKET_RADIATIVE;
+          hot->ray_count_ext = (uint8_t)1;
+          hot->needs_ray = 1;
+          hot->phase = (uint8_t)PATH_BND_SF_NULLCOLL_RAD_TRACE;
         }
         goto exit;
       }
@@ -822,8 +824,8 @@ step_bnd_sf_nullcoll_rad_trace(
       /* Store direction for Tref retrieval */
       d3_set_f3(p->rwalk.dir, p->locals.bnd_sf.rad_sub_direction);
 
-      p->phase = PATH_BND_SF_NULLCOLL_DECIDE;
-      p->needs_ray = 0;
+      hot->phase = (uint8_t)PATH_BND_SF_NULLCOLL_DECIDE;
+      hot->needs_ray = 0;
       goto exit;
     }
 
@@ -858,25 +860,25 @@ step_bnd_sf_nullcoll_rad_trace(
       p->filter_data_storage.scn = scn;
       p->filter_data_storage.enc_id = p->rwalk.enc_id;
 
-      p->ray_bucket = RAY_BUCKET_RADIATIVE;
-      p->ray_count_ext = 1;
-      p->needs_ray = 1;
-      p->phase = PATH_BND_SF_NULLCOLL_RAD_TRACE;
+      hot->ray_bucket = (uint8_t)RAY_BUCKET_RADIATIVE;
+      hot->ray_count_ext = (uint8_t)1;
+      hot->needs_ray = 1;
+      hot->phase = (uint8_t)PATH_BND_SF_NULLCOLL_RAD_TRACE;
     }
   }
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_BND_SF_NULLCOLL_DECIDE: accept/reject radiative sub-path ------- */
 LOCAL_SYM res_T
-step_bnd_sf_nullcoll_decide(struct path_state* p, struct sdis_scene* scn)
+step_bnd_sf_nullcoll_decide(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   double Tref_s = 0;
   double h_radi, p_radi;
@@ -925,8 +927,8 @@ step_bnd_sf_nullcoll_decide(struct path_state* p, struct sdis_scene* scn)
   if(r < p->locals.bnd_sf.p_conv + p->locals.bnd_sf.p_cond + p_radi) {
     /* === ACCEPT: use the radiative sub-path result === */
     /* rwalk/T already contain the sub-path result (no need to restore) */
-    p->phase = PATH_BND_POST_ROBIN_CHECK;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_BND_POST_ROBIN_CHECK;
+    hot->needs_ray = 0;
     goto exit;
   }
 
@@ -954,16 +956,16 @@ step_bnd_sf_nullcoll_decide(struct path_state* p, struct sdis_scene* scn)
 
     /* Loop back to prob_dispatch for next null-collision iteration.
      * Note: h_hat is already set, so prob_dispatch will skip init. */
-    p->phase = PATH_BND_SF_PROB_DISPATCH;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_BND_SF_PROB_DISPATCH;
+    hot->needs_ray = 0;
     goto exit;
   }
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }

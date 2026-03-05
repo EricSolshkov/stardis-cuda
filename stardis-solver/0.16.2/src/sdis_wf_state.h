@@ -213,9 +213,7 @@ struct path_state {
   uint16_t  pixel_x, pixel_y;         /* pixel coords (tile-local)          */
   uint32_t  realisation_idx;           /* SPP index                          */
 
-  /* --- Lifecycle --- */
-  enum path_phase  phase;
-  int              active;             /* 1 = still running                  */
+  /* --- Lifecycle --- P0_OPT: phase/active moved to path_hot --- */
 
   /* --- Random walk core --- */
   struct rwalk          rwalk;         /* position, time, hit, enc_id ...    */
@@ -265,7 +263,7 @@ struct path_state {
 
   /* --- Ray request output (set by step functions) --- */
   struct path_ray_request ray_req;
-  int    needs_ray;                    /* does this step need a trace?        */
+  /* P0_OPT: needs_ray moved to path_hot */
 
   /* --- RNG (shared per-thread, non-owning pointer) --- */
   struct ssp_rng* rng;
@@ -356,9 +354,7 @@ struct path_state {
    * pool->sfn_arr[slot_idx].  See struct path_ext_data, path_enc_data,
    * path_sfn_data defined above. */
 
-  /* --- B-4: Ray type tag --- */
-  enum ray_bucket_type ray_bucket;     /* bucket for current ray request   */
-  int  ray_count_ext;                  /* extended ray count (ENC=6, etc.) */
+  /* --- B-4: Ray type tag --- P0_OPT: ray_bucket/ray_count_ext moved to path_hot */
 };
 
 #endif /* SDIS_WF_STATE_H */

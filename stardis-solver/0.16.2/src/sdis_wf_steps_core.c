@@ -107,7 +107,7 @@ error:
  * Ray-request setup helpers (matches trace_ray / sample_next_step API)
  ******************************************************************************/
 LOCAL_SYM void
-setup_radiative_trace_ray(struct path_state* p, struct sdis_scene* scn)
+setup_radiative_trace_ray(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   float pos[3];
   ASSERT(p && scn);
@@ -132,13 +132,13 @@ setup_radiative_trace_ray(struct path_state* p, struct sdis_scene* scn)
   p->filter_data_storage.enc_id = p->rwalk.enc_id;
 
   /* B-4 M2: bucket classification */
-  p->ray_bucket = RAY_BUCKET_RADIATIVE;
-  p->ray_count_ext = 1;
-  p->needs_ray = 1;
+  hot->ray_bucket = (uint8_t)RAY_BUCKET_RADIATIVE;
+  hot->ray_count_ext = (uint8_t)1;
+  hot->needs_ray = 1;
 }
 
 LOCAL_SYM void
-setup_delta_sphere_rays(struct path_state* p, struct sdis_scene* scn)
+setup_delta_sphere_rays(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   float pos[3];
   float dir[3];
@@ -177,13 +177,13 @@ setup_delta_sphere_rays(struct path_state* p, struct sdis_scene* scn)
   p->ray_req.ray_count = 2;
 
   /* B-4 M2: bucket classification */
-  p->ray_bucket = RAY_BUCKET_STEP_PAIR;
-  p->ray_count_ext = 2;
-  p->needs_ray = 1;
+  hot->ray_bucket = (uint8_t)RAY_BUCKET_STEP_PAIR;
+  hot->ray_count_ext = (uint8_t)2;
+  hot->needs_ray = 1;
 }
 
 LOCAL_SYM void
-setup_convective_startup_ray(struct path_state* p)
+setup_convective_startup_ray(struct path_state* p, struct path_hot* hot)
 {
   float pos[3];
   ASSERT(p);
@@ -202,9 +202,9 @@ setup_convective_startup_ray(struct path_state* p)
   p->ray_req.ray_count = 1;
 
   /* B-4 M2: bucket classification */
-  p->ray_bucket = RAY_BUCKET_STARTUP;
-  p->ray_count_ext = 1;
-  p->needs_ray = 1;
+  hot->ray_bucket = (uint8_t)RAY_BUCKET_STARTUP;
+  hot->ray_count_ext = (uint8_t)1;
+  hot->needs_ray = 1;
 }
 
 /*******************************************************************************
@@ -222,15 +222,15 @@ setup_convective_startup_ray(struct path_state* p)
 
 /* --- PATH_INIT: set up first radiative trace ----------------------------- */
 LOCAL_SYM res_T
-step_init(struct path_state* p, struct sdis_scene* scn)
+step_init(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   ASSERT(p && scn);
 
   /* Register starting vertex (skip heat_path for now) */
 
   /* Emit the first radiative trace ray */
-  setup_radiative_trace_ray(p, scn);
-  p->phase = PATH_RAD_TRACE_PENDING;
+  setup_radiative_trace_ray(p, hot, scn);
+  hot->phase = (uint8_t)PATH_RAD_TRACE_PENDING;
   return RES_OK;
 }
 
@@ -238,6 +238,7 @@ step_init(struct path_state* p, struct sdis_scene* scn)
 LOCAL_SYM res_T
 step_radiative_trace(
   struct path_state* p,
+  struct path_hot* hot,
   struct sdis_scene* scn,
   const struct s3d_hit* trace_hit)
 {
@@ -268,9 +269,9 @@ step_radiative_trace(
 
     p->T.value += trad;
     p->T.done = 1;
-    p->phase = PATH_DONE;
-    p->active = 0;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_DONE;
+    hot->active = 0;
+    hot->needs_ray = 0;
     p->done_reason = 1; /* radiative miss */
     goto exit;
   }
@@ -340,8 +341,8 @@ step_radiative_trace(
 
         /* Re-trace from adjusted position */
         f3_set_d3(p->rad_direction, dir_d);
-        setup_radiative_trace_ray(p, scn);
-        p->phase = PATH_RAD_TRACE_PENDING;
+        setup_radiative_trace_ray(p, hot, scn);
+        hot->phase = (uint8_t)PATH_RAD_TRACE_PENDING;
         goto exit;
       }
       goto error;
@@ -371,8 +372,8 @@ step_radiative_trace(
       /* Absorbed -> enter boundary path */
       p->T.func = boundary_path_3d;
       p->rwalk.enc_id = ENCLOSURE_ID_NULL;
-      p->phase = PATH_COUPLED_BOUNDARY;
-      p->needs_ray = 0;
+      hot->phase = (uint8_t)PATH_COUPLED_BOUNDARY;
+      hot->needs_ray = 0;
       goto exit;
     }
 
@@ -395,8 +396,8 @@ step_radiative_trace(
     f3_set_d3(p->rad_direction, bounce.dir);
 
     /* Set up next trace */
-    setup_radiative_trace_ray(p, scn);
-    p->phase = PATH_RAD_TRACE_PENDING;
+    setup_radiative_trace_ray(p, hot, scn);
+    hot->phase = (uint8_t)PATH_RAD_TRACE_PENDING;
   }
 
 exit:
@@ -407,7 +408,7 @@ error:
 
 /* --- PATH_COUPLED_BOUNDARY: run boundary_path logic (no ray needed) ------ */
 LOCAL_SYM res_T
-step_boundary(struct path_state* p, struct sdis_scene* scn)
+step_boundary(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   res_T res = RES_OK;
   ASSERT(p && scn);
@@ -439,16 +440,16 @@ step_boundary(struct path_state* p, struct sdis_scene* scn)
       "wavefront: exceeded max_branchings (%lu) at pixel (%u,%u)\n",
       (unsigned long)p->ctx.max_branchings, p->pixel_x, p->pixel_y);
     res = RES_BAD_OP;
-    p->phase = PATH_DONE;
-    p->active = 0;
+    hot->phase = (uint8_t)PATH_DONE;
+    hot->active = 0;
     goto error;
   }
 
   /* B4-M6: redirect ALL boundary dispatch to the fine-grained state machine.
    * step_bnd_dispatch handles solid/solid (M3 batch), picard1/N (sync
    * fallback until M5/M8), Dirichlet, and Robin post-check. */
-  p->phase = PATH_BND_DISPATCH;
-  res = step_bnd_dispatch(p, scn);
+  hot->phase = (uint8_t)PATH_BND_DISPATCH;
+  res = step_bnd_dispatch(p, hot, scn);
   /* Persist nbranchings */
   p->coupled_nbranchings = (int)p->ctx.nbranchings;
 
@@ -460,7 +461,7 @@ error:
 
 /* --- PATH_COUPLED_CONDUCTIVE: wavefront delta_sphere entry/loop --------- */
 LOCAL_SYM res_T
-step_conductive(struct path_state* p, struct sdis_scene* scn,
+step_conductive(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn,
                 struct path_enc_data* enc)
 {
   res_T res = RES_OK;
@@ -473,10 +474,10 @@ step_conductive(struct path_state* p, struct sdis_scene* scn,
     if(!p->locals.cnd_wos.wos_initialized) {
       /* First entry: emit 6-ray enc_query to discover enc_id.
        * After result, PATH_CND_WOS_CHECK_TEMP initialises WoS. */
-      step_enc_query_emit(p, enc, p->rwalk.vtx.P, PATH_CND_WOS_CHECK_TEMP);
+      step_enc_query_emit(p, hot, enc, p->rwalk.vtx.P, PATH_CND_WOS_CHECK_TEMP);
     } else {
       /* Re-entry after coupled boundary: go straight to check_temp */
-      p->phase = PATH_CND_WOS_CHECK_TEMP;
+      hot->phase = (uint8_t)PATH_CND_WOS_CHECK_TEMP;
     }
     goto exit;
   }
@@ -486,19 +487,19 @@ step_conductive(struct path_state* p, struct sdis_scene* scn,
     res = conductive_path_3d(scn, &p->ctx, &p->rwalk, p->rng, &p->T);
     if(res != RES_OK && res != RES_BAD_OP) goto error;
     if(res == RES_BAD_OP) {
-      p->phase = PATH_DONE;
-      p->active = 0;
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
       goto exit;
     }
     if(p->T.done) {
-      p->phase = PATH_DONE;
-      p->active = 0;
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
     } else if(p->T.func == boundary_path_3d) {
-      p->phase = PATH_COUPLED_BOUNDARY;
+      hot->phase = (uint8_t)PATH_COUPLED_BOUNDARY;
     } else if(p->T.func == convective_path_3d) {
-      p->phase = PATH_COUPLED_CONVECTIVE;
+      hot->phase = (uint8_t)PATH_COUPLED_CONVECTIVE;
     } else if(p->T.func == radiative_path_3d) {
-      p->phase = PATH_COUPLED_RADIATIVE;
+      hot->phase = (uint8_t)PATH_COUPLED_RADIATIVE;
     } else {
       FATAL("wavefront: unexpected T.func after conductive_path (fallback)\n");
     }
@@ -511,19 +512,19 @@ step_conductive(struct path_state* p, struct sdis_scene* scn,
   if(!p->ds_initialized) {
     /* Emit 6-ray enc_query from current position.
      * After result, PATH_CND_DS_CHECK_TEMP finalises init. */
-    step_enc_query_emit(p, enc, p->rwalk.vtx.P, PATH_CND_DS_CHECK_TEMP);
+    step_enc_query_emit(p, hot, enc, p->rwalk.vtx.P, PATH_CND_DS_CHECK_TEMP);
     goto exit;
   }
 
   /* Already initialised — go directly to temperature check */
-  p->phase = PATH_CND_DS_CHECK_TEMP;
+  hot->phase = (uint8_t)PATH_CND_DS_CHECK_TEMP;
 
 exit:
   return res;
 error:
   /* Mark path as failed */
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
@@ -538,6 +539,7 @@ error:
 LOCAL_SYM res_T
 step_conductive_ds_process(
   struct path_state* p,
+  struct path_hot* hot,
   struct sdis_scene* scn,
   const struct s3d_hit* hit0,
   const struct s3d_hit* hit1,
@@ -610,8 +612,8 @@ step_conductive_ds_process(
     d3_set(pos_next, p->rwalk.vtx.P);
     move_pos_3d(pos_next, p->ds_dir0, delta);
     d3_set(enc->query_pos, pos_next);
-    p->phase = PATH_CND_DS_STEP_ENC_VERIFY;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_CND_DS_STEP_ENC_VERIFY;
+    hot->needs_ray = 0;
   } else {
     /* Hit at forward — get enclosure from hit primitive (pure compute) */
     unsigned enc_ids[2] = {ENCLOSURE_ID_NULL, ENCLOSURE_ID_NULL};
@@ -631,40 +633,40 @@ step_conductive_ds_process(
         goto error;
       }
       /* Cascade will enter step_cnd_ds_check_temp which re-emits rays */
-      p->phase = PATH_CND_DS_CHECK_TEMP;
-      p->needs_ray = 0;
+      hot->phase = (uint8_t)PATH_CND_DS_CHECK_TEMP;
+      hot->needs_ray = 0;
     } else {
       /* Match — store result for step_advance check and proceed */
       enc->resolved_enc_id = enc_id;
-      p->phase = PATH_CND_DS_STEP_ADVANCE;
-      p->needs_ray = 0;
+      hot->phase = (uint8_t)PATH_CND_DS_STEP_ADVANCE;
+      hot->needs_ray = 0;
     }
   }
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_COUPLED_CONVECTIVE: run convective_path (may need startup ray) - */
 LOCAL_SYM res_T
-step_convective(struct path_state* p, struct sdis_scene* scn)
+step_convective(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   res_T res = RES_OK;
   ASSERT(p && scn);
 
   /* M6: redirect to fine-grained convective state machine */
-  p->phase = PATH_CNV_INIT;
-  return step_cnv_init(p, scn);
+  hot->phase = (uint8_t)PATH_CNV_INIT;
+  return step_cnv_init(p, hot, scn);
 }
 
 /* --- PATH_COUPLED_RADIATIVE: bounce into radiative from boundary --------- */
 LOCAL_SYM res_T
-step_coupled_radiative_begin(struct path_state* p, struct sdis_scene* scn)
+step_coupled_radiative_begin(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   float N[3] = {0, 0, 0};
   float dir[3] = {0, 0, 0};
@@ -685,8 +687,8 @@ step_coupled_radiative_begin(struct path_state* p, struct sdis_scene* scn)
   p->rad_bounce_count = 0;
   p->rad_retry_count  = 0;
 
-  setup_radiative_trace_ray(p, scn);
-  p->phase = PATH_RAD_TRACE_PENDING;
+  setup_radiative_trace_ray(p, hot, scn);
+  hot->phase = (uint8_t)PATH_RAD_TRACE_PENDING;
   return RES_OK;
 }
 
@@ -697,40 +699,40 @@ step_coupled_radiative_begin(struct path_state* p, struct sdis_scene* scn)
 /* Advance one path by one step (without ray).  Returns 1 if path was advanced,
  * 0 if it needs a ray or is done. */
 LOCAL_SYM res_T
-advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
+advance_one_step_no_ray(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn,
                         int* advanced,
                         struct wavefront_pool* pool, size_t slot_idx)
 {
   res_T res = RES_OK;
   *advanced = 0;
 
-  if(!p->active) return RES_OK;
+  if(!hot->active) return RES_OK;
 
-  p->needs_ray = 0;
+  hot->needs_ray = 0;
 
-  switch(p->phase) {
+  switch((enum path_phase)hot->phase) {
   case PATH_INIT:
-    res = step_init(p, scn);
+    res = step_init(p, hot, scn);
     *advanced = 1;
     break;
 
   case PATH_COUPLED_BOUNDARY:
-    res = step_boundary(p, scn);
+    res = step_boundary(p, hot, scn);
     *advanced = 1;
     break;
 
   case PATH_COUPLED_CONDUCTIVE:
-    res = step_conductive(p, scn, &pool->enc_arr[slot_idx]);
+    res = step_conductive(p, hot, scn, &pool->enc_arr[slot_idx]);
     *advanced = 1;
     break;
 
   case PATH_COUPLED_CONVECTIVE:
-    res = step_convective(p, scn);
+    res = step_convective(p, hot, scn);
     *advanced = 1;
     break;
 
   case PATH_COUPLED_RADIATIVE:
-    res = step_coupled_radiative_begin(p, scn);
+    res = step_coupled_radiative_begin(p, hot, scn);
     *advanced = 1;
     break;
 
@@ -770,115 +772,115 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
 
   /* --- B-4 M10: Enclosure locate result (compute-only, activated) --- */
   case PATH_ENC_LOCATE_RESULT:
-    res = step_enc_locate_result(p, scn, &pool->enc_arr[slot_idx]);
+    res = step_enc_locate_result(p, hot, scn, &pool->enc_arr[slot_idx]);
     *advanced = 1;
     break;
 
   /* --- B-4 M3: solid/solid reinjection (compute-only, activated) --- */
   case PATH_BND_SS_REINJECT_DECIDE:
-    res = step_bnd_ss_reinject_decide(p, scn);
+    res = step_bnd_ss_reinject_decide(p, hot, scn);
     *advanced = 1;
     break;
   case PATH_BND_SS_REINJECT_ENC:
-    res = step_bnd_ss_reinject_enc_result(p, scn, &pool->enc_arr[slot_idx]);
+    res = step_bnd_ss_reinject_enc_result(p, hot, scn, &pool->enc_arr[slot_idx]);
     *advanced = 1;
     break;
 
   /* --- B-4 M4: delta-sphere conductive (compute-only, activated) --- */
   case PATH_CND_DS_CHECK_TEMP:
-    res = step_cnd_ds_check_temp(p, scn, &pool->enc_arr[slot_idx]);
+    res = step_cnd_ds_check_temp(p, hot, scn, &pool->enc_arr[slot_idx]);
     *advanced = 1;
     break;
   case PATH_CND_DS_STEP_ENC_VERIFY:
-    step_cnd_ds_step_enc_verify(p, &pool->enc_arr[slot_idx]);
+    step_cnd_ds_step_enc_verify(p, hot, &pool->enc_arr[slot_idx]);
     *advanced = 1;
     break;
   case PATH_CND_DS_STEP_ADVANCE:
-    res = step_cnd_ds_step_advance(p, scn, &pool->enc_arr[slot_idx]);
+    res = step_cnd_ds_step_advance(p, hot, scn, &pool->enc_arr[slot_idx]);
     *advanced = 1;
     break;
 
   /* --- B-4 M6: Convective path fine-grained (compute-only, activated) --- */
   case PATH_CNV_INIT:
-    res = step_cnv_init(p, scn);
+    res = step_cnv_init(p, hot, scn);
     *advanced = 1;
     break;
   case PATH_CNV_SAMPLE_LOOP:
-    res = step_cnv_sample_loop(p, scn);
+    res = step_cnv_sample_loop(p, hot, scn);
     *advanced = 1;
     break;
 
   /* --- B-4 M6: Boundary dispatch + Robin post-check (activated) --- */
   case PATH_BND_DISPATCH:
-    res = step_bnd_dispatch(p, scn);
+    res = step_bnd_dispatch(p, hot, scn);
     *advanced = 1;
     break;
   case PATH_BND_POST_ROBIN_CHECK:
-    res = step_bnd_post_robin_check(p, scn);
+    res = step_bnd_post_robin_check(p, hot, scn);
     *advanced = 1;
     break;
 
   /* --- B-4 M5: solid/fluid picard1 (compute-only, activated) --- */
   case PATH_BND_SF_REINJECT_ENC:
-    res = step_bnd_sf_reinject_enc_result(p, scn, &pool->enc_arr[slot_idx]);
+    res = step_bnd_sf_reinject_enc_result(p, hot, scn, &pool->enc_arr[slot_idx]);
     *advanced = 1;
     break;
   case PATH_BND_SF_PROB_DISPATCH:
-    res = step_bnd_sf_prob_dispatch(p, scn, &pool->ext_arr[slot_idx]);
+    res = step_bnd_sf_prob_dispatch(p, hot, scn, &pool->ext_arr[slot_idx]);
     *advanced = 1;
     break;
   case PATH_BND_SF_NULLCOLL_DECIDE:
-    res = step_bnd_sf_nullcoll_decide(p, scn);
+    res = step_bnd_sf_nullcoll_decide(p, hot, scn);
     *advanced = 1;
     break;
 
   /* --- B-4 M7: External net flux (compute-only, activated) --- */
   case PATH_BND_EXT_CHECK:
-    res = step_bnd_ext_check(p, scn, &pool->ext_arr[slot_idx]);
+    res = step_bnd_ext_check(p, hot, scn, &pool->ext_arr[slot_idx]);
     *advanced = 1;
     break;
   case PATH_BND_EXT_FINALIZE:
-    res = step_bnd_ext_finalize(p, scn, &pool->ext_arr[slot_idx]);
+    res = step_bnd_ext_finalize(p, hot, scn, &pool->ext_arr[slot_idx]);
     *advanced = 1;
     break;
 
   /* --- B-4 M8: picardN compute-only states (activated) --- */
   case PATH_BND_SFN_PROB_DISPATCH:
-    res = step_bnd_sfn_prob_dispatch(p, scn, &pool->sfn_arr[slot_idx]);
+    res = step_bnd_sfn_prob_dispatch(p, hot, scn, &pool->sfn_arr[slot_idx]);
     *advanced = 1;
     break;
   case PATH_BND_SFN_RAD_DONE:
-    res = step_bnd_sfn_rad_done(p, scn, &pool->sfn_arr[slot_idx]);
+    res = step_bnd_sfn_rad_done(p, hot, scn, &pool->sfn_arr[slot_idx]);
     *advanced = 1;
     break;
   case PATH_BND_SFN_COMPUTE_Ti:
-    res = step_bnd_sfn_compute_Ti(p, scn, &pool->sfn_arr[slot_idx]);
+    res = step_bnd_sfn_compute_Ti(p, hot, scn, &pool->sfn_arr[slot_idx]);
     *advanced = 1;
     break;
   case PATH_BND_SFN_COMPUTE_Ti_RESUME:
-    res = step_bnd_sfn_compute_Ti_resume(p, scn, &pool->sfn_arr[slot_idx]);
+    res = step_bnd_sfn_compute_Ti_resume(p, hot, scn, &pool->sfn_arr[slot_idx]);
     *advanced = 1;
     break;
   case PATH_BND_SFN_CHECK_PMIN_PMAX:
-    res = step_bnd_sfn_check_pmin_pmax(p, scn, &pool->sfn_arr[slot_idx]);
+    res = step_bnd_sfn_check_pmin_pmax(p, hot, scn, &pool->sfn_arr[slot_idx]);
     *advanced = 1;
     break;
 
   /* --- B-4 M9: Walk on Spheres conductive (compute-only, activated) --- */
   case PATH_CND_WOS_CHECK_TEMP:
-    res = step_cnd_wos_check_temp(p, scn);
+    res = step_cnd_wos_check_temp(p, hot, scn);
     *advanced = 1;
     break;
   case PATH_CND_WOS_CLOSEST_RESULT:
-    res = step_cnd_wos_closest_result(p, scn);
+    res = step_cnd_wos_closest_result(p, hot, scn);
     *advanced = 1;
     break;
   case PATH_CND_WOS_DIFFUSION_CHECK_RESULT:
-    res = step_cnd_wos_diffusion_check_result(p, scn);
+    res = step_cnd_wos_diffusion_check_result(p, hot, scn);
     *advanced = 1;
     break;
   case PATH_CND_WOS_TIME_TRAVEL:
-    res = step_cnd_wos_time_travel(p, scn);
+    res = step_cnd_wos_time_travel(p, hot, scn);
     *advanced = 1;
     break;
 
@@ -889,7 +891,7 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
   case PATH_CND_CUSTOM:
   case PATH_CNV_STARTUP_RESULT:
     VFATAL("wavefront: advance_no_ray hit unactivated future state %d -- "
-           "this state has no step function yet\n", ARG1((int)p->phase));
+           "this state has no step function yet\n", ARG1((int)hot->phase));
     break;
 
   /* M7 result phases: handled inline by advance_one_step_with_ray
@@ -901,7 +903,7 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
 
   case PATH_PHASE_COUNT:
   default:
-    VFATAL("wavefront: unknown path phase %d\n", ARG1((int)p->phase));
+    VFATAL("wavefront: unknown path phase %d\n", ARG1((int)hot->phase));
     break;
   }
 
@@ -910,24 +912,24 @@ advance_one_step_no_ray(struct path_state* p, struct sdis_scene* scn,
 
 /* Advance one path after receiving a ray trace result */
 LOCAL_SYM res_T
-advance_one_step_with_ray(struct path_state* p, struct sdis_scene* scn,
+advance_one_step_with_ray(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn,
                           const struct s3d_hit* hit0,
                           const struct s3d_hit* hit1,
                           struct wavefront_pool* pool, size_t slot_idx)
 {
   res_T res = RES_OK;
 
-  if(!p->active) return RES_OK;
+  if(!hot->active) return RES_OK;
 
-  p->needs_ray = 0;
+  hot->needs_ray = 0;
 
-  switch(p->phase) {
+  switch((enum path_phase)hot->phase) {
   case PATH_RAD_TRACE_PENDING:
-    res = step_radiative_trace(p, scn, hit0);
+    res = step_radiative_trace(p, hot, scn, hit0);
     break;
 
   case PATH_COUPLED_COND_DS_PENDING:
-    res = step_conductive_ds_process(p, scn, hit0, hit1,
+    res = step_conductive_ds_process(p, hot, scn, hit0, hit1,
                                      &pool->enc_arr[slot_idx]);
     break;
 
@@ -938,7 +940,7 @@ advance_one_step_with_ray(struct path_state* p, struct sdis_scene* scn,
     const struct s3d_hit* h_frt1 = &p->locals.bnd_ss.ray_frt[1];
     const struct s3d_hit* h_bck0 = &p->locals.bnd_ss.ray_bck[0];
     const struct s3d_hit* h_bck1 = &p->locals.bnd_ss.ray_bck[1];
-    res = step_bnd_ss_reinject_process(p, scn, h_frt0, h_frt1, h_bck0, h_bck1,
+    res = step_bnd_ss_reinject_process(p, hot, scn, h_frt0, h_frt1, h_bck0, h_bck1,
                                         &pool->enc_arr[slot_idx]);
     break;
   }
@@ -947,73 +949,73 @@ advance_one_step_with_ray(struct path_state* p, struct sdis_scene* scn,
 
   /* --- B-4 M4: delta-sphere 2-ray results --- */
   case PATH_CND_DS_STEP_TRACE:
-    res = step_conductive_ds_process(p, scn, hit0, hit1,
+    res = step_conductive_ds_process(p, hot, scn, hit0, hit1,
                                      &pool->enc_arr[slot_idx]);
     break;
 
   /* --- B-4 M5: solid/fluid picard1 reinjection (2-ray result) --- */
   case PATH_BND_SF_REINJECT_SAMPLE:
-    res = step_bnd_sf_reinject_process(p, scn, hit0, hit1,
+    res = step_bnd_sf_reinject_process(p, hot, scn, hit0, hit1,
                                        &pool->enc_arr[slot_idx]);
     break;
 
   /* --- B-4 M5: radiative sub-path trace (1-ray result) --- */
   case PATH_BND_SF_NULLCOLL_RAD_TRACE:
-    res = step_bnd_sf_nullcoll_rad_trace(p, scn, hit0);
+    res = step_bnd_sf_nullcoll_rad_trace(p, hot, scn, hit0);
     break;
 
   /* --- B-4 M7: External net flux ray results (activated) --- */
   case PATH_BND_EXT_DIRECT_TRACE:
-    res = step_bnd_ext_direct_result(p, scn, hit0,
+    res = step_bnd_ext_direct_result(p, hot, scn, hit0,
                                      &pool->ext_arr[slot_idx]);
     break;
   case PATH_BND_EXT_DIFFUSE_TRACE:
-    res = step_bnd_ext_diffuse_result(p, scn, hit0,
+    res = step_bnd_ext_diffuse_result(p, hot, scn, hit0,
                                       &pool->ext_arr[slot_idx]);
     break;
   case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
-    res = step_bnd_ext_diffuse_shadow_result(p, scn, hit0,
+    res = step_bnd_ext_diffuse_shadow_result(p, hot, scn, hit0,
                                               &pool->ext_arr[slot_idx]);
     break;
 
   /* --- B-4 M8: picardN radiative sub-path ray result (activated) --- */
   case PATH_BND_SFN_RAD_TRACE:
-    res = step_bnd_sfn_rad_trace(p, scn, hit0);
+    res = step_bnd_sfn_rad_trace(p, hot, scn, hit0);
     break;
 
   /* --- B-4 M9: WoS conductive fallback -- 1-ray result --- */
   case PATH_CND_WOS_FALLBACK_TRACE:
-    res = step_cnd_wos_fallback_result(p, scn, hit0);
+    res = step_cnd_wos_fallback_result(p, hot, scn, hit0);
     break;
 
   /* --- B-4 future: ray-pending states, not yet activated --- */
   case PATH_CND_INIT_ENC:
     VFATAL("wavefront: advance_with_ray hit unactivated future state %d -- "
-           "this state has no step function yet\n", ARG1((int)p->phase));
+           "this state has no step function yet\n", ARG1((int)hot->phase));
     break;
   /* NOTE: PATH_CND_DS_STEP_ENC_VERIFY is compute-only (already handled by
    * advance_one_step_no_ray).  It must NOT appear here. */
 
   /* --- B-4 M6: Convective startup ray result --- */
   case PATH_CNV_STARTUP_TRACE:
-    res = step_cnv_startup_result(p, scn, hit0);
+    res = step_cnv_startup_result(p, hot, scn, hit0);
     break;
 
   /* --- B-4 M1-v2: 6-ray enclosure query results ---
    * 6 hits already pre-delivered to enc_query.dir_hits[] by distribute. */
   case PATH_ENC_QUERY_EMIT:
-    res = step_enc_query_resolve(p, scn, &pool->enc_arr[slot_idx]);
+    res = step_enc_query_resolve(p, hot, scn, &pool->enc_arr[slot_idx]);
     break;
 
   /* --- B-4 M1-v2: Fallback 1-ray result ---
    * 1 hit pre-delivered to enc_query.fb_hit by distribute. */
   case PATH_ENC_QUERY_FB_EMIT:
-    res = step_enc_query_fb_resolve(p, scn, &pool->enc_arr[slot_idx]);
+    res = step_enc_query_fb_resolve(p, hot, scn, &pool->enc_arr[slot_idx]);
     break;
 
   default:
     VFATAL("wavefront: advance_with_ray in unexpected phase %d\n",
-           ARG1((int)p->phase));
+           ARG1((int)hot->phase));
     break;
   }
 

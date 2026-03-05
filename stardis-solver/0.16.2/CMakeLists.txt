@@ -77,6 +77,7 @@ set(SDIS_SOURCES
     src/sdis_wf_steps_bnd_ext.c
     src/sdis_wf_steps_cnv.c
     src/sdis_solve_persistent_wavefront.c
+    src/sdis_wf_hot.c
     src/sdis_wf_soa.c
     src/sdis_wf_rng_adapter.cpp
     src/sdis_source.c
@@ -153,6 +154,10 @@ else()
     target_compile_definitions(sdis_obj PUBLIC  SDIS_STATIC_BUILD)
     add_library(sdis STATIC)
 endif()
+
+# P0_OPT: hot fields (phase, active, needs_ray, ray_bucket, ray_count_ext)
+# extracted from path_state into path_hot.  Old wavefront code disabled.
+target_compile_definitions(sdis_obj PUBLIC SDIS_P0_OPT)
 
 target_link_libraries(sdis PUBLIC sdis_obj)
 

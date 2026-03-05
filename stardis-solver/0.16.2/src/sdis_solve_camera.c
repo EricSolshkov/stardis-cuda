@@ -723,10 +723,17 @@ sdis_solve_camera
 
     /* Draw the tile */
     if(use_wavefront) {
+#ifdef SDIS_P0_OPT
+      /* P0_OPT: old per-tile wavefront disabled; camera mode uses the
+       * persistent wavefront exclusively (solve_persistent_wavefront). */
+      (void)solve_tile;
+      res_local = RES_BAD_OP;  /* should never reach here */
+#else
       res_local = solve_tile_wavefront
         (scn, rng, enc_id, args->cam, args->time_range, tile_org, tile_sz,
          args->spp, register_paths, pix_sz, args->picard_order, args->diff_algo,
          buf, tile);
+#endif
     } else {
       res_local = solve_tile
         (scn, rng, enc_id, args->cam, args->time_range, tile_org, tile_sz,

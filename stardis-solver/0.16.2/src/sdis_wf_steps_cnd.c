@@ -51,7 +51,7 @@
 
 /* --- PATH_CND_DS_CHECK_TEMP: finalize init (once) + loop top --------------- */
 LOCAL_SYM res_T
-step_cnd_ds_check_temp(struct path_state* p, struct sdis_scene* scn,
+step_cnd_ds_check_temp(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn,
                        struct path_enc_data* enc)
 {
   res_T res = RES_OK;
@@ -123,8 +123,8 @@ step_cnd_ds_check_temp(struct path_state* p, struct sdis_scene* scn,
     if(p->ctx.heat_path) {
       heat_path_get_last_vertex(p->ctx.heat_path)->weight = p->T.value;
     }
-    p->phase = PATH_DONE;
-    p->active = 0;
+    hot->phase = (uint8_t)PATH_DONE;
+    hot->active = 0;
     p->done_reason = 2; /* temperature known */
     goto exit;
   }
@@ -136,31 +136,31 @@ step_cnd_ds_check_temp(struct path_state* p, struct sdis_scene* scn,
   p->ds_delta_solid_param = (float)props.delta;
 
   /* Emit 2 rays (forward + backward) */
-  setup_delta_sphere_rays(p, scn);
-  p->phase = PATH_CND_DS_STEP_TRACE;
+  setup_delta_sphere_rays(p, hot, scn);
+  hot->phase = (uint8_t)PATH_CND_DS_STEP_TRACE;
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_CND_DS_STEP_ENC_VERIFY: set up ENC sub-state at pos_next -------- */
 LOCAL_SYM void
-step_cnd_ds_step_enc_verify(struct path_state* p,
+step_cnd_ds_step_enc_verify(struct path_state* p, struct path_hot* hot,
                             struct path_enc_data* enc)
 {
   ASSERT(p);
   /* enc_query.query_pos already set by step_conductive_ds_process */
-  step_enc_query_emit(p, enc, enc->query_pos, PATH_CND_DS_STEP_ADVANCE);
+  step_enc_query_emit(p, hot, enc, enc->query_pos, PATH_CND_DS_STEP_ADVANCE);
 }
 
 /* --- PATH_CND_DS_STEP_ADVANCE: enc check + volumic + time + pos + loop ---- */
 LOCAL_SYM res_T
-step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn,
+step_cnd_ds_step_advance(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn,
                          struct path_enc_data* enc)
 {
   res_T res = RES_OK;
@@ -186,8 +186,8 @@ step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn,
       goto error;
     }
     /* Cascade will call step_cnd_ds_check_temp which re-emits rays */
-    p->phase = PATH_CND_DS_CHECK_TEMP;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_CND_DS_CHECK_TEMP;
+    hot->needs_ray = 0;
     goto exit;
   }
 
@@ -246,8 +246,8 @@ step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn,
   res = time_rewind(scn, mu, props.t0, p->rng, &p->rwalk, &p->ctx, &p->T);
   if(res != RES_OK) goto error;
   if(p->T.done) {
-    p->phase = PATH_DONE;
-    p->active = 0;
+    hot->phase = (uint8_t)PATH_DONE;
+    hot->active = 0;
     p->done_reason = 4; /* time rewind */
     goto exit;
   }
@@ -273,8 +273,8 @@ step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn,
   /* Check loop condition: keep walking while no hit */
   if(S3D_HIT_NONE(&p->rwalk.hit_3d)) {
     /* Still inside solid — continue loop via check_temp */
-    p->phase = PATH_CND_DS_CHECK_TEMP;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_CND_DS_CHECK_TEMP;
+    hot->needs_ray = 0;
   } else {
     /* Hit boundary — register green power term and transition */
     if(p->ctx.green_path && p->ds_props_ref.power != SDIS_VOLUMIC_POWER_NONE) {
@@ -285,15 +285,15 @@ step_cnd_ds_step_advance(struct path_state* p, struct sdis_scene* scn,
     p->T.func = boundary_path_3d;
     p->rwalk.enc_id = ENCLOSURE_ID_NULL;
     p->ds_initialized = 0; /* reset for next conductive entry */
-    p->phase = PATH_COUPLED_BOUNDARY;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_COUPLED_BOUNDARY;
+    hot->needs_ray = 0;
   }
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
@@ -512,7 +512,7 @@ error:
 
 /* --- PATH_CND_WOS_CHECK_TEMP ---------------------------------------------- */
 LOCAL_SYM res_T
-step_cnd_wos_check_temp(struct path_state* p, struct sdis_scene* scn)
+step_cnd_wos_check_temp(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   res_T res = RES_OK;
   ASSERT(p && scn);
@@ -585,8 +585,8 @@ step_cnd_wos_check_temp(struct path_state* p, struct sdis_scene* scn)
         p->locals.cnd_wos.green_power_term, &p->T);
     }
 
-    p->phase = PATH_DONE;
-    p->active = 0;
+    hot->phase = (uint8_t)PATH_DONE;
+    hot->active = 0;
     p->done_reason = 2; /* temperature known */
     goto exit;
   }
@@ -598,20 +598,20 @@ step_cnd_wos_check_temp(struct path_state* p, struct sdis_scene* scn)
   d3_set(p->locals.cnd_wos.position_start, p->rwalk.vtx.P);
 
   /* Transition to closest_point query */
-  step_cnd_wos_closest(p);
+  step_cnd_wos_closest(p, hot);
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_CND_WOS_CLOSEST: submit closest_point batch query --------------- */
 LOCAL_SYM void
-step_cnd_wos_closest(struct path_state* p)
+step_cnd_wos_closest(struct path_state* p, struct path_hot* hot)
 {
   ASSERT(p);
 
@@ -623,13 +623,13 @@ step_cnd_wos_closest(struct path_state* p)
   p->locals.cnd_wos.query_radius = (float)HUGE_VAL;
   p->locals.cnd_wos.batch_cp_idx = (uint32_t)-1;
 
-  p->needs_ray = 0;  /* NOT a ray request — closest_point has its own batch */
-  p->phase = PATH_CND_WOS_CLOSEST;
+  hot->needs_ray = 0;  /* NOT a ray request — closest_point has its own batch */
+  hot->phase = (uint8_t)PATH_CND_WOS_CLOSEST;
 }
 
 /* --- PATH_CND_WOS_CLOSEST_RESULT: process closest_point result ------------ */
 LOCAL_SYM res_T
-step_cnd_wos_closest_result(struct path_state* p, struct sdis_scene* scn)
+step_cnd_wos_closest_result(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   const struct s3d_hit* hit = &p->locals.cnd_wos.cached_hit;
   double wos_distance = 0;
@@ -656,7 +656,7 @@ step_cnd_wos_closest_result(struct path_state* p, struct sdis_scene* scn)
     res = wf_setup_hit_wos(scn, hit, p->locals.cnd_wos.delta, &p->rwalk);
     if(res != RES_OK) goto error;
     p->locals.cnd_wos.last_distance = hit->distance;
-    p->phase = PATH_CND_WOS_TIME_TRAVEL;
+    hot->phase = (uint8_t)PATH_CND_WOS_TIME_TRAVEL;
     goto exit;
   }
 
@@ -678,21 +678,21 @@ step_cnd_wos_closest_result(struct path_state* p, struct sdis_scene* scn)
 
     /* Save candidate position and submit batch CP query for validation */
     d3_set(p->locals.cnd_wos.diffusion_pos, pos_new);
-    step_cnd_wos_diffusion_check(p);
+    step_cnd_wos_diffusion_check(p, hot);
   }
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_CND_WOS_DIFFUSION_CHECK: submit diffusion validation CP query --- */
 LOCAL_SYM void
-step_cnd_wos_diffusion_check(struct path_state* p)
+step_cnd_wos_diffusion_check(struct path_state* p, struct path_hot* hot)
 {
   ASSERT(p);
 
@@ -703,13 +703,13 @@ step_cnd_wos_diffusion_check(struct path_state* p)
   p->locals.cnd_wos.query_radius = (float)p->locals.cnd_wos.delta;
   p->locals.cnd_wos.batch_cp2_idx = (uint32_t)-1;
 
-  p->needs_ray = 0;  /* closest_point has its own batch */
-  p->phase = PATH_CND_WOS_DIFFUSION_CHECK;
+  hot->needs_ray = 0;  /* closest_point has its own batch */
+  hot->phase = (uint8_t)PATH_CND_WOS_DIFFUSION_CHECK;
 }
 
 /* --- PATH_CND_WOS_DIFFUSION_CHECK_RESULT: process validation CP result ---- */
 LOCAL_SYM res_T
-step_cnd_wos_diffusion_check_result(struct path_state* p, struct sdis_scene* scn)
+step_cnd_wos_diffusion_check_result(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   const struct s3d_hit* hit = &p->locals.cnd_wos.cached_hit;
   const unsigned expected_enc_id = p->rwalk.enc_id;
@@ -744,10 +744,10 @@ step_cnd_wos_diffusion_check_result(struct path_state* p, struct sdis_scene* scn
     d3_set(p->rwalk.vtx.P, pos);
     p->rwalk.hit_3d = S3D_HIT_NULL;
     /* last_distance already set by step_cnd_wos_closest_result */
-    p->phase = PATH_CND_WOS_TIME_TRAVEL;
+    hot->phase = (uint8_t)PATH_CND_WOS_TIME_TRAVEL;
   } else {
     /* Position invalid — need fallback trace_ray */
-    step_cnd_wos_fallback_trace(p);
+    step_cnd_wos_fallback_trace(p, hot);
   }
 
   return res;
@@ -755,7 +755,7 @@ step_cnd_wos_diffusion_check_result(struct path_state* p, struct sdis_scene* scn
 
 /* --- PATH_CND_WOS_FALLBACK_TRACE: emit fallback ray ---------------------- */
 LOCAL_SYM void
-step_cnd_wos_fallback_trace(struct path_state* p)
+step_cnd_wos_fallback_trace(struct path_state* p, struct path_hot* hot)
 {
   ASSERT(p);
 
@@ -767,15 +767,15 @@ step_cnd_wos_fallback_trace(struct path_state* p)
   p->ray_req.range[1] = (float)HUGE_VAL;
   p->ray_req.ray_count = 1;
 
-  p->ray_bucket = RAY_BUCKET_RADIATIVE;
-  p->ray_count_ext = 0;
-  p->needs_ray = 1;
-  p->phase = PATH_CND_WOS_FALLBACK_TRACE;
+  hot->ray_bucket = (uint8_t)RAY_BUCKET_RADIATIVE;
+  hot->ray_count_ext = (uint8_t)0;
+  hot->needs_ray = 1;
+  hot->phase = (uint8_t)PATH_CND_WOS_FALLBACK_TRACE;
 }
 
 /* --- PATH_CND_WOS_FALLBACK_RESULT: process fallback ray result ------------ */
 LOCAL_SYM res_T
-step_cnd_wos_fallback_result(struct path_state* p, struct sdis_scene* scn,
+step_cnd_wos_fallback_result(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn,
                              const struct s3d_hit* hit_rt)
 {
   res_T res = RES_OK;
@@ -801,20 +801,20 @@ step_cnd_wos_fallback_result(struct path_state* p, struct sdis_scene* scn,
     }
   }
 
-  p->phase = PATH_CND_WOS_TIME_TRAVEL;
+  hot->phase = (uint8_t)PATH_CND_WOS_TIME_TRAVEL;
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_CND_WOS_TIME_TRAVEL: time rewind + volumic power + loop --------- */
 LOCAL_SYM res_T
-step_cnd_wos_time_travel(struct path_state* p, struct sdis_scene* scn)
+step_cnd_wos_time_travel(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   res_T res = RES_OK;
   double dst = p->locals.cnd_wos.last_distance; /* [m/fp_to_meter] */
@@ -908,8 +908,8 @@ step_cnd_wos_time_travel(struct path_state* p, struct sdis_scene* scn)
     }
 
     p->locals.cnd_wos.wos_initialized = 0; /* reset for next entry */
-    p->phase = PATH_DONE;
-    p->active = 0;
+    hot->phase = (uint8_t)PATH_DONE;
+    hot->active = 0;
     p->done_reason = 4; /* time rewind / initial condition */
     goto exit;
   }
@@ -927,18 +927,18 @@ step_cnd_wos_time_travel(struct path_state* p, struct sdis_scene* scn)
     }
 
     p->locals.cnd_wos.wos_initialized = 0;
-    p->phase = PATH_COUPLED_BOUNDARY;
+    hot->phase = (uint8_t)PATH_COUPLED_BOUNDARY;
     goto exit;
   }
 
   /* Continue WoS loop */
-  p->phase = PATH_CND_WOS_CHECK_TEMP;
+  hot->phase = (uint8_t)PATH_CND_WOS_CHECK_TEMP;
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }

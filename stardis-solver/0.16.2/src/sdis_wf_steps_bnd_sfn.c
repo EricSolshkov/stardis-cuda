@@ -70,20 +70,20 @@
 
 /* Helper: perform picardN SWITCH_IN_RADIATIVE (accept radiative sub-path) */
 static void
-sfn_switch_in_radiative(struct path_state* p)
+sfn_switch_in_radiative(struct path_state* p, struct path_hot* hot)
 {
   p->rwalk = p->locals.bnd_sf.rwalk_s;
   p->T = p->locals.bnd_sf.T_s;
   if(p->ctx.heat_path) {
     (void)heat_path_restart(p->ctx.heat_path, &p->locals.bnd_sf.hvtx_s);
   }
-  p->phase = PATH_BND_POST_ROBIN_CHECK;
-  p->needs_ray = 0;
+  hot->phase = (uint8_t)PATH_BND_POST_ROBIN_CHECK;
+  hot->needs_ray = 0;
 }
 
 /* Helper: perform picardN NULL_COLLISION (reject, loop back) */
 static void
-sfn_null_collision(struct path_state* p)
+sfn_null_collision(struct path_state* p, struct path_hot* hot)
 {
   p->rwalk = p->locals.bnd_sf.rwalk_snapshot;
   p->T = p->locals.bnd_sf.T_snapshot;
@@ -100,8 +100,8 @@ sfn_null_collision(struct path_state* p)
     green_path_reset_limit(p->ctx.green_path);
   }
   /* h_hat remains set → prob_dispatch will skip init */
-  p->phase = PATH_BND_SFN_PROB_DISPATCH;
-  p->needs_ray = 0;
+  hot->phase = (uint8_t)PATH_BND_SFN_PROB_DISPATCH;
+  hot->needs_ray = 0;
 }
 
 /* Helper: compute h_radi bounds for CHECK_PMIN_PMAX at stage i.
@@ -157,7 +157,8 @@ sfn_compute_h_radi_bounds(const struct path_state* p,
 
 /* --- PATH_BND_SFN_PROB_DISPATCH: picardN probability dispatch ------------ */
 LOCAL_SYM res_T
-step_bnd_sfn_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
+step_bnd_sfn_prob_dispatch(struct path_state* p, struct path_hot* hot,
+                          struct sdis_scene* scn,
                           struct path_sfn_data* sfn)
 {
   struct reinjection_step reinject_step = REINJECTION_STEP_NULL;
@@ -235,8 +236,8 @@ step_bnd_sfn_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
     p->T.func = convective_path_3d;
     p->rwalk.enc_id = p->locals.bnd_sf.enc_ids[p->locals.bnd_sf.fluid_side];
     p->rwalk.hit_side = p->locals.bnd_sf.fluid_side;
-    p->phase = PATH_BND_POST_ROBIN_CHECK;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_BND_POST_ROBIN_CHECK;
+    hot->needs_ray = 0;
     goto exit;
   }
 
@@ -257,8 +258,8 @@ step_bnd_sfn_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
     if(res != RES_OK) goto error;
 
     if(p->T.done) {
-      p->phase = PATH_DONE;
-      p->active = 0;
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
       p->done_reason = 4;
       goto exit;
     }
@@ -266,13 +267,13 @@ step_bnd_sfn_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
     if(p->T.func == conductive_path_3d) {
       p->ds_initialized = 0;
       p->locals.cnd_wos.wos_initialized = 0; /* union was bnd_sfn — clear */
-      p->phase = PATH_COUPLED_CONDUCTIVE;
+      hot->phase = (uint8_t)PATH_COUPLED_CONDUCTIVE;
     } else if(p->T.func == boundary_path_3d) {
-      p->phase = PATH_COUPLED_BOUNDARY;
+      hot->phase = (uint8_t)PATH_COUPLED_BOUNDARY;
     } else {
       FATAL("wavefront M8: unexpected T.func after solid_reinjection\n");
     }
-    p->needs_ray = 0;
+    hot->needs_ray = 0;
     goto exit;
   }
 
@@ -328,18 +329,18 @@ step_bnd_sfn_prob_dispatch(struct path_state* p, struct sdis_scene* scn,
       p->filter_data_storage.scn = scn;
       p->filter_data_storage.enc_id = p->rwalk.enc_id;
 
-      p->ray_bucket = RAY_BUCKET_RADIATIVE;
-      p->ray_count_ext = 1;
-      p->needs_ray = 1;
-      p->phase = PATH_BND_SFN_RAD_TRACE;
+      hot->ray_bucket = (uint8_t)RAY_BUCKET_RADIATIVE;
+      hot->ray_count_ext = (uint8_t)1;
+      hot->needs_ray = 1;
+      hot->phase = (uint8_t)PATH_BND_SFN_RAD_TRACE;
     }
   }
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
@@ -348,7 +349,8 @@ error:
 /* Functionally identical to step_bnd_sf_nullcoll_rad_trace, but transitions
  * to PATH_BND_SFN_RAD_DONE on completion instead of SF_NULLCOLL_DECIDE. */
 LOCAL_SYM res_T
-step_bnd_sfn_rad_trace(struct path_state* p, struct sdis_scene* scn,
+step_bnd_sfn_rad_trace(struct path_state* p, struct path_hot* hot,
+                       struct sdis_scene* scn,
                        const struct s3d_hit* trace_hit)
 {
   res_T res = RES_OK;
@@ -385,8 +387,8 @@ step_bnd_sfn_rad_trace(struct path_state* p, struct sdis_scene* scn,
     p->rwalk.hit_3d = S3D_HIT_NULL;
     p->rwalk.hit_side = SDIS_SIDE_NULL__;
 
-    p->phase = PATH_BND_SFN_RAD_DONE;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_BND_SFN_RAD_DONE;
+    hot->needs_ray = 0;
     goto exit;
   }
 
@@ -463,10 +465,10 @@ step_bnd_sfn_rad_trace(struct path_state* p, struct sdis_scene* scn,
           p->filter_data_storage.scn = scn;
           p->filter_data_storage.enc_id = p->rwalk.enc_id;
 
-          p->ray_bucket = RAY_BUCKET_RADIATIVE;
-          p->ray_count_ext = 1;
-          p->needs_ray = 1;
-          p->phase = PATH_BND_SFN_RAD_TRACE;
+          hot->ray_bucket = (uint8_t)RAY_BUCKET_RADIATIVE;
+          hot->ray_count_ext = (uint8_t)1;
+          hot->needs_ray = 1;
+          hot->phase = (uint8_t)PATH_BND_SFN_RAD_TRACE;
         }
         goto exit;
       }
@@ -496,8 +498,8 @@ step_bnd_sfn_rad_trace(struct path_state* p, struct sdis_scene* scn,
       p->T.func = boundary_path_3d;
       d3_set_f3(p->rwalk.dir, p->locals.bnd_sf.rad_sub_direction);
 
-      p->phase = PATH_BND_SFN_RAD_DONE;
-      p->needs_ray = 0;
+      hot->phase = (uint8_t)PATH_BND_SFN_RAD_DONE;
+      hot->needs_ray = 0;
       goto exit;
     }
 
@@ -532,25 +534,26 @@ step_bnd_sfn_rad_trace(struct path_state* p, struct sdis_scene* scn,
       p->filter_data_storage.scn = scn;
       p->filter_data_storage.enc_id = p->rwalk.enc_id;
 
-      p->ray_bucket = RAY_BUCKET_RADIATIVE;
-      p->ray_count_ext = 1;
-      p->needs_ray = 1;
-      p->phase = PATH_BND_SFN_RAD_TRACE;
+      hot->ray_bucket = (uint8_t)RAY_BUCKET_RADIATIVE;
+      hot->ray_count_ext = (uint8_t)1;
+      hot->needs_ray = 1;
+      hot->phase = (uint8_t)PATH_BND_SFN_RAD_TRACE;
     }
   }
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_BND_SFN_RAD_DONE: radiative sub-path completed ----------------- */
 LOCAL_SYM res_T
-step_bnd_sfn_rad_done(struct path_state* p, struct sdis_scene* scn,
+step_bnd_sfn_rad_done(struct path_state* p, struct path_hot* hot,
+                      struct sdis_scene* scn,
                       struct path_sfn_data* sfn)
 {
   double h_radi_min, p_radi_min;
@@ -582,7 +585,7 @@ step_bnd_sfn_rad_done(struct path_state* p, struct sdis_scene* scn,
                         + p->locals.bnd_sf.p_cond
                         + p_radi_min) {
     /* Early accept: use radiative sub-path */
-    sfn_switch_in_radiative(p);
+    sfn_switch_in_radiative(p, hot);
     goto exit;
   }
 
@@ -606,8 +609,8 @@ step_bnd_sfn_rad_done(struct path_state* p, struct sdis_scene* scn,
   }
 
   /* Start COMPUTE_TEMPERATURE for T0 */
-  p->phase = PATH_BND_SFN_COMPUTE_Ti;
-  p->needs_ray = 0;
+  hot->phase = (uint8_t)PATH_BND_SFN_COMPUTE_Ti;
+  hot->needs_ray = 0;
 
 exit:
   return res;
@@ -615,7 +618,8 @@ exit:
 
 /* --- PATH_BND_SFN_COMPUTE_Ti: compute i-th temperature sample ----------- */
 LOCAL_SYM res_T
-step_bnd_sfn_compute_Ti(struct path_state* p, struct sdis_scene* scn,
+step_bnd_sfn_compute_Ti(struct path_state* p, struct path_hot* hot,
+                        struct sdis_scene* scn,
                         struct path_sfn_data* sfn)
 {
   int i;
@@ -642,8 +646,8 @@ step_bnd_sfn_compute_Ti(struct path_state* p, struct sdis_scene* scn,
   if(sample_T->done) {
     sfn->stack[sfn->depth].T_values[i] = sample_T->value;
     sfn->stack[sfn->depth].T_count = i + 1;
-    p->phase = PATH_BND_SFN_CHECK_PMIN_PMAX;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_BND_SFN_CHECK_PMIN_PMAX;
+    hot->needs_ray = 0;
     goto exit;
   }
 
@@ -675,16 +679,16 @@ step_bnd_sfn_compute_Ti(struct path_state* p, struct sdis_scene* scn,
     }
     if(res != RES_OK && res != RES_BAD_OP) goto error;
     if(res == RES_BAD_OP) {
-      p->phase = PATH_DONE;
-      p->active = 0;
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
       goto exit;
     }
     if(p->T.done) {
-      p->phase = PATH_DONE;
-      p->active = 0;
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
       p->done_reason = 3;
     } else {
-      p->phase = PATH_BND_POST_ROBIN_CHECK;
+      hot->phase = (uint8_t)PATH_BND_POST_ROBIN_CHECK;
     }
     goto exit;
   }
@@ -725,21 +729,22 @@ step_bnd_sfn_compute_Ti(struct path_state* p, struct sdis_scene* scn,
   /* The sub-path enters sample_coupled_path which calls boundary_path,
    * conductive_path, etc.  In wavefront mode, this means re-entering
    * step_boundary via PATH_COUPLED_BOUNDARY. */
-  p->phase = PATH_COUPLED_BOUNDARY;
-  p->needs_ray = 0;
+  hot->phase = (uint8_t)PATH_COUPLED_BOUNDARY;
+  hot->needs_ray = 0;
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_BND_SFN_COMPUTE_Ti_RESUME: sub-path returned, pop stack -------- */
 LOCAL_SYM res_T
-step_bnd_sfn_compute_Ti_resume(struct path_state* p, struct sdis_scene* scn,
+step_bnd_sfn_compute_Ti_resume(struct path_state* p, struct path_hot* hot,
+                               struct sdis_scene* scn,
                                struct path_sfn_data* sfn)
 {
   int i;
@@ -780,21 +785,22 @@ step_bnd_sfn_compute_Ti_resume(struct path_state* p, struct sdis_scene* scn,
   p->coupled_nbranchings = p->locals.bnd_sf.coupled_nbranchings_saved;
   p->ctx.nbranchings = (size_t)p->coupled_nbranchings;
 
-  p->phase = PATH_BND_SFN_CHECK_PMIN_PMAX;
-  p->needs_ray = 0;
+  hot->phase = (uint8_t)PATH_BND_SFN_CHECK_PMIN_PMAX;
+  hot->needs_ray = 0;
 
 exit:
   return res;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   goto exit;
 }
 
 /* --- PATH_BND_SFN_CHECK_PMIN_PMAX: early accept/reject or continue ------- */
 LOCAL_SYM res_T
-step_bnd_sfn_check_pmin_pmax(struct path_state* p, struct sdis_scene* scn,
+step_bnd_sfn_check_pmin_pmax(struct path_state* p, struct path_hot* hot,
+                             struct sdis_scene* scn,
                              struct path_sfn_data* sfn)
 {
   int i;
@@ -821,29 +827,29 @@ step_bnd_sfn_check_pmin_pmax(struct path_state* p, struct sdis_scene* scn,
 
   /* --- Early accept --- */
   if(r < p_conv + p_cond + p_radi_min) {
-    sfn_switch_in_radiative(p);
+    sfn_switch_in_radiative(p, hot);
     goto exit;
   }
 
   /* --- Early reject (only when i < 6, i.e. bounds are not exact) --- */
   if(i < 6 && r > p_conv + p_cond + p_radi_max) {
-    sfn_null_collision(p);
+    sfn_null_collision(p, hot);
     goto exit;
   }
 
   /* --- Continue: need more Ti samples --- */
   if(i < 6) {
-    p->phase = PATH_BND_SFN_COMPUTE_Ti;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_BND_SFN_COMPUTE_Ti;
+    hot->needs_ray = 0;
     goto exit;
   }
 
   /* i == 6: all T0-T5 computed, h_radi is now exact */
   /* Final decision: h_radi_min == h_radi_max at i=6 */
   if(r < p_conv + p_cond + p_radi_min) {
-    sfn_switch_in_radiative(p);
+    sfn_switch_in_radiative(p, hot);
   } else {
-    sfn_null_collision(p);
+    sfn_null_collision(p, hot);
   }
 
 exit:

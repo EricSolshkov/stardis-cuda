@@ -69,7 +69,7 @@ wf_sample_reinjection_dir_3d(const struct rwalk* rwalk,
 
 /* Helper: setup the 4-ray request for solid/solid reinjection. */
 LOCAL_SYM void
-setup_ss_reinject_rays(struct path_state* p)
+setup_ss_reinject_rays(struct path_state* p, struct path_hot* hot)
 {
   float pos[3];
   float range[2];
@@ -106,15 +106,15 @@ setup_ss_reinject_rays(struct path_state* p)
 
   /* B-4 M3: 4 rays total (frt*2 + bck*2), but ray_req only holds 2.
    * We use ray_count_ext=4 and emit the back side rays in collect. */
-  p->ray_count_ext = 4;
-  p->ray_bucket = RAY_BUCKET_STEP_PAIR;
-  p->needs_ray = 1;
-  p->phase = PATH_BND_SS_REINJECT_SAMPLE;
+  hot->ray_count_ext = (uint8_t)4;
+  hot->ray_bucket = (uint8_t)RAY_BUCKET_STEP_PAIR;
+  hot->needs_ray = 1;
+  hot->phase = (uint8_t)PATH_BND_SS_REINJECT_SAMPLE;
 }
 
 /* --- PATH_BND_SS_REINJECT_SAMPLE entry: prepare and emit 4 rays ---------- */
 LOCAL_SYM res_T
-step_bnd_ss_reinject_sample(struct path_state* p, struct sdis_scene* scn)
+step_bnd_ss_reinject_sample(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   struct sdis_interface* interf = NULL;
   struct sdis_medium* solid_frt = NULL;
@@ -185,8 +185,8 @@ step_bnd_ss_reinject_sample(struct path_state* p, struct sdis_scene* scn)
         (float)p->locals.bnd_ss.delta_boundary_bck;
     p->locals.bnd_ss.reinject_hit_bck = S3D_HIT_NULL;
     p->locals.bnd_ss.retry_count = 0;
-    p->phase = PATH_BND_SS_REINJECT_DECIDE;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)PATH_BND_SS_REINJECT_DECIDE;
+    hot->needs_ray = 0;
     return RES_OK;
   }
 
@@ -214,7 +214,7 @@ step_bnd_ss_reinject_sample(struct path_state* p, struct sdis_scene* scn)
   p->locals.bnd_ss.need_enc_bck = 0;
 
   /* Emit 4 trace rays */
-  setup_ss_reinject_rays(p);
+  setup_ss_reinject_rays(p, hot);
   return RES_OK;
 }
 
@@ -313,6 +313,7 @@ resolve_reinjection_from_hits(
 LOCAL_SYM res_T
 step_bnd_ss_reinject_process(
   struct path_state* p,
+  struct path_hot* hot,
   struct sdis_scene* scn,
   const struct s3d_hit* hit_frt0,
   const struct s3d_hit* hit_frt1,
@@ -487,7 +488,7 @@ step_bnd_ss_reinject_process(
     p->locals.bnd_ss.need_enc_frt = 0;
     p->locals.bnd_ss.need_enc_bck = 0;
 
-    setup_ss_reinject_rays(p);
+    setup_ss_reinject_rays(p, hot);
     return RES_OK; /* re-emit rays, stay in REINJECT_SAMPLE */
   }
 
@@ -501,7 +502,7 @@ step_bnd_ss_reinject_process(
     move_pos_3d(pos, p->locals.bnd_ss.reinject_dir_frt,
                 p->locals.bnd_ss.reinject_dst_frt);
     p->locals.bnd_ss.enc_side = 0; /* front */
-    step_enc_query_emit(p, enc, pos, PATH_BND_SS_REINJECT_ENC);
+    step_enc_query_emit(p, hot, enc, pos, PATH_BND_SS_REINJECT_ENC);
     return RES_OK;
   }
 
@@ -513,25 +514,26 @@ step_bnd_ss_reinject_process(
     move_pos_3d(pos, p->locals.bnd_ss.reinject_dir_bck,
                 p->locals.bnd_ss.reinject_dst_bck);
     p->locals.bnd_ss.enc_side = 1; /* back */
-    step_enc_query_emit(p, enc, pos, PATH_BND_SS_REINJECT_ENC);
+    step_enc_query_emit(p, hot, enc, pos, PATH_BND_SS_REINJECT_ENC);
     return RES_OK;
   }
 
   /* All enclosures resolved -- go to decide */
-  p->phase = PATH_BND_SS_REINJECT_DECIDE;
-  p->needs_ray = 0;
+  hot->phase = (uint8_t)PATH_BND_SS_REINJECT_DECIDE;
+  hot->needs_ray = 0;
   return RES_OK;
 
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   return res;
 }
 
 /* --- PATH_BND_SS_REINJECT_ENC: ENC query result for reinjection verify ---- */
 LOCAL_SYM res_T
-step_bnd_ss_reinject_enc_result(struct path_state* p, struct sdis_scene* scn,
+step_bnd_ss_reinject_enc_result(struct path_state* p, struct path_hot* hot,
+                               struct sdis_scene* scn,
                                struct path_enc_data* enc)
 {
   unsigned enc_id;
@@ -559,7 +561,7 @@ step_bnd_ss_reinject_enc_result(struct path_state* p, struct sdis_scene* scn,
       move_pos_3d(pos, p->locals.bnd_ss.reinject_dir_bck,
                   p->locals.bnd_ss.reinject_dst_bck);
       p->locals.bnd_ss.enc_side = 1; /* back */
-      step_enc_query_emit(p, enc, pos, PATH_BND_SS_REINJECT_ENC);
+      step_enc_query_emit(p, hot, enc, pos, PATH_BND_SS_REINJECT_ENC);
       return RES_OK;
     }
   } else {
@@ -585,8 +587,8 @@ step_bnd_ss_reinject_enc_result(struct path_state* p, struct sdis_scene* scn,
         log_warn(scn->dev,
           "wavefront M3: solid/solid reinjection failed (ENC) at "
           "(%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));
-        p->phase = PATH_DONE;
-        p->active = 0;
+        hot->phase = (uint8_t)PATH_DONE;
+        hot->active = 0;
         p->done_reason = -1;
         return RES_BAD_OP_IRRECOVERABLE;
       }
@@ -608,19 +610,19 @@ step_bnd_ss_reinject_enc_result(struct path_state* p, struct sdis_scene* scn,
       p->locals.bnd_ss.need_enc_frt = 0;
       p->locals.bnd_ss.need_enc_bck = 0;
 
-      setup_ss_reinject_rays(p);
+      setup_ss_reinject_rays(p, hot);
       return RES_OK;
     }
   }
 
-  p->phase = PATH_BND_SS_REINJECT_DECIDE;
-  p->needs_ray = 0;
+  hot->phase = (uint8_t)PATH_BND_SS_REINJECT_DECIDE;
+  hot->needs_ray = 0;
   return RES_OK;
 }
 
 /* --- PATH_BND_SS_REINJECT_DECIDE: probability choice + solid_reinjection -- */
 LOCAL_SYM res_T
-step_bnd_ss_reinject_decide(struct path_state* p, struct sdis_scene* scn)
+step_bnd_ss_reinject_decide(struct path_state* p, struct path_hot* hot, struct sdis_scene* scn)
 {
   double r, proba;
   float* chosen_dir;
@@ -719,8 +721,8 @@ step_bnd_ss_reinject_decide(struct path_state* p, struct sdis_scene* scn)
 
   /* After solid_reinjection, check where we go next */
   if(p->T.done) {
-    p->phase = PATH_DONE;
-    p->active = 0;
+    hot->phase = (uint8_t)PATH_DONE;
+    hot->active = 0;
     p->done_reason = 4; /* time rewind / temperature found */
     goto exit;
   }
@@ -729,19 +731,19 @@ step_bnd_ss_reinject_decide(struct path_state* p, struct sdis_scene* scn)
   if(p->T.func == conductive_path_3d) {
     p->ds_initialized = 0; /* reset for fresh conductive entry */
     p->locals.cnd_wos.wos_initialized = 0; /* union was bnd_ss — clear */
-    p->phase = PATH_COUPLED_CONDUCTIVE;
+    hot->phase = (uint8_t)PATH_COUPLED_CONDUCTIVE;
   } else if(p->T.func == boundary_path_3d) {
-    p->phase = PATH_COUPLED_BOUNDARY;
+    hot->phase = (uint8_t)PATH_COUPLED_BOUNDARY;
   } else {
     FATAL("wavefront M3: unexpected T.func after solid_reinjection\n");
   }
-  p->needs_ray = 0;
+  hot->needs_ray = 0;
 
 exit:
   return RES_OK;
 error:
-  p->phase = PATH_DONE;
-  p->active = 0;
+  hot->phase = (uint8_t)PATH_DONE;
+  hot->active = 0;
   p->done_reason = -1;
   return res;
 }

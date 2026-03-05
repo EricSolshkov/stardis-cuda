@@ -54,6 +54,7 @@
  * collect these requests into a batch before the next GPU dispatch. */
 LOCAL_SYM void
 step_enc_locate_submit(struct path_state* p,
+                       struct path_hot* hot,
                        struct path_enc_data* enc,
                        const double pos[3],
                        enum path_phase return_state)
@@ -70,15 +71,16 @@ step_enc_locate_submit(struct path_state* p,
   enc->locate.distance = -1.0f;
   enc->locate.batch_idx = (uint32_t)-1;
 
-  p->needs_ray = 0;  /* NOT a ray request — enc_locate has its own batch */
-  p->phase = PATH_ENC_LOCATE_PENDING;
+  hot->needs_ray = 0;  /* NOT a ray request — enc_locate has its own batch */
+  hot->phase = (uint8_t)PATH_ENC_LOCATE_PENDING;
 }
 
 /* Process the result of a batch enc_locate query.
  * At this point enc_locate.prim_id and enc_locate.side have been filled
  * by pool_distribute_enc_locate_results().  Resolve to enc_id. */
 LOCAL_SYM res_T
-step_enc_locate_result(struct path_state* p, struct sdis_scene* scn,
+step_enc_locate_result(struct path_state* p, struct path_hot* hot,
+                       struct sdis_scene* scn,
                        struct path_enc_data* enc)
 {
   unsigned enc_id = ENCLOSURE_ID_NULL;
@@ -100,7 +102,7 @@ step_enc_locate_result(struct path_state* p, struct sdis_scene* scn,
   /* else: prim_id < 0 → miss, enc_id stays ENCLOSURE_ID_NULL */
 
   enc->locate.resolved_enc_id = enc_id;
-  p->phase = enc->locate.return_state;
+  hot->phase = (uint8_t)enc->locate.return_state;
   return RES_OK;
 }
 
@@ -118,6 +120,7 @@ step_enc_locate_result(struct path_state* p, struct sdis_scene* scn,
 /* --- step_enc_query_emit: build 6 PI/4-rotated dirs + prepare ray request -- */
 LOCAL_SYM void
 step_enc_query_emit(struct path_state* p,
+                    struct path_hot* hot,
                     struct path_enc_data* enc,
                     const double pos[3],
                     enum path_phase return_state)
@@ -174,15 +177,16 @@ step_enc_query_emit(struct path_state* p,
   /* No self-intersection filter for enclosure query */
   p->filter_data_storage = HIT_FILTER_DATA_NULL;
 
-  p->ray_count_ext = 6;
-  p->ray_bucket = RAY_BUCKET_ENCLOSURE;
-  p->needs_ray = 1;
-  p->phase = PATH_ENC_QUERY_EMIT;
+  hot->ray_count_ext = 6;
+  hot->ray_bucket = (uint8_t)RAY_BUCKET_ENCLOSURE;
+  hot->needs_ray = 1;
+  hot->phase = (uint8_t)PATH_ENC_QUERY_EMIT;
 }
 
 /* --- step_enc_query_resolve: check 6 hits, pick first valid --------------- */
 LOCAL_SYM res_T
-step_enc_query_resolve(struct path_state* p, struct sdis_scene* scn,
+step_enc_query_resolve(struct path_state* p, struct path_hot* hot,
+                       struct sdis_scene* scn,
                        struct path_enc_data* enc)
 {
   unsigned enc_id = ENCLOSURE_ID_NULL;
@@ -217,8 +221,8 @@ step_enc_query_resolve(struct path_state* p, struct sdis_scene* scn,
   if(idir < 6) {
     /* Resolved from primary 6 rays */
     enc->resolved_enc_id = enc_id;
-    p->phase = enc->return_state;
-    p->needs_ray = 0;
+    hot->phase = (uint8_t)enc->return_state;
+    hot->needs_ray = 0;
     return RES_OK;
   }
 
@@ -249,17 +253,18 @@ step_enc_query_resolve(struct path_state* p, struct sdis_scene* scn,
 
     p->filter_data_storage = HIT_FILTER_DATA_NULL;
 
-    p->ray_count_ext = 1;
-    p->ray_bucket = RAY_BUCKET_ENCLOSURE;
-    p->needs_ray = 1;
-    p->phase = PATH_ENC_QUERY_FB_EMIT;
+    hot->ray_count_ext = 1;
+    hot->ray_bucket = (uint8_t)RAY_BUCKET_ENCLOSURE;
+    hot->needs_ray = 1;
+    hot->phase = (uint8_t)PATH_ENC_QUERY_FB_EMIT;
   }
   return RES_OK;
 }
 
 /* --- step_enc_query_fb_resolve: check 1 fallback hit --------------------- */
 LOCAL_SYM res_T
-step_enc_query_fb_resolve(struct path_state* p, struct sdis_scene* scn,
+step_enc_query_fb_resolve(struct path_state* p, struct path_hot* hot,
+                          struct sdis_scene* scn,
                           struct path_enc_data* enc)
 {
   unsigned enc_id = ENCLOSURE_ID_NULL;
@@ -287,7 +292,7 @@ step_enc_query_fb_resolve(struct path_state* p, struct sdis_scene* scn,
      * resolves, the path resumes at the original caller.  enc_locate
      * and enc_query are independent top-level members of path_state,
      * so writing enc_locate.* does not clobber enc_query.*. */
-    step_enc_locate_submit(p, enc,
+    step_enc_locate_submit(p, hot, enc,
                            enc->query_pos,
                            enc->return_state);
     /* p->phase is now PATH_ENC_LOCATE_PENDING; cascade will break out
@@ -296,8 +301,8 @@ step_enc_query_fb_resolve(struct path_state* p, struct sdis_scene* scn,
   }
 
   enc->resolved_enc_id = enc_id;
-  p->phase = enc->return_state;
-  p->needs_ray = 0;
+  hot->phase = (uint8_t)enc->return_state;
+  hot->needs_ray = 0;
   return RES_OK;
 }
 

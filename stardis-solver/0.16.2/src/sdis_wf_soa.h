@@ -31,6 +31,7 @@
 
 #include "sdis_wf_types.h"   /* enum path_phase, enum ray_bucket_type */
 #include "sdis_wf_state.h"   /* struct path_state */
+#include "sdis_wf_hot.h"     /* struct path_hot */
 #include "sdis.h"            /* INLINE, res_T */
 #include <stdint.h>
 
@@ -51,33 +52,34 @@ extern res_T dispatch_soa_alloc(struct dispatch_soa* soa, size_t pool_size);
 extern void  dispatch_soa_free (struct dispatch_soa* soa);
 
 /*******************************************************************************
- * Single-slot sync: path_state -> SoA (after init / after cascade per-path)
+ * Single-slot sync: path_hot -> SoA (after init / after cascade per-path)
+ * P0_OPT: hot fields now live in path_hot, not path_state.
  ******************************************************************************/
 static INLINE void
 dispatch_soa_sync_from_path(struct dispatch_soa* soa,
                             uint32_t idx,
-                            const struct path_state* p)
+                            const struct path_hot* h)
 {
-  soa->phase[idx]         = p->phase;
-  soa->active[idx]        = p->active;
-  soa->needs_ray[idx]     = p->needs_ray;
-  soa->ray_bucket[idx]    = p->ray_bucket;
-  soa->ray_count_ext[idx] = p->ray_count_ext;
+  soa->phase[idx]         = (enum path_phase)h->phase;
+  soa->active[idx]        = h->active;
+  soa->needs_ray[idx]     = h->needs_ray;
+  soa->ray_bucket[idx]    = (enum ray_bucket_type)h->ray_bucket;
+  soa->ray_count_ext[idx] = h->ray_count_ext;
 }
 
 /*******************************************************************************
- * Single-slot sync: SoA -> path_state (if needed before step_* that reads)
+ * Single-slot sync: SoA -> path_hot (if needed before step_* that reads)
  ******************************************************************************/
 static INLINE void
 dispatch_soa_sync_to_path(const struct dispatch_soa* soa,
                           uint32_t idx,
-                          struct path_state* p)
+                          struct path_hot* h)
 {
-  p->phase         = soa->phase[idx];
-  p->active        = soa->active[idx];
-  p->needs_ray     = soa->needs_ray[idx];
-  p->ray_bucket    = soa->ray_bucket[idx];
-  p->ray_count_ext = soa->ray_count_ext[idx];
+  h->phase         = (uint8_t)soa->phase[idx];
+  h->active        = (uint8_t)soa->active[idx];
+  h->needs_ray     = (uint8_t)soa->needs_ray[idx];
+  h->ray_bucket    = (uint8_t)soa->ray_bucket[idx];
+  h->ray_count_ext = soa->ray_count_ext[idx];
 }
 
 /*******************************************************************************
@@ -88,16 +90,16 @@ dispatch_soa_sync_to_path(const struct dispatch_soa* soa,
 static INLINE void
 dispatch_soa_assert_consistent(const struct dispatch_soa* soa,
                                uint32_t idx,
-                               const struct path_state* p)
+                               const struct path_hot* h)
 {
-  ASSERT(soa->phase[idx]         == p->phase);
-  ASSERT(soa->active[idx]        == p->active);
-  ASSERT(soa->needs_ray[idx]     == p->needs_ray);
-  ASSERT(soa->ray_bucket[idx]    == p->ray_bucket);
-  ASSERT(soa->ray_count_ext[idx] == p->ray_count_ext);
+  ASSERT(soa->phase[idx]         == (enum path_phase)h->phase);
+  ASSERT(soa->active[idx]        == (int)h->active);
+  ASSERT(soa->needs_ray[idx]     == (int)h->needs_ray);
+  ASSERT(soa->ray_bucket[idx]    == (enum ray_bucket_type)h->ray_bucket);
+  ASSERT(soa->ray_count_ext[idx] == h->ray_count_ext);
 }
 #else
-#define dispatch_soa_assert_consistent(soa, idx, p) ((void)0)
+#define dispatch_soa_assert_consistent(soa, idx, h) ((void)0)
 #endif
 
 #endif /* SDIS_WF_SOA_H */
