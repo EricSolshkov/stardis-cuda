@@ -22,6 +22,10 @@ struct Ray {
     float  tmax;
 };
 
+/* Plan E: Verify Ray layout matches C-visible s3d_ray_pinned (32 bytes).
+ * s3d_ray_pinned is defined in s3d.h as 8 consecutive floats. */
+static_assert(sizeof(Ray) == 32, "Ray must be 32 bytes to match s3d_ray_pinned");
+
 /* ---- Hit Result (E1 extended) ---- */
 struct HitResult {
     float        t;            /* hit distance; < 0 means miss             */
