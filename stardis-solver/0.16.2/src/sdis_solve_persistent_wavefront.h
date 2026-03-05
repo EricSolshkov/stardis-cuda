@@ -201,6 +201,10 @@ struct pool_view {
   /* ---- L4: GPU inline filter per-ray data ---- */
   struct s3d_filter_per_ray* filter_per_ray;
 
+  /* ---- Plan E: Pinned direct-write pointers (borrowed from batch_ctx) ---- */
+  struct s3d_ray_pinned*     ray_pinned;      /* → ctx->h_rays_pinned   */
+  struct s3d_filter_per_ray* filter_pinned;   /* → ctx->h_filter_pinned */
+
   /* ---- Ray bucket offsets ---- */
   size_t bucket_offsets[RAY_BUCKET_COUNT + 1];
   size_t bucket_counts[RAY_BUCKET_COUNT];

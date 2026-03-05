@@ -2559,6 +2559,74 @@ static res_T batch_trace_filtered_async_impl(
     return RES_OK;
 }
 
+/* Plan E: pinned direct-write async launch — data already in pinned buffers,
+ * skip AoS→SoA conversion and memcpy, go straight to H2D + kernel launch. */
+static res_T batch_trace_filtered_pinned_async_impl(
+    s3d_scene_view* sv,
+    s3d_batch_trace_context* ctx,
+    size_t nrays)
+{
+    res_T rc = ensure_built(sv);
+    if (rc != RES_OK) return rc;
+
+    if (!sv->has_geometry || nrays == 0) {
+        ctx->async_pending = false;
+        ctx->async_nrays   = nrays;
+        return RES_OK;
+    }
+
+    /* NO AoS→SoA loop — caller already wrote directly into h_rays_pinned.
+     * NO memcpy — caller already wrote directly into h_filter_pinned.     */
+
+    /* H2D uploads on transfer_stream */
+    unsigned int count = static_cast<unsigned int>(nrays);
+    ctx->d_rays.uploadAsync(ctx->h_rays_pinned, count, ctx->transfer_stream);
+    ctx->d_filter_data.uploadAsync(
+        reinterpret_cast<FilterPerRayData*>(ctx->h_filter_pinned),
+        count, ctx->transfer_stream);
+    CUDA_CHECK(cudaEventRecord(ctx->evt_upload_done, ctx->transfer_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->compute_stream, ctx->evt_upload_done, 0));
+
+    /* Ensure per-ctx params buffer */
+    if (!ctx->params_allocated) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ctx->params_ptr),
+                              sizeof(UnifiedParams)));
+        ctx->params_allocated = true;
+    }
+
+    /* L4: filtered kernel launch on compute_stream */
+    sv->tracer.traceBatchMultiHitFiltered(
+        ctx->d_rays.get(),
+        ctx->d_hits_filtered.get(),
+        ctx->d_multi_hits.get(),
+        ctx->d_filter_data.get(),
+        count,
+        ctx->compute_stream,
+        ctx->params_ptr);
+    CUDA_CHECK(cudaEventRecord(ctx->evt_kernel_done, ctx->compute_stream));
+
+    ctx->async_pending = true;
+    ctx->async_nrays   = nrays;
+    return RES_OK;
+}
+
+/* Plan E: get borrowed pointers to internal pinned buffers */
+static void get_pinned_buffers_impl(
+    s3d_batch_trace_context* ctx,
+    s3d_ray_pinned** out_rays,
+    s3d_filter_per_ray** out_filter,
+    size_t* out_capacity)
+{
+    /* Ray and s3d_ray_pinned are both 32 bytes of plain floats.
+     * The layout is verified by static_assert in ray_types.h. */
+    if (out_rays)
+        *out_rays = reinterpret_cast<s3d_ray_pinned*>(ctx->h_rays_pinned);
+    if (out_filter)
+        *out_filter = reinterpret_cast<s3d_filter_per_ray*>(ctx->h_filter_pinned);
+    if (out_capacity)
+        *out_capacity = ctx->pinned_capacity;
+}
+
 /* L4: sync filtered compute kernel */
 static res_T batch_trace_filtered_sync_kernel_impl(
     s3d_batch_trace_context* ctx)
@@ -2761,6 +2829,27 @@ res_T s3d_scene_view_trace_rays_batch_ctx_filtered_wait_d2h(
     if (!scnview || !ctx || !hits) return RES_BAD_ARG;
     return batch_trace_filtered_wait_d2h_impl(scnview, ctx, requests, nrays,
                                                hits, stats);
+}
+
+/* Plan E: public API for pinned buffer access */
+void s3d_batch_trace_context_get_pinned_buffers(
+    s3d_batch_trace_context* ctx,
+    s3d_ray_pinned** out_rays,
+    s3d_filter_per_ray** out_filter,
+    size_t* out_capacity)
+{
+    if (!ctx) return;
+    get_pinned_buffers_impl(ctx, out_rays, out_filter, out_capacity);
+}
+
+/* Plan E: public API for pinned direct-write async launch */
+res_T s3d_scene_view_trace_rays_batch_ctx_filtered_pinned_async(
+    s3d_scene_view* scnview,
+    s3d_batch_trace_context* ctx,
+    size_t nrays)
+{
+    if (!scnview || !ctx) return RES_BAD_ARG;
+    return batch_trace_filtered_pinned_async_impl(scnview, ctx, nrays);
 }
 
 /* ================================================================

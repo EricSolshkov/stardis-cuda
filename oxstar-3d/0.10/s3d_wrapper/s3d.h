@@ -375,6 +375,16 @@ struct s3d_ray_request {
   uint32_t user_id;
 };
 
+/* C-visible pinned Ray layout matching CUDA Ray struct (32 bytes).
+ * Used for direct-write optimization: collect writes here directly,
+ * skipping the intermediate s3d_ray_request buffer + AoS→SoA copy. */
+struct s3d_ray_pinned {
+  float origin_x, origin_y, origin_z;
+  float tmin;
+  float direction_x, direction_y, direction_z;
+  float tmax;
+};
+
 struct s3d_batch_trace_stats {
   size_t  total_rays;
   size_t  batch_accepted;
@@ -477,6 +487,27 @@ S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_filtered_wait_d2h(
   struct s3d_batch_trace_context* ctx,
   const struct s3d_ray_request* requests, size_t nrays,
   struct s3d_hit* hits, struct s3d_batch_trace_stats* stats);
+
+/*******************************************************************************
+ * Plan E: Pinned Direct-Write API
+ * Collect writes directly into pinned buffers, eliminating intermediate copy.
+ ******************************************************************************/
+
+/* Get borrowed pointers to batch_ctx internal pinned buffers.
+ * Caller must not free these — ownership stays with batch_ctx. */
+S3D_API void s3d_batch_trace_context_get_pinned_buffers(
+  struct s3d_batch_trace_context* ctx,
+  struct s3d_ray_pinned**       out_rays,
+  struct s3d_filter_per_ray**   out_filter,
+  size_t*                        out_capacity);
+
+/* Launch GPU trace directly from pinned buffers (no AoS→SoA copy).
+ * Caller must have written ray/filter data into the pinned buffers
+ * obtained via s3d_batch_trace_context_get_pinned_buffers(). */
+S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_filtered_pinned_async(
+  struct s3d_scene_view* scnview,
+  struct s3d_batch_trace_context* ctx,
+  size_t nrays);
 
 /*******************************************************************************
  * Batch Closest Point API (GPU-accelerated)

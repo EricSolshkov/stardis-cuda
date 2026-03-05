@@ -153,6 +153,10 @@ pool_view_init(struct pool_view* pv, size_t base, size_t view_size,
     if(rc != RES_OK) return rc;
   }
 
+  /* Plan E: Borrow pinned buffer pointers from batch_ctx for direct-write */
+  s3d_batch_trace_context_get_pinned_buffers(
+    pv->batch_ctx, &pv->ray_pinned, &pv->filter_pinned, NULL);
+
   /* enc_locate buffers */
   pv->max_enc_locates     = capacity;
   pv->enc_locate_requests = (struct s3d_enc_locate_request*)calloc(
@@ -1661,51 +1665,40 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
           }
         }
 
-        /* --- Emit ray 0 --- */
+        /* --- Emit ray 0 (Plan E: pinned direct-write) --- */
         {
           size_t ray_idx = my_cursor[bkt]++;
-          struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
-          rr->origin[0]    = p->ray_req.origin[0];
-          rr->origin[1]    = p->ray_req.origin[1];
-          rr->origin[2]    = p->ray_req.origin[2];
-          rr->direction[0] = p->ray_req.direction[0];
-          rr->direction[1] = p->ray_req.direction[1];
-          rr->direction[2] = p->ray_req.direction[2];
-          rr->range[0]     = p->ray_req.range[0];
-          rr->range[1]     = p->ray_req.range[1];
-          rr->user_id      = i;
+          struct s3d_ray_pinned* rp = &pv->ray_pinned[ray_idx];
+          rp->origin_x    = p->ray_req.origin[0];
+          rp->origin_y    = p->ray_req.origin[1];
+          rp->origin_z    = p->ray_req.origin[2];
+          rp->direction_x = p->ray_req.direction[0];
+          rp->direction_y = p->ray_req.direction[1];
+          rp->direction_z = p->ray_req.direction[2];
+          rp->tmin         = p->ray_req.range[0];
+          rp->tmax         = p->ray_req.range[1];
 
-          if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d))
-            rr->filter_data = &p->filter_data_storage;
-          else
-            rr->filter_data = NULL;
-
-          fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
+          fill_filter_per_ray(&pv->filter_pinned[ray_idx], p);
 
           pv->ray_to_slot[ray_idx] = i;
           pv->ray_slot_sub[ray_idx] = 0;
           p->ray_req.batch_idx = (uint32_t)ray_idx;
         }
 
-        /* --- Ray 1 (2-ray request) --- */
+        /* --- Ray 1 (2-ray request, Plan E: pinned) --- */
         if(p->ray_req.ray_count >= 2) {
           size_t ray_idx = my_cursor[bkt]++;
-          struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
-          rr->origin[0]    = p->ray_req.origin[0];
-          rr->origin[1]    = p->ray_req.origin[1];
-          rr->origin[2]    = p->ray_req.origin[2];
-          rr->direction[0] = p->ray_req.direction2[0];
-          rr->direction[1] = p->ray_req.direction2[1];
-          rr->direction[2] = p->ray_req.direction2[2];
-          rr->range[0]     = p->ray_req.range2[0];
-          rr->range[1]     = p->ray_req.range2[1];
-          if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d))
-            rr->filter_data = &p->filter_data_storage;
-          else
-            rr->filter_data = NULL;
-          rr->user_id      = i;
+          struct s3d_ray_pinned* rp = &pv->ray_pinned[ray_idx];
+          rp->origin_x    = p->ray_req.origin[0];
+          rp->origin_y    = p->ray_req.origin[1];
+          rp->origin_z    = p->ray_req.origin[2];
+          rp->direction_x = p->ray_req.direction2[0];
+          rp->direction_y = p->ray_req.direction2[1];
+          rp->direction_z = p->ray_req.direction2[2];
+          rp->tmin         = p->ray_req.range2[0];
+          rp->tmax         = p->ray_req.range2[1];
 
-          fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
+          fill_filter_per_ray(&pv->filter_pinned[ray_idx], p);
 
           pv->ray_to_slot[ray_idx] = i;
           pv->ray_slot_sub[ray_idx] = 1;
@@ -1721,19 +1714,17 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
 
           for(j = 2; j < 6; j++) {
             size_t ray_idx = my_cursor[bkt]++;
-            struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
-            rr->origin[0]    = p->ray_req.origin[0];
-            rr->origin[1]    = p->ray_req.origin[1];
-            rr->origin[2]    = p->ray_req.origin[2];
-            rr->direction[0] = pool->enc_arr[i].directions[j][0];
-            rr->direction[1] = pool->enc_arr[i].directions[j][1];
-            rr->direction[2] = pool->enc_arr[i].directions[j][2];
-            rr->range[0]     = p->ray_req.range[0];
-            rr->range[1]     = p->ray_req.range[1];
-            rr->filter_data  = NULL;
-            rr->user_id      = i;
+            struct s3d_ray_pinned* rp = &pv->ray_pinned[ray_idx];
+            rp->origin_x    = p->ray_req.origin[0];
+            rp->origin_y    = p->ray_req.origin[1];
+            rp->origin_z    = p->ray_req.origin[2];
+            rp->direction_x = pool->enc_arr[i].directions[j][0];
+            rp->direction_y = pool->enc_arr[i].directions[j][1];
+            rp->direction_z = pool->enc_arr[i].directions[j][2];
+            rp->tmin         = p->ray_req.range[0];
+            rp->tmax         = p->ray_req.range[1];
 
-            fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
+            fill_filter_per_ray(&pv->filter_pinned[ray_idx], p);
 
             pv->ray_to_slot[ray_idx] = i;
             pv->ray_slot_sub[ray_idx] = (uint32_t)j;
@@ -1754,22 +1745,17 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
 
           for(j = 0; j < 2; j++) {
             size_t ray_idx = my_cursor[bkt]++;
-            struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
-            rr->origin[0]    = p->ray_req.origin[0];
-            rr->origin[1]    = p->ray_req.origin[1];
-            rr->origin[2]    = p->ray_req.origin[2];
-            rr->direction[0] = p->locals.bnd_ss.dir_bck[j][0];
-            rr->direction[1] = p->locals.bnd_ss.dir_bck[j][1];
-            rr->direction[2] = p->locals.bnd_ss.dir_bck[j][2];
-            rr->range[0]     = p->ray_req.range[0];
-            rr->range[1]     = p->ray_req.range[1];
-            if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d))
-              rr->filter_data = &p->filter_data_storage;
-            else
-              rr->filter_data = NULL;
-            rr->user_id      = i;
+            struct s3d_ray_pinned* rp = &pv->ray_pinned[ray_idx];
+            rp->origin_x    = p->ray_req.origin[0];
+            rp->origin_y    = p->ray_req.origin[1];
+            rp->origin_z    = p->ray_req.origin[2];
+            rp->direction_x = p->locals.bnd_ss.dir_bck[j][0];
+            rp->direction_y = p->locals.bnd_ss.dir_bck[j][1];
+            rp->direction_z = p->locals.bnd_ss.dir_bck[j][2];
+            rp->tmin         = p->ray_req.range[0];
+            rp->tmax         = p->ray_req.range[1];
 
-            fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
+            fill_filter_per_ray(&pv->filter_pinned[ray_idx], p);
 
             pv->ray_to_slot[ray_idx] = i;
             pv->ray_slot_sub[ray_idx] = (uint32_t)(j + 2);
@@ -1868,49 +1854,40 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
         }
       }
 
+      /* Serial Ray 0 (Plan E: pinned direct-write) */
       {
         size_t ray_idx = ser_cursor[bkt]++;
-        struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
-        rr->origin[0]    = p->ray_req.origin[0];
-        rr->origin[1]    = p->ray_req.origin[1];
-        rr->origin[2]    = p->ray_req.origin[2];
-        rr->direction[0] = p->ray_req.direction[0];
-        rr->direction[1] = p->ray_req.direction[1];
-        rr->direction[2] = p->ray_req.direction[2];
-        rr->range[0]     = p->ray_req.range[0];
-        rr->range[1]     = p->ray_req.range[1];
-        rr->user_id      = i;
+        struct s3d_ray_pinned* rp = &pv->ray_pinned[ray_idx];
+        rp->origin_x    = p->ray_req.origin[0];
+        rp->origin_y    = p->ray_req.origin[1];
+        rp->origin_z    = p->ray_req.origin[2];
+        rp->direction_x = p->ray_req.direction[0];
+        rp->direction_y = p->ray_req.direction[1];
+        rp->direction_z = p->ray_req.direction[2];
+        rp->tmin         = p->ray_req.range[0];
+        rp->tmax         = p->ray_req.range[1];
 
-        if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d))
-          rr->filter_data = &p->filter_data_storage;
-        else
-          rr->filter_data = NULL;
-
-        fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
+        fill_filter_per_ray(&pv->filter_pinned[ray_idx], p);
 
         pv->ray_to_slot[ray_idx] = i;
         pv->ray_slot_sub[ray_idx] = 0;
         p->ray_req.batch_idx = (uint32_t)ray_idx;
       }
 
+      /* Serial Ray 1 (Plan E: pinned) */
       if(p->ray_req.ray_count >= 2) {
         size_t ray_idx = ser_cursor[bkt]++;
-        struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
-        rr->origin[0]    = p->ray_req.origin[0];
-        rr->origin[1]    = p->ray_req.origin[1];
-        rr->origin[2]    = p->ray_req.origin[2];
-        rr->direction[0] = p->ray_req.direction2[0];
-        rr->direction[1] = p->ray_req.direction2[1];
-        rr->direction[2] = p->ray_req.direction2[2];
-        rr->range[0]     = p->ray_req.range2[0];
-        rr->range[1]     = p->ray_req.range2[1];
-        if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d))
-          rr->filter_data = &p->filter_data_storage;
-        else
-          rr->filter_data = NULL;
-        rr->user_id      = i;
+        struct s3d_ray_pinned* rp = &pv->ray_pinned[ray_idx];
+        rp->origin_x    = p->ray_req.origin[0];
+        rp->origin_y    = p->ray_req.origin[1];
+        rp->origin_z    = p->ray_req.origin[2];
+        rp->direction_x = p->ray_req.direction2[0];
+        rp->direction_y = p->ray_req.direction2[1];
+        rp->direction_z = p->ray_req.direction2[2];
+        rp->tmin         = p->ray_req.range2[0];
+        rp->tmax         = p->ray_req.range2[1];
 
-        fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
+        fill_filter_per_ray(&pv->filter_pinned[ray_idx], p);
 
         pv->ray_to_slot[ray_idx] = i;
         pv->ray_slot_sub[ray_idx] = 1;
@@ -1926,19 +1903,17 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
 
         for(j = 2; j < 6; j++) {
           size_t ray_idx = ser_cursor[bkt]++;
-          struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
-          rr->origin[0]    = p->ray_req.origin[0];
-          rr->origin[1]    = p->ray_req.origin[1];
-          rr->origin[2]    = p->ray_req.origin[2];
-          rr->direction[0] = pool->enc_arr[i].directions[j][0];
-          rr->direction[1] = pool->enc_arr[i].directions[j][1];
-          rr->direction[2] = pool->enc_arr[i].directions[j][2];
-          rr->range[0]     = p->ray_req.range[0];
-          rr->range[1]     = p->ray_req.range[1];
-          rr->filter_data  = NULL;
-          rr->user_id      = i;
+          struct s3d_ray_pinned* rp = &pv->ray_pinned[ray_idx];
+          rp->origin_x    = p->ray_req.origin[0];
+          rp->origin_y    = p->ray_req.origin[1];
+          rp->origin_z    = p->ray_req.origin[2];
+          rp->direction_x = pool->enc_arr[i].directions[j][0];
+          rp->direction_y = pool->enc_arr[i].directions[j][1];
+          rp->direction_z = pool->enc_arr[i].directions[j][2];
+          rp->tmin         = p->ray_req.range[0];
+          rp->tmax         = p->ray_req.range[1];
 
-          fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
+          fill_filter_per_ray(&pv->filter_pinned[ray_idx], p);
 
           pv->ray_to_slot[ray_idx] = i;
           pv->ray_slot_sub[ray_idx] = (uint32_t)j;
@@ -1955,22 +1930,17 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
 
         for(j = 0; j < 2; j++) {
           size_t ray_idx = ser_cursor[bkt]++;
-          struct s3d_ray_request* rr = &pv->ray_requests[ray_idx];
-          rr->origin[0]    = p->ray_req.origin[0];
-          rr->origin[1]    = p->ray_req.origin[1];
-          rr->origin[2]    = p->ray_req.origin[2];
-          rr->direction[0] = p->locals.bnd_ss.dir_bck[j][0];
-          rr->direction[1] = p->locals.bnd_ss.dir_bck[j][1];
-          rr->direction[2] = p->locals.bnd_ss.dir_bck[j][2];
-          rr->range[0]     = p->ray_req.range[0];
-          rr->range[1]     = p->ray_req.range[1];
-          if(!S3D_HIT_NONE(&p->filter_data_storage.hit_3d))
-            rr->filter_data = &p->filter_data_storage;
-          else
-            rr->filter_data = NULL;
-          rr->user_id      = i;
+          struct s3d_ray_pinned* rp = &pv->ray_pinned[ray_idx];
+          rp->origin_x    = p->ray_req.origin[0];
+          rp->origin_y    = p->ray_req.origin[1];
+          rp->origin_z    = p->ray_req.origin[2];
+          rp->direction_x = p->locals.bnd_ss.dir_bck[j][0];
+          rp->direction_y = p->locals.bnd_ss.dir_bck[j][1];
+          rp->direction_z = p->locals.bnd_ss.dir_bck[j][2];
+          rp->tmin         = p->ray_req.range[0];
+          rp->tmax         = p->ray_req.range[1];
 
-          fill_filter_per_ray(&pv->filter_per_ray[ray_idx], p);
+          fill_filter_per_ray(&pv->filter_pinned[ray_idx], p);
 
           pv->ray_to_slot[ray_idx] = i;
           pv->ray_slot_sub[ray_idx] = (uint32_t)(j + 2);
@@ -3235,9 +3205,9 @@ gpu_launch_async(struct wavefront_pool* pool, struct pool_view* pv,
   }
 
   if(pool->use_gpu_filter) {
-    res = s3d_scene_view_trace_rays_batch_ctx_filtered_async(
-      sv, pv->batch_ctx, pv->ray_requests,
-      pv->filter_per_ray, pv->ray_count);
+    /* Plan E: upload directly from pinned buffers written by collect */
+    res = s3d_scene_view_trace_rays_batch_ctx_filtered_pinned_async(
+      sv, pv->batch_ctx, pv->ray_count);
   } else {
     res = s3d_scene_view_trace_rays_batch_ctx_async(
       sv, pv->batch_ctx, pv->ray_requests, pv->ray_count);
@@ -4428,10 +4398,9 @@ solve_camera_persistent_wavefront(
       memset(&stats, 0, sizeof(stats));
 
       if(pool.use_gpu_filter) {
-        /* L4: single-pool filtered trace (sync 3-step) */
-        res = s3d_scene_view_trace_rays_batch_ctx_filtered_async(
-          scn->s3d_view, pv->batch_ctx, pv->ray_requests,
-          pv->filter_per_ray, pv->ray_count);
+        /* L4: single-pool filtered trace (sync 3-step) — Plan E pinned */
+        res = s3d_scene_view_trace_rays_batch_ctx_filtered_pinned_async(
+          scn->s3d_view, pv->batch_ctx, pv->ray_count);
         if(res != RES_OK) goto cleanup;
         {
           struct time k0, k1;
