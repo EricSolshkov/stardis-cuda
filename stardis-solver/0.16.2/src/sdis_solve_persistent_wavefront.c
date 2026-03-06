@@ -83,6 +83,91 @@ static FILE* pixel_trace_file(void) {
 }
 
 /*******************************************************************************
+ * O11_DIAG: Per-step path state trace (Debug builds only).
+ *
+ * Enable: set STARDIS_PATH_TRACE=<max_lines> (e.g. "5000").
+ * Output: stderr, one line per step.
+ * Format: [PT] <tag> round=R s=SLOT pid=PID ph=BEFORE->AFTER act=A nr=N
+ *         bidx=B rc=RC steps=S dist=D norm=(x,y,z) rbkt=K done=DR res=LR
+ *
+ * In Release builds (NDEBUG defined), pt_enabled() returns 0 and pt_log()
+ * is a no-op, so the compiler can eliminate all tracing code.
+ ******************************************************************************/
+#ifndef NDEBUG
+static long long s_pt_max  = -1;  /* max lines; -1 = not checked yet */
+static long long s_pt_seq  =  0;  /* monotonic sequence counter      */
+static long long s_pt_pid  = -1;  /* -1 = log all; >=0 = filter by path_id */
+
+static int pt_enabled(void) {
+  if(s_pt_max < 0) {
+    const char* e = getenv("STARDIS_PATH_TRACE");
+    const char* f = getenv("STARDIS_PATH_TRACE_PID");
+    s_pt_max = (e && e[0]) ? atoll(e) : 0;
+    s_pt_pid = (f && f[0]) ? atoll(f) : 486729;
+    if(s_pt_max > 0)
+      fprintf(stderr,
+        "[PT] seq,tag,round,slot,pid,ph_before,ph_after,"
+        "active,needs_ray,batch_idx,ray_count,steps,"
+        "hit_dist,norm_x,norm_y,norm_z,ray_bkt,done_reason,step_res,"
+        "enc_resolved,flt_prim,flt_enc,sf_retry\n");
+  }
+  return s_pt_max > 0 && s_pt_seq < s_pt_max;
+}
+
+/* tag: A=distribute, B=cascade, F=first_ray.  lr: step return value. */
+static void
+pt_log(const char* tag,
+       unsigned long long round,
+       uint32_t slot,
+       const struct path_state* p,
+       const struct path_hot*   hot,
+       const struct wavefront_pool* pool,
+       int ph_before,
+       int step_res)
+{
+  if(!pt_enabled()) return;
+  if(s_pt_pid >= 0 && (long long)p->path_id != s_pt_pid) return;
+  fprintf(stderr,
+    "[PT] %llu,%s,%llu,%u,%u,%d,%d,"
+    "%d,%d,%u,%d,%llu,"
+    "%.8g,%.8g,%.8g,%.8g,%d,%d,%d,"
+    "%u,%u,%u,%d\n",
+    (unsigned long long)s_pt_seq++,
+    tag,
+    round,
+    (unsigned)slot,
+    (unsigned)p->path_id,
+    ph_before,
+    (int)hot->phase,
+    (int)hot->active,
+    (int)hot->needs_ray,
+    (unsigned)p->ray_req.batch_idx,
+    (int)p->ray_req.ray_count,
+    (unsigned long long)p->steps_taken,
+    p->rwalk.hit_3d.distance,
+    p->rwalk.hit_3d.normal[0],
+    p->rwalk.hit_3d.normal[1],
+    p->rwalk.hit_3d.normal[2],
+    (int)hot->ray_bucket,
+    p->done_reason,
+    step_res,
+    (unsigned)pool->enc_arr[slot].resolved_enc_id,
+    (unsigned)p->filter_data_storage.hit_3d.prim.prim_id,
+    (unsigned)p->filter_data_storage.enc_id,
+    p->locals.bnd_sf.retry_count);
+}
+#else
+static INLINE int pt_enabled(void) { return 0; }
+static INLINE void
+pt_log(const char* tag, unsigned long long round, uint32_t slot,
+       const struct path_state* p, const struct path_hot* hot,
+       const struct wavefront_pool* pool,
+       int ph_before, int step_res)
+{ (void)tag; (void)round; (void)slot; (void)p; (void)hot;
+  (void)pool; (void)ph_before; (void)step_res; }
+#endif
+
+/*******************************************************************************
  * Step functions are now in sdis_wf_steps.c with LOCAL_SYM linkage.
  * Include the header to access them.
  ******************************************************************************/
@@ -557,6 +642,14 @@ pool_destroy(struct wavefront_pool* pool)
   free(pool->enc_arr);
   free(pool->ext_arr);
 
+  /* O11: per-thread ray buffers */
+  if(pool->tl_ray_bufs) {
+    int ti;
+    for(ti = 0; ti < pool->tl_ray_nbufs; ti++)
+      free(pool->tl_ray_bufs[ti]);
+    free(pool->tl_ray_bufs);
+  }
+
   memset(pool, 0, sizeof(*pool));
 }
 
@@ -713,6 +806,10 @@ init_single_path(
   p->rwalk.hit_3d = S3D_HIT_NULL;
   p->rwalk.hit_side = SDIS_SIDE_NULL__;
   p->rwalk.enc_id = enc_id;
+
+  /* O11_SAFETY: sentinel — marks "never submitted to GPU" so the first
+   * merged_pass Phase A skips distribute for this path. */
+  p->ray_req.batch_idx = (uint32_t)-1;
 
   /* Initialise rwalk_context */
   p->ctx = RWALK_CONTEXT_NULL;
@@ -911,6 +1008,9 @@ probe_init_path(struct path_state* p,
   p->rwalk.hit_side = SDIS_SIDE_NULL__;
   p->rwalk.enc_id = enc_id;
 
+  /* O11_SAFETY: sentinel — marks "never submitted to GPU" */
+  p->ray_req.batch_idx = (uint32_t)-1;
+
   /* Initialise rwalk_context (matches init_paths_from_probe) */
   p->ctx = RWALK_CONTEXT_NULL;
   p->ctx.heat_path   = NULL;
@@ -1085,6 +1185,9 @@ probe_batch_init_path(struct path_state* p,
   p->rwalk.hit_side = SDIS_SIDE_NULL__;
   p->rwalk.enc_id = probe_enc_id;
 
+  /* O11_SAFETY: sentinel — marks "never submitted to GPU" */
+  p->ray_req.batch_idx = (uint32_t)-1;
+
   p->ctx = RWALK_CONTEXT_NULL;
   p->ctx.heat_path   = NULL;
   p->ctx.green_path  = NULL;
@@ -1187,9 +1290,15 @@ advance_path_to_first_ray(struct path_state* p,
       && (enum path_phase)hot->phase != PATH_DONE
       && (enum path_phase)hot->phase != PATH_ERROR) {
     int advanced = 0;
-    if(path_phase_is_ray_pending((enum path_phase)hot->phase)) break;
+    enum path_phase phase_before = (enum path_phase)hot->phase;
+    if(path_phase_is_ray_pending(phase_before)) break;
 
     res = advance_one_step_no_ray(p, hot, scn, &advanced, pool, slot_idx);
+
+    /* O11_DIAG: log after first-ray cascade step */
+    pt_log("F", 0, (uint32_t)slot_idx, p, hot, pool,
+           (int)phase_before, (int)res);
+
     if(res != RES_OK && res != RES_BAD_OP
     && res != RES_BAD_OP_IRRECOVERABLE) return res;
     if(res == RES_BAD_OP || res == RES_BAD_OP_IRRECOVERABLE) {
@@ -1273,27 +1382,23 @@ compact_active_paths(struct wavefront_pool* pool, struct pool_view* pv)
   size_t i;
 
   pv->active_compact      = 0;
-  pv->need_ray_count      = 0;
   pv->done_count          = 0;
-  pv->bucket_radiative_n  = 0;
-  pv->bucket_conductive_n = 0;
-  pv->bucket_other_n      = 0;
 
+  /* O12: In merged architecture, need_ray_indices and bucket arrays are
+   * not used — merged_pass handles collect inline.  Compact now only scans
+   * hot_arr (80KB, fits in L2) without touching path_state (20MB). */
   for(i = base; i < end; i++) {
     enum path_phase ph = (enum path_phase)pool->hot_arr[i].phase;
     int act = pool->hot_arr[i].active;
-    int nr  = pool->hot_arr[i].needs_ray;
 
     if(ph == PATH_DONE || ph == PATH_ERROR
     || ph == PATH_HARVESTED) {
       /* M8: if sfn_stack_depth > 0, the sub-path finished but the
        * parent picardN frame still needs to resume.  Re-activate.
-       * Need to access AoS for sfn_stack_depth (rare path). */
+       * Need to access SoA for sfn_stack_depth (rare path). */
       if(ph == PATH_DONE && pool->sfn_arr[i].depth > 0) {
-        /* P0_OPT: hot_arr is canonical; no slots[i].phase/active */
         pool->hot_arr[i].phase = (uint8_t)PATH_BND_SFN_COMPUTE_Ti_RESUME;
         pool->hot_arr[i].active = 1;
-        ph = PATH_BND_SFN_COMPUTE_Ti_RESUME;
         act = 1;
         /* Fall through to treat as active path */
       } else {
@@ -1304,27 +1409,6 @@ compact_active_paths(struct wavefront_pool* pool, struct pool_view* pv)
     if(!act) continue;
 
     pv->active_indices[pv->active_compact++] = (uint32_t)i;
-
-    if(nr) {
-      /* Only touch AoS when needs_ray is set (minority of paths).
-       * Still need ray_req.ray_count from AoS (P2 scope). */
-      struct path_state* p = &pool->slots[i];
-      if(p->ray_req.ray_count > 0) {
-        pv->need_ray_indices[pv->need_ray_count++] = (uint32_t)i;
-
-        /* Bucket by phase type */
-        if(ph == PATH_RAD_TRACE_PENDING) {
-          pv->bucket_radiative[pv->bucket_radiative_n++] = (uint32_t)i;
-        } else if(ph == PATH_COUPLED_COND_DS_PENDING
-               || ph == PATH_CND_DS_STEP_TRACE) {
-          pv->bucket_conductive[pv->bucket_conductive_n++] = (uint32_t)i;
-        } else {
-          /* O2: Other ray-pending phases (boundary reinject, enclosure,
-           * etc.) go into bucket_other for direct Phase 3 iteration. */
-          pv->bucket_other[pv->bucket_other_n++] = (uint32_t)i;
-        }
-      }
-    }
   }
 }
 
@@ -2004,6 +2088,7 @@ pool_distribute_enc_locate_results(struct wavefront_pool* pool,
     uint32_t slot_id = pv->enc_locate_to_slot[k];
     const struct s3d_enc_locate_result* r = &pv->enc_locate_results[k];
 
+    /* O11_SAFETY: write-before-read — data must be written before phase → RESULT */
     pool->enc_arr[slot_id].locate.prim_id  = r->prim_id;
     pool->enc_arr[slot_id].locate.side     = r->side;
     pool->enc_arr[slot_id].locate.distance = r->distance;
@@ -2077,6 +2162,7 @@ pool_distribute_cp_results(struct wavefront_pool* pool,
     struct path_state* p = &pool->slots[slot_id];
     enum path_phase cp_ph = (enum path_phase)pool->hot_arr[slot_id].phase;
 
+    /* O11_SAFETY: write-before-read — data must be written before phase → RESULT */
     p->locals.cnd_wos.cached_hit = pv->cp_hits[k];
 
     if(cp_ph == PATH_CND_WOS_DIFFUSION_CHECK)
@@ -2437,6 +2523,10 @@ cascade_advance_single_path(
 #endif
 
     res = advance_one_step_no_ray(p, hot, scn, &advanced, pool, slot_idx);
+
+    /* O11_DIAG: log after cascade step */
+    pt_log("B", pool->total_steps, (uint32_t)slot_idx, p, hot, pool,
+           (int)phase_before, (int)res);
 
 #ifdef SDIS_CASCADE_PROFILE
     time_current(&t_step1);
@@ -3504,6 +3594,1273 @@ gpu_wait_d2h(struct wavefront_pool* pool,
   return RES_OK;
 }
 
+/*******************************************************************************
+ * O11: Unified async dispatch — RT + enc_locate + closest_point
+ *
+ * gpu_launch_all   — launch RT + enc + cp async (replaces gpu_launch_async
+ *                    for views that have pending enc/cp requests)
+ * gpu_sync_kernel_all — sync RT + enc + cp compute kernels
+ * gpu_start_d2h_all   — start D2H for RT + enc + cp
+ * gpu_wait_d2h_all    — wait D2H + post-process + distribute enc/cp results
+ *
+ * This eliminates the synchronous post_merged_enc_cp() from the CPU phase,
+ * hiding enc/cp GPU latency behind the dual-buffer pipeline.
+ ******************************************************************************/
+
+/**
+ * gpu_launch_all — launch RT + enc_locate + closest_point async.
+ * Replaces gpu_launch_async() and absorbs the GPU launch part of
+ * post_merged_enc_cp().
+ */
+static res_T
+gpu_launch_all(struct wavefront_pool* pool, struct pool_view* pv,
+               struct s3d_scene_view* sv)
+{
+  res_T res;
+
+  /* RT launch (existing) */
+  if(pv->ray_count > 0) {
+    if(pool->use_gpu_filter) {
+      res = s3d_scene_view_trace_rays_batch_ctx_filtered_pinned_async(
+        sv, pv->batch_ctx, pv->ray_count);
+    } else {
+      res = s3d_scene_view_trace_rays_batch_ctx_async(
+        sv, pv->batch_ctx, pv->ray_requests, pv->ray_count);
+    }
+    if(res != RES_OK) return res;
+    pv->gpu_pending = 1;
+  } else {
+    pv->gpu_pending = 0;
+  }
+
+  /* enc_locate launch (new async) */
+  if(pv->enc_locate_count > 0) {
+    res = s3d_scene_view_find_enclosure_batch_ctx_async(
+      sv, pv->enc_batch_ctx,
+      pv->enc_locate_requests, pv->enc_locate_count);
+    if(res != RES_OK) return res;
+    pv->enc_gpu_pending = 1;
+  } else {
+    pv->enc_gpu_pending = 0;
+  }
+
+  /* closest_point launch (new async) */
+  if(pv->cp_count > 0) {
+    res = s3d_scene_view_closest_point_batch_ctx_async(
+      sv, pv->cp_batch_ctx,
+      pv->cp_requests, pv->cp_count);
+    if(res != RES_OK) return res;
+    pv->cp_gpu_pending = 1;
+  } else {
+    pv->cp_gpu_pending = 0;
+  }
+
+  return RES_OK;
+}
+
+/**
+ * gpu_sync_kernel_all — sync RT + enc + cp compute kernels.
+ */
+static res_T
+gpu_sync_kernel_all(struct wavefront_pool* pool, struct pool_view* pv)
+{
+  res_T rc;
+  struct time k0, k1;
+
+  /* RT sync (existing logic) */
+  if(pv->ray_count > 0 && pv->gpu_pending) {
+    time_current(&k0);
+    if(pool->use_gpu_filter)
+      rc = s3d_scene_view_trace_rays_batch_ctx_filtered_sync_kernel(
+        pv->batch_ctx);
+    else
+      rc = s3d_scene_view_trace_rays_batch_ctx_sync_kernel(pv->batch_ctx);
+    if(rc != RES_OK) return rc;
+    time_current(&k1);
+    pool->trace_kernel_time_ms_sum +=
+      (double)s3d_batch_trace_context_get_last_kernel_ms(pv->batch_ctx);
+  }
+
+  /* enc sync */
+  if(pv->enc_gpu_pending) {
+    rc = s3d_scene_view_find_enclosure_batch_ctx_sync_kernel(pv->enc_batch_ctx);
+    if(rc != RES_OK) return rc;
+  }
+
+  /* cp sync */
+  if(pv->cp_gpu_pending) {
+    rc = s3d_scene_view_closest_point_batch_ctx_sync_kernel(pv->cp_batch_ctx);
+    if(rc != RES_OK) return rc;
+  }
+
+  return RES_OK;
+}
+
+/**
+ * gpu_start_d2h_all — start async D2H for RT + enc + cp.
+ */
+static res_T
+gpu_start_d2h_all(struct wavefront_pool* pool, struct pool_view* pv)
+{
+  res_T rc;
+
+  /* RT D2H (existing logic) */
+  if(pv->ray_count > 0 && pv->gpu_pending) {
+    if(pool->use_gpu_filter)
+      rc = s3d_scene_view_trace_rays_batch_ctx_filtered_start_d2h(
+        pv->batch_ctx, pv->ray_count);
+    else
+      rc = s3d_scene_view_trace_rays_batch_ctx_start_d2h(
+        pv->batch_ctx, pv->ray_count);
+    if(rc != RES_OK) return rc;
+  }
+
+  /* enc D2H */
+  if(pv->enc_gpu_pending) {
+    rc = s3d_scene_view_find_enclosure_batch_ctx_start_d2h(
+      pv->enc_batch_ctx, pv->enc_locate_count);
+    if(rc != RES_OK) return rc;
+  }
+
+  /* cp D2H */
+  if(pv->cp_gpu_pending) {
+    rc = s3d_scene_view_closest_point_batch_ctx_start_d2h(
+      pv->cp_batch_ctx, pv->cp_count);
+    if(rc != RES_OK) return rc;
+  }
+
+  return RES_OK;
+}
+
+/**
+ * gpu_wait_d2h_all — wait for D2H + post-process + distribute enc/cp results.
+ * Replaces gpu_wait_d2h() and absorbs the distribute+post-process parts
+ * of post_merged_enc_cp().
+ */
+static res_T
+gpu_wait_d2h_all(struct wavefront_pool* pool,
+                 struct pool_view* pv,
+                 struct s3d_scene_view* sv)
+{
+  struct time t0, t1;
+  res_T res;
+
+  /* ── RT wait + post-process (existing gpu_wait_d2h logic) ── */
+  time_current(&t0);
+  if(pv->ray_count > 0 && pv->gpu_pending) {
+    struct s3d_batch_trace_stats stats;
+    memset(&stats, 0, sizeof(stats));
+
+    if(pool->use_gpu_filter) {
+      res = s3d_scene_view_trace_rays_batch_ctx_filtered_wait_d2h(
+        sv, pv->batch_ctx,
+        pv->ray_requests, pv->ray_count,
+        pv->ray_hits, &stats);
+    } else {
+      res = s3d_scene_view_trace_rays_batch_ctx_wait_d2h(
+        sv, pv->batch_ctx,
+        pv->ray_requests, pv->ray_count,
+        pv->ray_hits, &stats);
+    }
+    if(res != RES_OK) return res;
+    pv->gpu_pending = 0;
+
+    pool->total_rays_traced += pv->ray_count;
+
+    {
+      pool->rays_radiative           += pv->pending_rays_radiative;
+      pool->rays_conductive_ds       += pv->pending_rays_conductive_ds;
+      pool->rays_conductive_ds_retry += pv->pending_rays_conductive_ds_retry;
+      pool->rays_shadow              += pv->pending_rays_shadow;
+      pool->rays_enclosure           += pv->pending_rays_enclosure;
+      pool->rays_startup             += pv->pending_rays_startup;
+      pool->rays_other               += pv->pending_rays_other;
+    }
+
+    pool->trace_call_count++;
+    pool->trace_batch_size_sum   += pv->ray_count;
+    pool->trace_batch_time_ms_sum  += stats.batch_time_ms;
+    pool->trace_post_time_ms_sum   += stats.postprocess_time_ms;
+    pool->trace_retrace_time_ms_sum += stats.retrace_time_ms;
+    pool->trace_retrace_accepted_sum += stats.retrace_accepted;
+    pool->trace_retrace_missed_sum   += stats.retrace_missed;
+    pool->trace_filter_rejected_sum  += stats.filter_rejected;
+
+    if(pv->ray_count < pool->trace_batch_size_min)
+      pool->trace_batch_size_min = pv->ray_count;
+    if(pv->ray_count > pool->trace_batch_size_max)
+      pool->trace_batch_size_max = pv->ray_count;
+  }
+  time_current(&t1);
+  pool->time_trace_s += time_elapsed_sec(&t0, &t1);
+
+  /* ── enc_locate wait + post-process + distribute ── */
+  time_current(&t0);
+  if(pv->enc_gpu_pending) {
+    struct s3d_batch_enc_stats enc_stats;
+    memset(&enc_stats, 0, sizeof(enc_stats));
+
+    res = s3d_scene_view_find_enclosure_batch_ctx_wait_d2h(
+      sv, pv->enc_batch_ctx,
+      pv->enc_locate_requests, pv->enc_locate_count,
+      pv->enc_locate_results, &enc_stats);
+    if(res != RES_OK) return res;
+    pv->enc_gpu_pending = 0;
+
+    /* Distribute enc results to path_state (same as post_merged_enc_cp) */
+    res = pool_distribute_enc_locate_results(pool, pv);
+    if(res != RES_OK) return res;
+
+    pool->enc_locates_total     += pv->enc_locate_count;
+    pool->enc_locates_resolved  += enc_stats.resolved;
+    pool->enc_locates_degenerate += enc_stats.degenerate;
+  }
+  time_current(&t1);
+  pool->time_enc_locate_s += time_elapsed_sec(&t0, &t1);
+
+  /* ── closest_point wait + post-process + distribute ── */
+  time_current(&t0);
+  if(pv->cp_gpu_pending) {
+    struct s3d_batch_cp_stats cp_stats;
+    memset(&cp_stats, 0, sizeof(cp_stats));
+
+    res = s3d_scene_view_closest_point_batch_ctx_wait_d2h(
+      sv, pv->cp_batch_ctx,
+      pv->cp_requests, pv->cp_count,
+      pv->cp_hits, &cp_stats);
+    if(res != RES_OK) return res;
+    pv->cp_gpu_pending = 0;
+
+    /* Distribute cp results to path_state (same as post_merged_enc_cp) */
+    res = pool_distribute_cp_results(pool, pv);
+    if(res != RES_OK) return res;
+
+    pool->cp_total     += pv->cp_count;
+    pool->cp_accepted  += cp_stats.batch_accepted;
+    pool->cp_requeried += cp_stats.requery_accepted;
+  }
+  time_current(&t1);
+  pool->time_cp_s += time_elapsed_sec(&t0, &t1);
+
+  return RES_OK;
+}
+
+/**
+ * gpu_wait_download_all — monolithic sync+D2H+wait for RT + enc + cp.
+ * Used by pool_run_dual and single-pool loops that don't split the pipeline.
+ */
+static res_T
+gpu_wait_download_all(struct wavefront_pool* pool,
+                      struct pool_view* pv,
+                      struct s3d_scene_view* sv)
+{
+  res_T res;
+  res = gpu_sync_kernel_all(pool, pv);
+  if(res != RES_OK) return res;
+  res = gpu_start_d2h_all(pool, pv);
+  if(res != RES_OK) return res;
+  return gpu_wait_d2h_all(pool, pv, sv);
+}
+
+/*******************************************************************************
+ * O11: merged_pass — single OMP scan combining distribute + cascade + collect
+ *      + harvest.
+ *
+ * Replaces the 6-scan pipeline (compact+collect, distribute, enc/cp batch,
+ * cascade, compact, harvest) with a single scan over path_state[].
+ * Each path is loaded into L1 once; all per-path operations execute while
+ * the cache line is hot.
+ *
+ * Phase A: Distribute (pure writer) — consume results from PREVIOUS round:
+ *          ray_hits + enc_results + cp_results → write into slot-local storage.
+ *          Also call step functions (absorbed from old distribute).
+ *
+ * Phase B: Cascade — no-ray inner loop until needs_ray / pending / done.
+ *
+ * Phase C: Collect — if needs_ray: write ray request to thread-local buffer.
+ *          Also collect enc_locate and cp requests (atomic append).
+ *
+ * Phase D: Harvest — if PATH_DONE: accumulate result + mark PATH_HARVESTED.
+ *
+ * After the OMP parallel region, thread-local ray buffers are merged into
+ * the pinned buffer (unsorted — no bucket ordering, Option A).
+ ******************************************************************************/
+
+/* --- Per-ray entry in thread-local ray buffer --- */
+struct tl_ray_entry {
+  uint32_t  slot;
+  uint32_t  sub;          /* 0, 1, 2..5 for multi-ray */
+  double    origin[3];
+  double    direction[3];
+  double    tmin, tmax;
+  struct s3d_filter_per_ray filter;
+};
+
+/* Maximum rays per thread-local buffer before forced flush.
+ * 8192 entries × ~104 B ≈ 800 KB stack — safe for OMP thread. */
+#define TL_RAY_BUF_MAX 8192
+
+/**
+ * merged_pass_distribute_step — Phase A for one path.
+ *
+ * If this path had a ray traced last round (needs_ray == 1 on entry),
+ * write back ray results and call the appropriate step function.
+ * This absorbs the old pool_distribute_ray_results() three-bucket logic.
+ *
+ * Returns: 0 = ok, 1 = fatal error.
+ */
+static INLINE int
+merged_pass_distribute_step(
+  struct wavefront_pool* pool,
+  struct pool_view*      pv,
+  uint32_t               slot,
+  struct path_state*     p,
+  struct path_hot*       hot,
+  struct sdis_scene*     scn,
+  size_t*                tl_paths_failed,
+  size_t*                tl_enc_escalated)
+{
+  /* Only process if this path had a ray last round (needs_ray still set) */
+  if(!hot->needs_ray) return 0;
+
+  /* O11_SAFETY: first-round guard — if batch_idx is still the sentinel
+   * value from init, no GPU trace has completed for this path yet.
+   * Skip distribute and let Phase C collect the ray for the first time. */
+  if(p->ray_req.batch_idx == (uint32_t)-1) return 0;
+
+  {
+    /* Fetch ray hit(s) from previous GPU trace via batch_idx */
+    const struct s3d_hit* h0 = &pv->ray_hits[p->ray_req.batch_idx];
+    const struct s3d_hit* h1 = NULL;
+    enum path_phase ph_before = (enum path_phase)hot->phase;
+    res_T lr;
+
+    if(p->ray_req.ray_count >= 2)
+      h1 = &pv->ray_hits[p->ray_req.batch_idx2];
+
+    /* Pre-deliver multi-ray results for special phases */
+    if(ph_before == PATH_ENC_QUERY_EMIT && hot->ray_count_ext == 6) {
+      int j;
+      for(j = 0; j < 6; j++) {
+        pool->enc_arr[slot].dir_hits[j] =
+          pv->ray_hits[pool->enc_arr[slot].batch_indices[j]];
+      }
+    }
+    if(ph_before == PATH_ENC_QUERY_FB_EMIT) {
+      pool->enc_arr[slot].fb_hit = pv->ray_hits[p->ray_req.batch_idx];
+    }
+    /* B-4 M3: SS 4-ray pre-delivery */
+    if(ph_before == PATH_BND_SS_REINJECT_SAMPLE
+    && hot->ray_count_ext == 4) {
+      p->locals.bnd_ss.ray_frt[0] =
+        pv->ray_hits[p->locals.bnd_ss.batch_idx_frt0];
+      p->locals.bnd_ss.ray_frt[1] =
+        pv->ray_hits[p->locals.bnd_ss.batch_idx_frt1];
+      p->locals.bnd_ss.ray_bck[0] =
+        pv->ray_hits[p->locals.bnd_ss.batch_idx_bck0];
+      p->locals.bnd_ss.ray_bck[1] =
+        pv->ray_hits[p->locals.bnd_ss.batch_idx_bck1];
+    }
+
+    /* Clear needs_ray before calling step (matches old distribute) */
+    hot->needs_ray = 0;
+
+    /* O11_DIAG: log ray hit BEFORE step consumes it */
+#ifndef NDEBUG
+    if(pt_enabled() && (s_pt_pid < 0 || (long long)p->path_id == s_pt_pid)) {
+      fprintf(stderr,
+        "[PT-HIT] s=%u bidx=%u dist=%.8g norm=(%.8g,%.8g,%.8g) "
+        "geom=%u prim=%u\n",
+        (unsigned)slot,
+        (unsigned)p->ray_req.batch_idx,
+        h0->distance,
+        h0->normal[0], h0->normal[1], h0->normal[2],
+        (unsigned)h0->prim.geom_id, (unsigned)h0->prim.prim_id);
+    }
+#endif
+
+    /* Call step function based on bucket type (absorbed from old distribute).
+     * STEP_PAIR guard: only CND_DS_STEP_TRACE / COUPLED_COND_DS_PENDING are
+     * true conductive DS step-pairs.  Other 2-ray phases (BND_SF_REINJECT,
+     * BND_SS_REINJECT) also set ray_bucket=STEP_PAIR for GPU batching but
+     * must go through advance_one_step_with_ray for correct dispatch. */
+    switch((enum ray_bucket_type)hot->ray_bucket) {
+    case RAY_BUCKET_RADIATIVE:
+      lr = step_radiative_trace(p, hot, scn, h0);
+      break;
+    case RAY_BUCKET_STEP_PAIR:
+      if(ph_before == PATH_CND_DS_STEP_TRACE
+      || ph_before == PATH_COUPLED_COND_DS_PENDING) {
+        lr = step_conductive_ds_process(p, hot, scn, h0, h1,
+                                         &pool->enc_arr[slot]);
+      } else {
+        lr = advance_one_step_with_ray(p, hot, scn, h0, h1,
+                                        pool, (size_t)slot);
+        if(ph_before == PATH_ENC_QUERY_FB_EMIT
+        && (enum path_phase)hot->phase == PATH_ENC_LOCATE_PENDING) {
+          (*tl_enc_escalated)++;
+        }
+      }
+      break;
+    default:
+      lr = advance_one_step_with_ray(p, hot, scn, h0, h1,
+                                      pool, (size_t)slot);
+      if(ph_before == PATH_ENC_QUERY_FB_EMIT
+      && (enum path_phase)hot->phase == PATH_ENC_LOCATE_PENDING) {
+        (*tl_enc_escalated)++;
+      }
+      break;
+    }
+
+    /* O11_DIAG: log after step */
+    pt_log("A", pool->total_steps, slot, p, hot, pool, (int)ph_before, (int)lr);
+
+    /* Error handling (matches old distribute) */
+    if(lr != RES_OK && lr != RES_BAD_OP
+    && lr != RES_BAD_OP_IRRECOVERABLE) return 1; /* fatal */
+    if(lr == RES_BAD_OP || lr == RES_BAD_OP_IRRECOVERABLE) {
+      hot->phase = (uint8_t)PATH_DONE;
+      hot->active = 0;
+      p->done_reason = -1;
+      (*tl_paths_failed)++;
+    }
+    p->steps_taken++;
+  }
+  return 0;
+}
+
+/**
+ * merged_pass_collect_ray — Phase C: collect ray request for one path into
+ * thread-local buffer.  Returns number of rays added.
+ */
+static INLINE size_t
+merged_pass_collect_ray(
+  struct wavefront_pool* pool,
+  struct pool_view*      pv,
+  struct path_state*     p,
+  struct path_hot*       hot,
+  uint32_t               slot,
+  struct tl_ray_entry*   tl_entries,
+  size_t                 tl_count)
+{
+  size_t added = 0;
+  enum path_phase ph_i = (enum path_phase)hot->phase;
+  (void)pv;
+
+  /* Ray 0 */
+  {
+    struct tl_ray_entry* e = &tl_entries[tl_count + added];
+    e->slot = slot;
+    e->sub  = 0;
+    e->origin[0]    = p->ray_req.origin[0];
+    e->origin[1]    = p->ray_req.origin[1];
+    e->origin[2]    = p->ray_req.origin[2];
+    e->direction[0] = p->ray_req.direction[0];
+    e->direction[1] = p->ray_req.direction[1];
+    e->direction[2] = p->ray_req.direction[2];
+    e->tmin          = p->ray_req.range[0];
+    e->tmax          = p->ray_req.range[1];
+    fill_filter_per_ray(&e->filter, p);
+    added++;
+  }
+
+  /* Ray 1 (2-ray request) */
+  if(p->ray_req.ray_count >= 2) {
+    struct tl_ray_entry* e = &tl_entries[tl_count + added];
+    e->slot = slot;
+    e->sub  = 1;
+    e->origin[0]    = p->ray_req.origin[0];
+    e->origin[1]    = p->ray_req.origin[1];
+    e->origin[2]    = p->ray_req.origin[2];
+    e->direction[0] = p->ray_req.direction2[0];
+    e->direction[1] = p->ray_req.direction2[1];
+    e->direction[2] = p->ray_req.direction2[2];
+    e->tmin          = p->ray_req.range2[0];
+    e->tmax          = p->ray_req.range2[1];
+    fill_filter_per_ray(&e->filter, p);
+    added++;
+  }
+
+  /* Rays 2..5 for 6-ray enclosure query */
+  if(hot->ray_count_ext == 6 && ph_i == PATH_ENC_QUERY_EMIT) {
+    int j;
+    /* batch_indices[0..1] are set from Ray 0/1 above */
+    for(j = 2; j < 6; j++) {
+      struct tl_ray_entry* e = &tl_entries[tl_count + added];
+      e->slot = slot;
+      e->sub  = (uint32_t)j;
+      e->origin[0]    = p->ray_req.origin[0];
+      e->origin[1]    = p->ray_req.origin[1];
+      e->origin[2]    = p->ray_req.origin[2];
+      e->direction[0] = pool->enc_arr[slot].directions[j][0];
+      e->direction[1] = pool->enc_arr[slot].directions[j][1];
+      e->direction[2] = pool->enc_arr[slot].directions[j][2];
+      e->tmin          = p->ray_req.range[0];
+      e->tmax          = p->ray_req.range[1];
+      fill_filter_per_ray(&e->filter, p);
+      added++;
+    }
+  }
+
+  /* Rays 2..3 for SS 4-ray reinjection */
+  if(hot->ray_count_ext == 4 && ph_i == PATH_BND_SS_REINJECT_SAMPLE) {
+    int j;
+    for(j = 0; j < 2; j++) {
+      struct tl_ray_entry* e = &tl_entries[tl_count + added];
+      e->slot = slot;
+      e->sub  = (uint32_t)(j + 2);
+      e->origin[0]    = p->ray_req.origin[0];
+      e->origin[1]    = p->ray_req.origin[1];
+      e->origin[2]    = p->ray_req.origin[2];
+      e->direction[0] = p->locals.bnd_ss.dir_bck[j][0];
+      e->direction[1] = p->locals.bnd_ss.dir_bck[j][1];
+      e->direction[2] = p->locals.bnd_ss.dir_bck[j][2];
+      e->tmin          = p->ray_req.range[0];
+      e->tmax          = p->ray_req.range[1];
+      fill_filter_per_ray(&e->filter, p);
+      added++;
+    }
+  }
+
+  return added;
+}
+
+/**
+ * merged_pass_flush_tl_rays — merge thread-local ray buffer into pinned
+ * buffer at the given base offset.
+ *
+ * Called per-thread AFTER the OMP for loop, under atomic-based offset
+ * reservation.  Writes rays contiguously starting at ray_base.
+ */
+static void
+merged_pass_flush_tl_rays(
+  struct wavefront_pool* pool,
+  struct pool_view*      pv,
+  const struct tl_ray_entry* entries,
+  size_t                 count,
+  size_t                 ray_base)
+{
+  size_t r;
+  for(r = 0; r < count; r++) {
+    size_t ray_idx = ray_base + r;
+    const struct tl_ray_entry* e = &entries[r];
+    struct s3d_ray_pinned* rp = &pv->ray_pinned[ray_idx];
+
+    rp->origin_x    = e->origin[0];
+    rp->origin_y    = e->origin[1];
+    rp->origin_z    = e->origin[2];
+    rp->direction_x = e->direction[0];
+    rp->direction_y = e->direction[1];
+    rp->direction_z = e->direction[2];
+    rp->tmin         = e->tmin;
+    rp->tmax         = e->tmax;
+
+    pv->filter_pinned[ray_idx] = e->filter;
+    pv->ray_to_slot[ray_idx]   = e->slot;
+    pv->ray_slot_sub[ray_idx]  = e->sub;
+  }
+}
+
+/**
+ * merged_pass_fixup_batch_idx — after all rays are written to pinned,
+ * set batch_idx/batch_idx2/batch_indices on path_state so distribute
+ * can find the results next round.
+ *
+ * Must be called AFTER flush, because ray indices are known only then.
+ */
+static void
+merged_pass_fixup_batch_idx(
+  struct wavefront_pool* pool,
+  struct pool_view*      pv,
+  size_t                 total_rays)
+{
+  int ri;
+  int n = (int)total_rays;
+
+  #pragma omp parallel for schedule(static)
+  for(ri = 0; ri < n; ri++) {
+    size_t r = (size_t)ri;
+    uint32_t slot = pv->ray_to_slot[r];
+    uint32_t sub  = pv->ray_slot_sub[r];
+    struct path_state* p = &pool->slots[slot];
+
+    switch(sub) {
+    case 0:
+      p->ray_req.batch_idx = (uint32_t)r;
+      /* For 6-ray enc query, also store in enc_arr.batch_indices[0] */
+      if(pool->hot_arr[slot].ray_count_ext == 6
+      && (enum path_phase)pool->hot_arr[slot].phase == PATH_ENC_QUERY_EMIT)
+        pool->enc_arr[slot].batch_indices[0] = (uint32_t)r;
+      /* For 4-ray SS, store batch_idx_frt0 */
+      if(pool->hot_arr[slot].ray_count_ext == 4
+      && (enum path_phase)pool->hot_arr[slot].phase == PATH_BND_SS_REINJECT_SAMPLE)
+        p->locals.bnd_ss.batch_idx_frt0 = (uint32_t)r;
+      break;
+    case 1:
+      p->ray_req.batch_idx2 = (uint32_t)r;
+      if(pool->hot_arr[slot].ray_count_ext == 6
+      && (enum path_phase)pool->hot_arr[slot].phase == PATH_ENC_QUERY_EMIT)
+        pool->enc_arr[slot].batch_indices[1] = (uint32_t)r;
+      if(pool->hot_arr[slot].ray_count_ext == 4
+      && (enum path_phase)pool->hot_arr[slot].phase == PATH_BND_SS_REINJECT_SAMPLE)
+        p->locals.bnd_ss.batch_idx_frt1 = (uint32_t)r;
+      break;
+    case 2: case 3: case 4: case 5:
+      if(pool->hot_arr[slot].ray_count_ext == 6)
+        pool->enc_arr[slot].batch_indices[sub] = (uint32_t)r;
+      if(sub == 2 && pool->hot_arr[slot].ray_count_ext == 4)
+        p->locals.bnd_ss.batch_idx_bck0 = (uint32_t)r;
+      if(sub == 3 && pool->hot_arr[slot].ray_count_ext == 4)
+        p->locals.bnd_ss.batch_idx_bck1 = (uint32_t)r;
+      break;
+    }
+  }
+}
+
+/*******************************************************************************
+ * O11_SAFETY: Debug assertions for enc/cp delayed-one-round model.
+ * Verify write-before-read causality and one-shot RESULT consumption.
+ * Enable with: -DSDIS_DEBUG_CHECKS at compile time.
+ ******************************************************************************/
+#ifdef SDIS_DEBUG_CHECKS
+
+/* Assertion 1: merged_pass entry — every RESULT phase has a matching
+ * slot in the previous round's enc_locate_to_slot / cp_to_slot arrays,
+ * proving that post_merged_enc_cp actually wrote the backing data. */
+static void
+assert_result_phases_backed(struct wavefront_pool* pool,
+                            struct pool_view*      pv)
+{
+  size_t i, k;
+  for(i = pv->base; i < pv->base + pv->view_size; i++) {
+    if(pool->hot_arr[i].phase == (uint8_t)PATH_ENC_LOCATE_RESULT) {
+      int found = 0;
+      for(k = 0; k < pv->enc_locate_count; k++) {
+        if(pv->enc_locate_to_slot[k] == (uint32_t)i) { found = 1; break; }
+      }
+      ASSERT(found && "O11_SAFETY: RESULT phase without GPU write: enc_locate");
+    }
+    if(pool->hot_arr[i].phase == (uint8_t)PATH_CND_WOS_CLOSEST_RESULT
+    || pool->hot_arr[i].phase == (uint8_t)PATH_CND_WOS_DIFFUSION_CHECK_RESULT) {
+      int found = 0;
+      for(k = 0; k < pv->cp_count; k++) {
+        if(pv->cp_to_slot[k] == (uint32_t)i) { found = 1; break; }
+      }
+      ASSERT(found && "O11_SAFETY: RESULT phase without GPU write: cp");
+    }
+  }
+}
+
+/* Assertion 2: merged_pass exit — no active path may still hold a RESULT
+ * phase. All RESULTs must have been consumed by cascade in Phase B. */
+static void
+assert_no_residual_results(struct wavefront_pool* pool,
+                           struct pool_view*      pv)
+{
+  size_t i;
+  for(i = pv->base; i < pv->base + pv->view_size; i++) {
+    if(!pool->hot_arr[i].active) continue;
+    ASSERT(pool->hot_arr[i].phase != (uint8_t)PATH_ENC_LOCATE_RESULT
+        && "O11_SAFETY: Residual ENC_LOCATE_RESULT after merged_pass");
+    ASSERT(pool->hot_arr[i].phase != (uint8_t)PATH_CND_WOS_CLOSEST_RESULT
+        && "O11_SAFETY: Residual CND_WOS_CLOSEST_RESULT after merged_pass");
+    ASSERT(pool->hot_arr[i].phase != (uint8_t)PATH_CND_WOS_DIFFUSION_CHECK_RESULT
+        && "O11_SAFETY: Residual CND_WOS_DIFFUSION_CHECK_RESULT after merged_pass");
+  }
+}
+
+/* Assertion 3: before gpu_launch — confirm no RESULT phases remain.
+ * Identical to assertion 2 but placed at a second verification point. */
+static void
+assert_no_pending_result_before_dispatch(struct wavefront_pool* pool,
+                                          struct pool_view*      pv)
+{
+  size_t i;
+  for(i = pv->base; i < pv->base + pv->view_size; i++) {
+    enum path_phase ph;
+    if(!pool->hot_arr[i].active) continue;
+    ph = (enum path_phase)pool->hot_arr[i].phase;
+    ASSERT(ph != PATH_ENC_LOCATE_RESULT
+        && ph != PATH_CND_WOS_CLOSEST_RESULT
+        && ph != PATH_CND_WOS_DIFFUSION_CHECK_RESULT
+        && "O11_SAFETY: RESULT phase still present at gpu_dispatch");
+  }
+}
+
+#endif /* SDIS_DEBUG_CHECKS */
+
+/**
+ * merged_pass — O11 single OMP scan.
+ */
+static res_T
+merged_pass(struct wavefront_pool* pool,
+            struct pool_view*      pv,
+            struct sdis_scene*     scn)
+{
+  int omp_nthreads = (scn && scn->dev) ? (int)scn->dev->nthreads : 1;
+  int had_fatal = 0;
+  size_t n = pv->active_compact;
+  size_t total_rays = 0;
+
+  if(omp_nthreads < 1) omp_nthreads = 1;
+
+  /* O11_SAFETY: verify RESULT phases are backed by previous round's writes */
+#ifdef SDIS_DEBUG_CHECKS
+  assert_result_phases_backed(pool, pv);
+#endif
+
+  /* Reset per-view counters */
+  pv->ray_count = 0;
+  pv->enc_locate_count = 0;
+  pv->cp_count = 0;
+  pv->done_count = 0;
+
+  /* Zero pending ray stats */
+  pv->pending_rays_radiative           = 0;
+  pv->pending_rays_conductive_ds       = 0;
+  pv->pending_rays_conductive_ds_retry = 0;
+  pv->pending_rays_shadow              = 0;
+  pv->pending_rays_enclosure           = 0;
+  pv->pending_rays_startup             = 0;
+  pv->pending_rays_other               = 0;
+
+  if(n == 0) return RES_OK;
+
+  if(n < 64 || omp_nthreads <= 1) {
+    /* ════════ Serial fallback ════════ */
+    size_t k;
+    size_t tl_iterations = 0, tl_advances = 0, tl_paths_failed = 0;
+    size_t tl_enc_escalated = 0;
+    size_t tl_enc_degenerate_null = 0;
+    size_t tl_completed = 0, tl_done_rad = 0, tl_done_temp = 0, tl_done_bnd = 0;
+    size_t ser_ray_count = 0;
+    /* Heap-alloc ray buffer for serial path */
+    struct tl_ray_entry* ser_rays = NULL;
+    size_t ser_rays_cap = 0;
+
+    for(k = 0; k < n; k++) {
+      uint32_t slot = pv->active_indices[k];
+      struct path_state* p = &pool->slots[slot];
+      struct path_hot* hot = &pool->hot_arr[slot];
+
+      if(!hot->active) continue;
+
+      /* ── Phase A: Distribute+Step (if had ray last round) ── */
+      if(merged_pass_distribute_step(pool, pv, slot, p, hot, scn,
+                                      &tl_paths_failed, &tl_enc_escalated))
+        return RES_UNKNOWN_ERR;
+
+      /* ── Phase B: Cascade ── */
+      if(hot->active
+      && (enum path_phase)hot->phase != PATH_DONE
+      && (enum path_phase)hot->phase != PATH_ERROR) {
+        if(cascade_advance_single_path(
+              p, scn, pool, (size_t)slot,
+              &tl_iterations, &tl_advances,
+              &tl_paths_failed, &tl_enc_degenerate_null
+#ifdef SDIS_CASCADE_PROFILE
+              ,pool->cascade_phase_count, pool->cascade_phase_time
+#endif
+              ))
+          return RES_UNKNOWN_ERR;
+      }
+
+      /* ── Phase C: Collect ray request ── */
+      if(hot->needs_ray && hot->active && p->ray_req.ray_count > 0) {
+        size_t nrays = count_path_rays_soa(
+          (enum path_phase)hot->phase, hot->ray_count_ext, p);
+
+        /* Ensure buffer capacity */
+        if(ser_ray_count + nrays > ser_rays_cap) {
+          size_t new_cap = (ser_rays_cap == 0) ? 4096 : ser_rays_cap * 2;
+          while(new_cap < ser_ray_count + nrays) new_cap *= 2;
+          ser_rays = (struct tl_ray_entry*)realloc(ser_rays,
+            new_cap * sizeof(struct tl_ray_entry));
+          ser_rays_cap = new_cap;
+        }
+
+        {
+          size_t added = merged_pass_collect_ray(pool, pv, p, hot, slot,
+                                                  ser_rays, ser_ray_count);
+          /* Accumulate ray stats */
+          {
+            enum path_phase ph_i = (enum path_phase)hot->phase;
+            switch(ph_i) {
+            case PATH_RAD_TRACE_PENDING:
+            case PATH_BND_SF_NULLCOLL_RAD_TRACE:
+            case PATH_BND_SFN_RAD_TRACE:
+            case PATH_BND_EXT_DIFFUSE_TRACE:
+            case PATH_CND_WOS_FALLBACK_TRACE:
+            case PATH_COUPLED_BOUNDARY_REINJECT:
+            case PATH_BND_SS_REINJECT_SAMPLE:
+            case PATH_BND_SF_REINJECT_SAMPLE:
+              pv->pending_rays_radiative += nrays; break;
+            case PATH_COUPLED_COND_DS_PENDING:
+            case PATH_CND_DS_STEP_TRACE:
+              if(p->ds_robust_attempt > 0) pv->pending_rays_conductive_ds_retry += nrays;
+              else                          pv->pending_rays_conductive_ds += nrays;
+              break;
+            case PATH_BND_EXT_DIRECT_TRACE:
+            case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
+              pv->pending_rays_shadow += nrays; break;
+            case PATH_ENC_QUERY_EMIT:
+            case PATH_ENC_QUERY_FB_EMIT:
+            case PATH_CND_INIT_ENC:
+              pv->pending_rays_enclosure += nrays; break;
+            case PATH_CNV_STARTUP_TRACE:
+              pv->pending_rays_startup += nrays; break;
+            default:
+              pv->pending_rays_other += nrays; break;
+            }
+          }
+          ser_ray_count += added;
+        }
+      }
+
+      /* ── Phase C2: Collect enc_locate request ── */
+      if((enum path_phase)hot->phase == PATH_ENC_LOCATE_PENDING) {
+        size_t idx = pv->enc_locate_count;
+        struct s3d_enc_locate_request* req = &pv->enc_locate_requests[idx];
+        req->pos[0] = (float)pool->enc_arr[slot].locate.query_pos[0];
+        req->pos[1] = (float)pool->enc_arr[slot].locate.query_pos[1];
+        req->pos[2] = (float)pool->enc_arr[slot].locate.query_pos[2];
+        req->user_id = slot;
+        pv->enc_locate_to_slot[idx] = slot;
+        pool->enc_arr[slot].locate.batch_idx = (uint32_t)idx;
+        pv->enc_locate_count++;
+      }
+
+      /* ── Phase C3: Collect cp request ── */
+      if(path_phase_is_cp_pending((enum path_phase)hot->phase)) {
+        size_t idx = pv->cp_count;
+        struct s3d_cp_request* req = &pv->cp_requests[idx];
+        req->pos[0] = (float)p->locals.cnd_wos.query_pos[0];
+        req->pos[1] = (float)p->locals.cnd_wos.query_pos[1];
+        req->pos[2] = (float)p->locals.cnd_wos.query_pos[2];
+        req->radius = p->locals.cnd_wos.query_radius;
+        req->query_data = NULL;
+        req->user_id = slot;
+        pv->cp_to_slot[idx] = slot;
+        p->locals.cnd_wos.batch_cp_idx = (uint32_t)idx;
+        pv->cp_count++;
+      }
+
+      /* ── Phase D: Harvest ── */
+      if(((enum path_phase)hot->phase == PATH_DONE
+       || (enum path_phase)hot->phase == PATH_ERROR)
+      && !hot->active) {
+        /* M8: check sfn_stack_depth for Picard N resumption */
+        if((enum path_phase)hot->phase == PATH_DONE
+        && pool->sfn_arr[slot].depth > 0) {
+          hot->phase = (uint8_t)PATH_BND_SFN_COMPUTE_Ti_RESUME;
+          hot->active = 1;
+        } else {
+          pool->ops->accumulate_result(p, pool->result_ctx);
+
+          { FILE* tf = pixel_trace_file();
+            if(tf) {
+              fprintf(tf, "%u,%u,%u,%u,%.17g,%d,%d,%llu,%d\n",
+                (unsigned)p->path_id,
+                (unsigned)p->ipix_image[0], (unsigned)p->ipix_image[1],
+                (unsigned)p->realisation_idx,
+                p->T.value, (int)p->T.done, p->done_reason,
+                (unsigned long long)p->steps_taken,
+                (int)(enum path_phase)hot->phase);
+            }
+          }
+
+          if(p->steps_taken > pool->max_path_depth)
+            pool->max_path_depth = p->steps_taken;
+
+          tl_completed++;
+          switch(p->done_reason) {
+          case 1:  tl_done_rad++;  break;
+          case 2:  tl_done_temp++; break;
+          case 3:  tl_done_bnd++;  break;
+          case 4:  tl_done_temp++; break;
+          case -1: break;
+          default: break;
+          }
+
+          hot->active = 0;
+          hot->phase  = (uint8_t)PATH_HARVESTED;
+          /* Record for refill */
+          pv->done_indices[pv->done_count++] = slot;
+        }
+      }
+    } /* end serial loop */
+
+    /* Flush serial ray buffer to pinned */
+    if(ser_ray_count > 0) {
+      merged_pass_flush_tl_rays(pool, pv, ser_rays, ser_ray_count, 0);
+      merged_pass_fixup_batch_idx(pool, pv, ser_ray_count);
+    }
+    pv->ray_count = ser_ray_count;
+    free(ser_rays);
+
+    /* Update pool counters */
+    pool->cascade_total_iterations += tl_iterations;
+    pool->cascade_total_advances   += tl_advances;
+    pool->paths_failed             += tl_paths_failed;
+    pool->enc_locate_degenerate_null += tl_enc_degenerate_null;
+    pool->enc_query_escalated_to_m10 += tl_enc_escalated;
+    pool->paths_completed          += tl_completed;
+    pool->paths_done_radiative     += tl_done_rad;
+    pool->paths_done_temperature   += tl_done_temp;
+    pool->paths_done_boundary      += tl_done_bnd;
+
+    return RES_OK;
+  }
+
+  /* Lazy-init per-thread ray buffers (once per pool lifetime) */
+  if(!pool->tl_ray_bufs || pool->tl_ray_nbufs < omp_nthreads) {
+    int ti;
+    /* Free old (if nthreads grew) */
+    if(pool->tl_ray_bufs) {
+      for(ti = 0; ti < pool->tl_ray_nbufs; ti++)
+        free(pool->tl_ray_bufs[ti]);
+      free(pool->tl_ray_bufs);
+    }
+    pool->tl_ray_nbufs = omp_nthreads;
+    pool->tl_ray_bufs = (void**)calloc(
+      (size_t)omp_nthreads, sizeof(void*));
+    if(!pool->tl_ray_bufs) return RES_MEM_ERR;
+    for(ti = 0; ti < omp_nthreads; ti++) {
+      pool->tl_ray_bufs[ti] = malloc(
+        TL_RAY_BUF_MAX * sizeof(struct tl_ray_entry));
+      if(!pool->tl_ray_bufs[ti]) return RES_MEM_ERR;
+    }
+  }
+
+  /* ════════ OMP parallel merged_pass ════════ */
+  #pragma omp parallel num_threads(omp_nthreads)
+  {
+    /* Thread-local accumulators */
+    size_t tl_iterations = 0, tl_advances = 0, tl_paths_failed = 0;
+    size_t tl_enc_escalated = 0, tl_enc_degenerate_null = 0;
+    size_t tl_completed = 0, tl_done_rad = 0, tl_done_temp = 0, tl_done_bnd = 0;
+    size_t tl_max_depth = 0;
+    int tl_fatal = 0;
+
+    /* Per-thread ray buffer from pre-allocated pool */
+    struct tl_ray_entry* tl_rays =
+      (struct tl_ray_entry*)pool->tl_ray_bufs[omp_get_thread_num()];
+    size_t tl_ray_count = 0;
+
+    /* Thread-local pending ray stats */
+    size_t tl_rays_radiative = 0, tl_rays_cond_ds = 0;
+    size_t tl_rays_cond_ds_retry = 0, tl_rays_shadow = 0;
+    size_t tl_rays_enclosure = 0, tl_rays_startup = 0;
+    size_t tl_rays_other = 0;
+
+    int ph;
+
+    #pragma omp for schedule(dynamic, 64)
+    for(ph = 0; ph < (int)n; ph++) {
+      uint32_t slot = pv->active_indices[ph];
+      struct path_state* p = &pool->slots[slot];
+      struct path_hot* hot = &pool->hot_arr[slot];
+
+      if(!hot->active) continue;
+
+      /* O7: prefetch 4 iterations ahead */
+      if(ph + 4 < (int)n) {
+        PREFETCH_T0(&pool->slots[pv->active_indices[ph + 4]]);
+        PREFETCH_T0(&pool->hot_arr[pv->active_indices[ph + 4]]);
+      }
+
+      /* ── Phase A: Distribute+Step ── */
+      if(merged_pass_distribute_step(pool, pv, slot, p, hot, scn,
+                                      &tl_paths_failed, &tl_enc_escalated)) {
+        tl_fatal = 1;
+      }
+
+      /* ── Phase B: Cascade ── */
+      if(!tl_fatal && hot->active
+      && (enum path_phase)hot->phase != PATH_DONE
+      && (enum path_phase)hot->phase != PATH_ERROR) {
+        if(cascade_advance_single_path(
+              p, scn, pool, (size_t)slot,
+              &tl_iterations, &tl_advances,
+              &tl_paths_failed, &tl_enc_degenerate_null
+#ifdef SDIS_CASCADE_PROFILE
+              ,pool->cascade_phase_count, pool->cascade_phase_time
+#endif
+              )) {
+          tl_fatal = 1;
+        }
+      }
+
+      /* ── Phase C: Collect ray request ── */
+      if(!tl_fatal && hot->needs_ray && hot->active
+      && p->ray_req.ray_count > 0) {
+        size_t nrays = count_path_rays_soa(
+          (enum path_phase)hot->phase, hot->ray_count_ext, p);
+        size_t added;
+
+        /* Safety: don't overflow stack buffer */
+        if(tl_ray_count + nrays > TL_RAY_BUF_MAX) {
+          /* This should not happen with pool=20K and 32 threads.
+           * Each thread handles ~625 paths, max 6 rays each = 3750. */
+          tl_fatal = 1;
+        } else {
+          added = merged_pass_collect_ray(pool, pv, p, hot, slot,
+                                           tl_rays, tl_ray_count);
+          /* Ray stats */
+          {
+            enum path_phase ph_i = (enum path_phase)hot->phase;
+            switch(ph_i) {
+            case PATH_RAD_TRACE_PENDING:
+            case PATH_BND_SF_NULLCOLL_RAD_TRACE:
+            case PATH_BND_SFN_RAD_TRACE:
+            case PATH_BND_EXT_DIFFUSE_TRACE:
+            case PATH_CND_WOS_FALLBACK_TRACE:
+            case PATH_COUPLED_BOUNDARY_REINJECT:
+            case PATH_BND_SS_REINJECT_SAMPLE:
+            case PATH_BND_SF_REINJECT_SAMPLE:
+              tl_rays_radiative += nrays; break;
+            case PATH_COUPLED_COND_DS_PENDING:
+            case PATH_CND_DS_STEP_TRACE:
+              if(p->ds_robust_attempt > 0) tl_rays_cond_ds_retry += nrays;
+              else                          tl_rays_cond_ds += nrays;
+              break;
+            case PATH_BND_EXT_DIRECT_TRACE:
+            case PATH_BND_EXT_DIFFUSE_SHADOW_TRACE:
+              tl_rays_shadow += nrays; break;
+            case PATH_ENC_QUERY_EMIT:
+            case PATH_ENC_QUERY_FB_EMIT:
+            case PATH_CND_INIT_ENC:
+              tl_rays_enclosure += nrays; break;
+            case PATH_CNV_STARTUP_TRACE:
+              tl_rays_startup += nrays; break;
+            default:
+              tl_rays_other += nrays; break;
+            }
+          }
+          tl_ray_count += added;
+        }
+      }
+
+      /* ── Phase C2: Collect enc_locate request (atomic) ── */
+      if(!tl_fatal
+      && (enum path_phase)hot->phase == PATH_ENC_LOCATE_PENDING) {
+        size_t idx;
+        idx = (size_t)_InterlockedExchangeAdd64(
+          (volatile long long*)&pv->enc_locate_count, 1);
+
+        {
+          struct s3d_enc_locate_request* req = &pv->enc_locate_requests[idx];
+          req->pos[0] = (float)pool->enc_arr[slot].locate.query_pos[0];
+          req->pos[1] = (float)pool->enc_arr[slot].locate.query_pos[1];
+          req->pos[2] = (float)pool->enc_arr[slot].locate.query_pos[2];
+          req->user_id = slot;
+          pv->enc_locate_to_slot[idx] = slot;
+          pool->enc_arr[slot].locate.batch_idx = (uint32_t)idx;
+        }
+      }
+
+      /* ── Phase C3: Collect cp request (atomic) ── */
+      if(!tl_fatal
+      && path_phase_is_cp_pending((enum path_phase)hot->phase)) {
+        size_t idx;
+        idx = (size_t)_InterlockedExchangeAdd64(
+          (volatile long long*)&pv->cp_count, 1);
+
+        {
+          struct s3d_cp_request* req = &pv->cp_requests[idx];
+          req->pos[0] = (float)p->locals.cnd_wos.query_pos[0];
+          req->pos[1] = (float)p->locals.cnd_wos.query_pos[1];
+          req->pos[2] = (float)p->locals.cnd_wos.query_pos[2];
+          req->radius = p->locals.cnd_wos.query_radius;
+          req->query_data = NULL;
+          req->user_id = slot;
+          pv->cp_to_slot[idx] = slot;
+          p->locals.cnd_wos.batch_cp_idx = (uint32_t)idx;
+        }
+      }
+
+      /* ── Phase D: Harvest ── */
+      if(!tl_fatal
+      && ((enum path_phase)hot->phase == PATH_DONE
+       || (enum path_phase)hot->phase == PATH_ERROR)
+      && !hot->active) {
+        /* M8: Picard N resumption check */
+        if((enum path_phase)hot->phase == PATH_DONE
+        && pool->sfn_arr[slot].depth > 0) {
+          hot->phase = (uint8_t)PATH_BND_SFN_COMPUTE_Ti_RESUME;
+          hot->active = 1;
+        } else {
+          /* accumulate_result is atomic-safe (writes to distinct pixels) */
+          pool->ops->accumulate_result(p, pool->result_ctx);
+
+          { FILE* tf = pixel_trace_file();
+            if(tf) {
+              #pragma omp critical(harvest_trace)
+              fprintf(tf, "%u,%u,%u,%u,%.17g,%d,%d,%llu,%d\n",
+                (unsigned)p->path_id,
+                (unsigned)p->ipix_image[0], (unsigned)p->ipix_image[1],
+                (unsigned)p->realisation_idx,
+                p->T.value, (int)p->T.done, p->done_reason,
+                (unsigned long long)p->steps_taken,
+                (int)(enum path_phase)hot->phase);
+            }
+          }
+
+          if(p->steps_taken > tl_max_depth)
+            tl_max_depth = p->steps_taken;
+
+          tl_completed++;
+          switch(p->done_reason) {
+          case 1:  tl_done_rad++;  break;
+          case 2:  tl_done_temp++; break;
+          case 3:  tl_done_bnd++;  break;
+          case 4:  tl_done_temp++; break;
+          case -1: break;
+          default: break;
+          }
+
+          hot->active = 0;
+          hot->phase  = (uint8_t)PATH_HARVESTED;
+
+          /* Record done slot for refill (atomic append) */
+          {
+            size_t di;
+            di = (size_t)_InterlockedExchangeAdd64(
+              (volatile long long*)&pv->done_count, 1);
+            pv->done_indices[di] = slot;
+          }
+        }
+      }
+    } /* end omp for */
+
+    /* ── Thread-local ray buffer → pinned merge ── */
+    if(tl_ray_count > 0) {
+      size_t ray_base;
+      ray_base = (size_t)_InterlockedExchangeAdd64(
+        (volatile long long*)&total_rays, (long long)tl_ray_count);
+      merged_pass_flush_tl_rays(pool, pv, tl_rays, tl_ray_count, ray_base);
+    }
+
+    /* ── Reduction: thread-local → pool ── */
+    #pragma omp atomic
+    pool->cascade_total_iterations += tl_iterations;
+    #pragma omp atomic
+    pool->cascade_total_advances   += tl_advances;
+    #pragma omp atomic
+    pool->paths_failed             += tl_paths_failed;
+    #pragma omp atomic
+    pool->enc_locate_degenerate_null += tl_enc_degenerate_null;
+    #pragma omp atomic
+    pool->enc_query_escalated_to_m10 += tl_enc_escalated;
+    #pragma omp atomic
+    pool->paths_completed          += tl_completed;
+    #pragma omp atomic
+    pool->paths_done_radiative     += tl_done_rad;
+    #pragma omp atomic
+    pool->paths_done_temperature   += tl_done_temp;
+    #pragma omp atomic
+    pool->paths_done_boundary      += tl_done_bnd;
+
+    #pragma omp atomic
+    pv->pending_rays_radiative           += tl_rays_radiative;
+    #pragma omp atomic
+    pv->pending_rays_conductive_ds       += tl_rays_cond_ds;
+    #pragma omp atomic
+    pv->pending_rays_conductive_ds_retry += tl_rays_cond_ds_retry;
+    #pragma omp atomic
+    pv->pending_rays_shadow              += tl_rays_shadow;
+    #pragma omp atomic
+    pv->pending_rays_enclosure           += tl_rays_enclosure;
+    #pragma omp atomic
+    pv->pending_rays_startup             += tl_rays_startup;
+    #pragma omp atomic
+    pv->pending_rays_other               += tl_rays_other;
+
+    #pragma omp critical(merged_max_depth)
+    {
+      if(tl_max_depth > pool->max_path_depth)
+        pool->max_path_depth = tl_max_depth;
+    }
+
+    if(tl_fatal) had_fatal = 1;
+  } /* end omp parallel */
+
+  if(had_fatal) return RES_UNKNOWN_ERR;
+
+  /* Fixup batch_idx after all rays are in pinned buffer */
+  pv->ray_count = total_rays;
+  merged_pass_fixup_batch_idx(pool, pv, total_rays);
+
+  /* O11_SAFETY: verify all RESULT phases consumed — none should survive cascade */
+#ifdef SDIS_DEBUG_CHECKS
+  assert_no_residual_results(pool, pv);
+#endif
+
+  return RES_OK;
+}
+
+/**
+ * post_merged_enc_cp — synchronous enc_locate + closest_point batch.
+ *
+ * Called after merged_pass() to process enc and cp requests that were
+ * collected during Phase C.  Results are written back to path_state so
+ * the next merged_pass's cascade can consume them.
+ */
+static res_T
+post_merged_enc_cp(struct wavefront_pool* pool,
+                   struct pool_view*      pv,
+                   struct sdis_scene*     scn)
+{
+  res_T res;
+  struct time t0, t1;
+
+  /* ── enc_locate batch ── */
+  time_current(&t0);
+  if(pv->enc_locate_count > 0) {
+    struct s3d_batch_enc_stats enc_stats;
+    memset(&enc_stats, 0, sizeof(enc_stats));
+
+    res = s3d_scene_view_find_enclosure_batch_ctx(
+      scn->s3d_view, pv->enc_batch_ctx,
+      pv->enc_locate_requests, pv->enc_locate_count,
+      pv->enc_locate_results, &enc_stats);
+    if(res != RES_OK) return res;
+
+    res = pool_distribute_enc_locate_results(pool, pv);
+    if(res != RES_OK) return res;
+
+    pool->enc_locates_total     += pv->enc_locate_count;
+    pool->enc_locates_resolved  += enc_stats.resolved;
+    pool->enc_locates_degenerate += enc_stats.degenerate;
+  }
+  time_current(&t1);
+  pool->time_enc_locate_s += time_elapsed_sec(&t0, &t1);
+
+  /* ── closest_point batch ── */
+  time_current(&t0);
+  if(pv->cp_count > 0) {
+    struct s3d_batch_cp_stats cp_stats;
+    memset(&cp_stats, 0, sizeof(cp_stats));
+
+    res = s3d_scene_view_closest_point_batch_ctx(
+      scn->s3d_view, pv->cp_batch_ctx,
+      pv->cp_requests, pv->cp_count,
+      pv->cp_hits, &cp_stats);
+    if(res != RES_OK) return res;
+
+    res = pool_distribute_cp_results(pool, pv);
+    if(res != RES_OK) return res;
+
+    pool->cp_total     += pv->cp_count;
+    pool->cp_accepted  += cp_stats.batch_accepted;
+    pool->cp_requeried += cp_stats.requery_accepted;
+  }
+  time_current(&t1);
+  pool->time_cp_s += time_elapsed_sec(&t0, &t1);
+
+  return RES_OK;
+}
+
 /**
  * cpu_between — cascade non-ray steps + harvest completed + refill pool.
  */
@@ -3539,7 +4896,13 @@ cpu_between(struct wavefront_pool* pool, struct pool_view* pv)
 /*******************************************************************************
  * pool_run_single — Single-buffer main loop (bare, no progress reporting).
  *
- * Used by probe / probe_batch modes and as fallback after dual→single merge.
+ * O11 merged architecture:
+ *   1. merged_pass:     distribute+cascade+collect+harvest (single OMP scan)
+ *   2. compact:         rebuild active_indices from hot_arr
+ *   3. refill:          replace completed paths with new tasks
+ *   4. enc/cp batch:    synchronous enc_locate + closest_point
+ *   5. gpu_launch:      async RT trace
+ *   6. gpu_wait:        sync + D2H (ray results ready for next merged_pass)
  ******************************************************************************/
 static res_T
 pool_run_single(struct wavefront_pool* pool,
@@ -3547,7 +4910,9 @@ pool_run_single(struct wavefront_pool* pool,
                 struct sdis_scene* scn)
 {
   struct pool_view* pv = &pool->views[0];
+  struct time t0, t1;
   res_T res;
+  size_t refill_count = 0;
 
   compact_active_paths(pool, pv);
   pool_update_active_count(pool);
@@ -3555,16 +4920,38 @@ pool_run_single(struct wavefront_pool* pool,
   while(pool->active_count > 0 || pool->task_next < pool->task_count) {
     pool->total_steps++;
 
-    res = cpu_pre_gpu(pool, pv);
+    /* Step 1: O11 merged_pass (distribute+cascade+collect+harvest) */
+    time_current(&t0);
+    res = merged_pass(pool, pv, scn);
     if(res != RES_OK) return res;
+    time_current(&t1);
+    pool->time_cascade_s += time_elapsed_sec(&t0, &t1);
 
-    res = gpu_launch_async(pool, pv, sv);
+    /* Step 2: compact active indices */
+    time_current(&t0);
+    compact_active_paths(pool, pv);
+    time_current(&t1);
+    pool->time_compact_s += time_elapsed_sec(&t0, &t1);
+
+    /* Step 3: refill completed slots */
+    time_current(&t0);
+    res = refill_pool(pool, pv, &refill_count);
     if(res != RES_OK) return res;
+    time_current(&t1);
+    pool->time_harvest_s += time_elapsed_sec(&t0, &t1);
 
-    res = gpu_wait_and_postprocess(pool, pv, sv, scn);
+    /* Step 4: GPU launch RT + enc + cp (async) */
+#ifdef SDIS_DEBUG_CHECKS
+    assert_no_pending_result_before_dispatch(pool, pv);
+#endif
+    time_current(&t0);
+    res = gpu_launch_all(pool, pv, sv);
     if(res != RES_OK) return res;
+    time_current(&t1);
+    pool->time_gpu_launch_s += time_elapsed_sec(&t0, &t1);
 
-    res = cpu_between(pool, pv);
+    /* Step 5: GPU wait + D2H for RT + enc + cp */
+    res = gpu_wait_download_all(pool, pv, sv);
     if(res != RES_OK) return res;
 
     pool_update_active_count(pool);
@@ -3581,9 +4968,9 @@ pool_run_single(struct wavefront_pool* pool,
 /*******************************************************************************
  * pool_run_dual — Dual-buffer pipeline main loop (bare, no progress).
  *
- * Overlaps GPU trace on one view with CPU cascade on the other.
- * Dynamically merges to single-buffer when either half's occupancy drops
- * below 12.5% (via should_merge).
+ * O11: Overlaps GPU trace on one view with merged_pass on the other.
+ * Each half-cycle: wait GPU(X) → merged_pass(X) + compact + refill +
+ *   enc/cp batch on X → gpu_launch(X).
  ******************************************************************************/
 static res_T
 pool_run_dual(struct wavefront_pool* pool,
@@ -3593,37 +4980,66 @@ pool_run_dual(struct wavefront_pool* pool,
   struct pool_view* pv_a = &pool->views[0];
   struct pool_view* pv_b = &pool->views[1];
   res_T res;
+  size_t refill_count = 0;
 
-  /* Startup: prepare A and launch first GPU */
-  res = cpu_pre_gpu(pool, pv_a);
+  /* Startup: initial compact + merged_pass(A) → launch GPU(A) */
+  compact_active_paths(pool, pv_a);
+  res = merged_pass(pool, pv_a, scn);
   if(res != RES_OK) return res;
-  res = gpu_launch_async(pool, pv_a, sv);
+  compact_active_paths(pool, pv_a);
+  res = refill_pool(pool, pv_a, &refill_count);
+  if(res != RES_OK) return res;
+#ifdef SDIS_DEBUG_CHECKS
+  assert_no_pending_result_before_dispatch(pool, pv_a);
+#endif
+  res = gpu_launch_all(pool, pv_a, sv);
   if(res != RES_OK) return res;
 
-  /* Prepare B (first cycle: no cascade yet, just pre) */
-  res = cpu_pre_gpu(pool, pv_b);
+  /* Startup: initial compact + merged_pass(B) */
+  compact_active_paths(pool, pv_b);
+  res = merged_pass(pool, pv_b, scn);
   if(res != RES_OK) return res;
+  compact_active_paths(pool, pv_b);
+  res = refill_pool(pool, pv_b, &refill_count);
+  if(res != RES_OK) return res;
+  /* B's enc/cp requests pending — will be launched in first gpu_launch_all(B) */
 
   while(pool->active_count > 0 || pool->task_next < pool->task_count) {
     struct time t_pl0, t_pl1;
 
     /* ════════ Phase 1: wait GPU(A) → launch GPU(B) → CPU on A ════════ */
     time_current(&t_pl0);
-    res = gpu_wait_and_postprocess(pool, pv_a, sv, scn);
+    res = gpu_wait_download_all(pool, pv_a, sv);
     if(res != RES_OK) return res;
     time_current(&t_pl1);
     pool->time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
 
-    res = gpu_launch_async(pool, pv_b, sv);
+#ifdef SDIS_DEBUG_CHECKS
+    assert_no_pending_result_before_dispatch(pool, pv_b);
+#endif
+    res = gpu_launch_all(pool, pv_b, sv);
     if(res != RES_OK) return res;
 
     pool->total_steps++;
 
     time_current(&t_pl0);
-    res = cpu_between(pool, pv_a);
-    if(res != RES_OK) return res;
-    res = cpu_pre_gpu(pool, pv_a);
-    if(res != RES_OK) return res;
+    /* O11: merged_pass on A (distribute+cascade+collect+harvest) */
+    { struct time t_mp0, t_mp1;
+      time_current(&t_mp0);
+      res = merged_pass(pool, pv_a, scn);
+      if(res != RES_OK) return res;
+      time_current(&t_mp1);
+      pool->time_cascade_s += time_elapsed_sec(&t_mp0, &t_mp1);
+    }
+    { struct time t_cr0, t_cr1;
+      time_current(&t_cr0);
+      compact_active_paths(pool, pv_a);
+      res = refill_pool(pool, pv_a, &refill_count);
+      if(res != RES_OK) return res;
+      if(refill_count > 0) compact_active_paths(pool, pv_a);
+      time_current(&t_cr1);
+      pool->time_harvest_s += time_elapsed_sec(&t_cr0, &t_cr1);
+    }
     time_current(&t_pl1);
     pool->time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
 
@@ -3633,28 +5049,43 @@ pool_run_dual(struct wavefront_pool* pool,
       pool->in_drain_phase = 1;
     }
 
-    /* Safety */
     if(pool->total_steps > pool->task_count * 1000) {
       return RES_BAD_OP;
     }
 
     /* ════════ Phase 2: wait GPU(B) → launch GPU(A) → CPU on B ════════ */
     time_current(&t_pl0);
-    res = gpu_wait_and_postprocess(pool, pv_b, sv, scn);
+    res = gpu_wait_download_all(pool, pv_b, sv);
     if(res != RES_OK) return res;
     time_current(&t_pl1);
     pool->time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
 
-    res = gpu_launch_async(pool, pv_a, sv);
+#ifdef SDIS_DEBUG_CHECKS
+    assert_no_pending_result_before_dispatch(pool, pv_a);
+#endif
+    res = gpu_launch_all(pool, pv_a, sv);
     if(res != RES_OK) return res;
 
     pool->total_steps++;
 
     time_current(&t_pl0);
-    res = cpu_between(pool, pv_b);
-    if(res != RES_OK) return res;
-    res = cpu_pre_gpu(pool, pv_b);
-    if(res != RES_OK) return res;
+    /* O11: merged_pass on B */
+    { struct time t_mp0, t_mp1;
+      time_current(&t_mp0);
+      res = merged_pass(pool, pv_b, scn);
+      if(res != RES_OK) return res;
+      time_current(&t_mp1);
+      pool->time_cascade_s += time_elapsed_sec(&t_mp0, &t_mp1);
+    }
+    { struct time t_cr0, t_cr1;
+      time_current(&t_cr0);
+      compact_active_paths(pool, pv_b);
+      res = refill_pool(pool, pv_b, &refill_count);
+      if(res != RES_OK) return res;
+      if(refill_count > 0) compact_active_paths(pool, pv_b);
+      time_current(&t_cr1);
+      pool->time_harvest_s += time_elapsed_sec(&t_cr0, &t_cr1);
+    }
     time_current(&t_pl1);
     pool->time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
 
@@ -3664,41 +5095,49 @@ pool_run_dual(struct wavefront_pool* pool,
       pool->in_drain_phase = 1;
     }
 
-    /* Safety */
     if(pool->total_steps > pool->task_count * 1000) {
       return RES_BAD_OP;
     }
 
     /* ════════ Dynamic merge check ════════ */
     if(should_merge(pool)) {
-      if(pv_a->gpu_pending) {
-        res = gpu_wait_and_postprocess(pool, pv_a, sv, scn);
+      log_warn(pool->scn->dev,
+        "O11_MERGE step=%llu v0_active=%zu v0_size=%zu v1_active=%zu v1_size=%zu thresh=%zu tasks=%zu/%zu\n",
+        (unsigned long long)pool->total_steps,
+        pool->views[0].active_compact, pool->views[0].view_size,
+        pool->views[1].active_compact, pool->views[1].view_size,
+        pool->views[0].view_size / 8,
+        pool->task_next, pool->task_count);
+      if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
+        res = gpu_wait_download_all(pool, pv_a, sv);
         if(res != RES_OK) return res;
       }
-      if(pv_b->gpu_pending) {
-        res = gpu_wait_and_postprocess(pool, pv_b, sv, scn);
+      if(pv_b->gpu_pending || pv_b->enc_gpu_pending || pv_b->cp_gpu_pending) {
+        res = gpu_wait_download_all(pool, pv_b, sv);
         if(res != RES_OK) return res;
       }
       merge_to_single_pool(pool);
-      break;  /* fall through to single-buffer in pool_run() */
+      break;
     }
   } /* end dual-buffer while */
 
   /* Drain: wait for last pending GPU calls */
   if(pool->num_active_views == 2) {
-    if(pv_a->gpu_pending) {
-      res = gpu_wait_and_postprocess(pool, pv_a, sv, scn);
+    if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
+      res = gpu_wait_download_all(pool, pv_a, sv);
       if(res != RES_OK) return res;
       pool->total_steps++;
-      res = cpu_between(pool, pv_a);
+      res = merged_pass(pool, pv_a, scn);
       if(res != RES_OK) return res;
+      compact_active_paths(pool, pv_a);
     }
-    if(pv_b->gpu_pending) {
-      res = gpu_wait_and_postprocess(pool, pv_b, sv, scn);
+    if(pv_b->gpu_pending || pv_b->enc_gpu_pending || pv_b->cp_gpu_pending) {
+      res = gpu_wait_download_all(pool, pv_b, sv);
       if(res != RES_OK) return res;
       pool->total_steps++;
-      res = cpu_between(pool, pv_b);
+      res = merged_pass(pool, pv_b, scn);
       if(res != RES_OK) return res;
+      compact_active_paths(pool, pv_b);
     }
   }
 
@@ -4015,40 +5454,79 @@ solve_camera_persistent_wavefront(
       "pipeline: starting dual-buffer mode, half=%llu\n",
       (unsigned long long)pv_a->view_size);
 
-    /* ---- Startup: prepare A and launch first GPU ---- */
-    res = cpu_pre_gpu(&pool, pv_a);
+    /* ---- O11 Startup: merged_pass(A) → launch GPU(A) ---- */
+    compact_active_paths(&pool, pv_a);
+    log_info(scn->dev,
+      "O11_STARTUP A pre-merge: active=%llu need_ray=%llu done=%llu\n",
+      (unsigned long long)pv_a->active_compact,
+      (unsigned long long)pv_a->need_ray_count,
+      (unsigned long long)pv_a->done_count);
+    res = merged_pass(&pool, pv_a, scn);
     if(res != RES_OK) goto cleanup;
-    res = gpu_launch_async(&pool, pv_a, scn->s3d_view);
+    compact_active_paths(&pool, pv_a);
+    log_info(scn->dev,
+      "O11_STARTUP A post-merge: active=%llu need_ray=%llu done=%llu rays=%llu\n",
+      (unsigned long long)pv_a->active_compact,
+      (unsigned long long)pv_a->need_ray_count,
+      (unsigned long long)pv_a->done_count,
+      (unsigned long long)pv_a->ray_count);
+    { size_t rc = 0;
+      res = refill_pool(&pool, pv_a, &rc);
+      if(res != RES_OK) goto cleanup; }
+#ifdef SDIS_DEBUG_CHECKS
+    assert_no_pending_result_before_dispatch(&pool, pv_a);
+#endif
+    res = gpu_launch_all(&pool, pv_a, scn->s3d_view);
     if(res != RES_OK) goto cleanup;
 
-    /* ---- Prepare B (first cycle: no cascade yet, just pre) ---- */
-    res = cpu_pre_gpu(&pool, pv_b);
+    /* ---- O11 Startup: merged_pass(B) ---- */
+    compact_active_paths(&pool, pv_b);
+    log_info(scn->dev,
+      "O11_STARTUP B pre-merge: active=%llu need_ray=%llu done=%llu\n",
+      (unsigned long long)pv_b->active_compact,
+      (unsigned long long)pv_b->need_ray_count,
+      (unsigned long long)pv_b->done_count);
+    res = merged_pass(&pool, pv_b, scn);
     if(res != RES_OK) goto cleanup;
+    compact_active_paths(&pool, pv_b);
+    log_info(scn->dev,
+      "O11_STARTUP B post-merge: active=%llu need_ray=%llu done=%llu rays=%llu\n",
+      (unsigned long long)pv_b->active_compact,
+      (unsigned long long)pv_b->need_ray_count,
+      (unsigned long long)pv_b->done_count,
+      (unsigned long long)pv_b->ray_count);
+    { size_t rc = 0;
+      res = refill_pool(&pool, pv_b, &rc);
+      if(res != RES_OK) goto cleanup; }
+    /* B's enc/cp requests pending — will be launched in first gpu_launch_all(B) */
 
     while(pool.active_count > 0 || pool.task_next < pool.task_count) {
       struct time t_pl0, t_pl1, t_hk;
-      /* L3 timeline: 11 timestamps spanning one full A+B cycle (dual-stream)
+      /* O11 timeline: 11 timestamps spanning one full A+B cycle
        * [0]=start
-       * [1]=syncKernA [2]=startD2hA [3]=launchB [4]=waitD2hA [5]=postA [6]=cpuA
-       * [7]=syncKernB [8]=startD2hB [9]=launchA [10]=waitD2hB [11]=postB [12]=cpuB
+       * [1]=syncKernA [2]=startD2hA [3]=launchB [4]=waitD2hA [5]=cpuA(merged)
+       * [6]=syncKernB [7]=startD2hB [8]=launchA [9]=waitD2hB [10]=cpuB(merged)
        */
-      struct time t_cy[13];
+      struct time t_cy[11];
 
-      /* ════════ Phase 1: syncK(A) → d2h↓(A) → launch(B) → waitD2h(A) → post(A) → CPU(A) ════════ */
+      /* ════════ Phase 1: syncK(A) → d2h↓(A) → launch(B) → waitD2h(A) → O11 merged(A) ════════ */
       time_current(&t_cy[0]);
 
-      /* 1a. Sync compute kernel only (no D2H yet) */
-      res = gpu_sync_kernel(&pool, pv_a);
+      /* 1a. Sync compute kernels: RT + enc + cp (no D2H yet) */
+      res = gpu_sync_kernel_all(&pool, pv_a);
       if(res != RES_OK) goto cleanup;
       time_current(&t_cy[1]);  /* after syncKernel(A) */
 
-      /* 1b. Start async D2H — returns immediately */
-      res = gpu_start_d2h(&pool, pv_a);
+      /* 1b. Start async D2H for RT + enc + cp — returns immediately */
+      res = gpu_start_d2h_all(&pool, pv_a);
       if(res != RES_OK) goto cleanup;
       time_current(&t_cy[2]);  /* after startD2h(A) */
 
-      /* 1c. Launch GPU(B) — H2D(B) + kernel(B) overlap with D2H(A) */
-      res = gpu_launch_async(&pool, pv_b, scn->s3d_view);
+      /* 1c. Launch GPU(B) RT+enc+cp — overlap with D2H(A) */
+#ifdef SDIS_DEBUG_CHECKS
+      assert_no_pending_result_before_dispatch(&pool, pv_b);
+#endif
+      res = gpu_launch_all(&pool, pv_b, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
       time_current(&t_cy[3]);  /* after launch(B) */
 
@@ -4056,33 +5534,38 @@ solve_camera_persistent_wavefront(
       pool.time_gpu_sync_s   += time_elapsed_sec(&t_cy[0], &t_cy[1]);
       pool.time_gpu_launch_s += time_elapsed_sec(&t_cy[1], &t_cy[3]);
 
-      /* 1d. Wait D2H(A) + CPU filter/retrace */
+      /* 1d. Wait D2H(A) for RT + enc + cp + distribute enc/cp results */
       time_current(&t_pl0);
-      res = gpu_wait_d2h(&pool, pv_a, scn->s3d_view);
+      res = gpu_wait_d2h_all(&pool, pv_a, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
       time_current(&t_pl1);
       pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
       t_cy[4] = t_pl1;  /* after waitD2h(A) */
 
-      /* 1e. CPU postprocess on A (distribute + enc_locate + cp) */
-      time_current(&t_pl0);
-      res = gpu_postprocess(&pool, pv_a, scn);
-      if(res != RES_OK) goto cleanup;
-      time_current(&t_pl1);
-      pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[5] = t_pl1;  /* after post(A) */
-
       pool.total_steps++;  /* view A completed one step */
 
-      /* 1f. CPU cascade + harvest + refill + pre_gpu on A */
+      /* 1e. O11 merged_pass on A (distribute+cascade+collect+harvest) */
       time_current(&t_pl0);
-      res = cpu_between(&pool, pv_a);
-      if(res != RES_OK) goto cleanup;
-      res = cpu_pre_gpu(&pool, pv_a);
-      if(res != RES_OK) goto cleanup;
+      { struct time t_mp0, t_mp1;
+        time_current(&t_mp0);
+        res = merged_pass(&pool, pv_a, scn);
+        if(res != RES_OK) goto cleanup;
+        time_current(&t_mp1);
+        pool.time_cascade_s += time_elapsed_sec(&t_mp0, &t_mp1);
+      }
+      { struct time t_cr0, t_cr1;
+        time_current(&t_cr0);
+        compact_active_paths(&pool, pv_a);
+        { size_t rc = 0;
+          res = refill_pool(&pool, pv_a, &rc);
+          if(res != RES_OK) goto cleanup;
+          if(rc > 0) compact_active_paths(&pool, pv_a); }
+        time_current(&t_cr1);
+        pool.time_harvest_s += time_elapsed_sec(&t_cr0, &t_cr1);
+      }
       time_current(&t_pl1);
       pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[6] = t_pl1;  /* after cpu(A) */
+      t_cy[5] = t_pl1;  /* after merged(A) */
 
       /* -- Housekeeping after A's step (timed) -- */
       time_current(&t_hk);
@@ -4144,65 +5627,66 @@ solve_camera_persistent_wavefront(
             (unsigned long long)pv_a->active_compact);
         }
       }
-      if(pool.total_steps > total_tasks * 1000) {
-        log_err(scn->dev,
-          "pipeline: infinite loop safety break at step %llu\n",
-          (unsigned long long)pool.total_steps);
-        res = RES_BAD_OP;
-        goto cleanup;
-      }
       { struct time t_hk_end; time_current(&t_hk_end);
         pool.time_housekeeping_s += time_elapsed_sec(&t_hk, &t_hk_end);
         t_hk = t_hk_end; } /* t_hk now = end of housekeeping A */
 
-      /* ════════ Phase 2: syncK(B) → d2h↓(B) → launch(A) → waitD2h(B) → post(B) → CPU(B) ════════ */
+      /* ════════ Phase 2: syncK(B) → d2h↓(B) → launch(A) → waitD2h(B) → O11 merged(B) ════════ */
 
-      /* 2a. Sync compute kernel only (no D2H yet) */
-      res = gpu_sync_kernel(&pool, pv_b);
+      /* 2a. Sync compute kernels: RT + enc + cp (no D2H yet) */
+      res = gpu_sync_kernel_all(&pool, pv_b);
       if(res != RES_OK) goto cleanup;
-      time_current(&t_cy[7]);  /* after syncKernel(B) */
+      time_current(&t_cy[6]);  /* after syncKernel(B) */
 
-      /* 2b. Start async D2H — returns immediately */
-      res = gpu_start_d2h(&pool, pv_b);
+      /* 2b. Start async D2H for RT + enc + cp — returns immediately */
+      res = gpu_start_d2h_all(&pool, pv_b);
       if(res != RES_OK) goto cleanup;
-      time_current(&t_cy[8]);  /* after startD2h(B) */
+      time_current(&t_cy[7]);  /* after startD2h(B) */
 
-      /* 2c. Launch GPU(A) — H2D(A) + kernel(A) overlap with D2H(B) */
-      res = gpu_launch_async(&pool, pv_a, scn->s3d_view);
+      /* 2c. Launch GPU(A) RT+enc+cp — overlap with D2H(B) */
+#ifdef SDIS_DEBUG_CHECKS
+      assert_no_pending_result_before_dispatch(&pool, pv_a);
+#endif
+      res = gpu_launch_all(&pool, pv_a, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
-      time_current(&t_cy[9]);  /* after launch(A) */
+      time_current(&t_cy[8]);  /* after launch(A) */
 
       /* Accumulate Phase 2 untimed GPU ops (t_hk = end of housekeeping A) */
-      pool.time_gpu_sync_s   += time_elapsed_sec(&t_hk, &t_cy[7]);
-      pool.time_gpu_launch_s += time_elapsed_sec(&t_cy[7], &t_cy[9]);
+      pool.time_gpu_sync_s   += time_elapsed_sec(&t_hk, &t_cy[6]);
+      pool.time_gpu_launch_s += time_elapsed_sec(&t_cy[6], &t_cy[8]);
 
-      /* 2d. Wait D2H(B) + CPU filter/retrace */
+      /* 2d. Wait D2H(B) for RT + enc + cp + distribute enc/cp results */
       time_current(&t_pl0);
-      res = gpu_wait_d2h(&pool, pv_b, scn->s3d_view);
+      res = gpu_wait_d2h_all(&pool, pv_b, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
       time_current(&t_pl1);
       pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[10] = t_pl1;  /* after waitD2h(B) */
-
-      /* 2e. CPU postprocess on B */
-      time_current(&t_pl0);
-      res = gpu_postprocess(&pool, pv_b, scn);
-      if(res != RES_OK) goto cleanup;
-      time_current(&t_pl1);
-      pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[11] = t_pl1;  /* after post(B) */
+      t_cy[9] = t_pl1;  /* after waitD2h(B) */
 
       pool.total_steps++;  /* view B completed one step */
 
-      /* 2f. CPU cascade + harvest + refill + pre_gpu on B */
+      /* 2e. O11 merged_pass on B */
       time_current(&t_pl0);
-      res = cpu_between(&pool, pv_b);
-      if(res != RES_OK) goto cleanup;
-      res = cpu_pre_gpu(&pool, pv_b);
-      if(res != RES_OK) goto cleanup;
+      { struct time t_mp0, t_mp1;
+        time_current(&t_mp0);
+        res = merged_pass(&pool, pv_b, scn);
+        if(res != RES_OK) goto cleanup;
+        time_current(&t_mp1);
+        pool.time_cascade_s += time_elapsed_sec(&t_mp0, &t_mp1);
+      }
+      { struct time t_cr0, t_cr1;
+        time_current(&t_cr0);
+        compact_active_paths(&pool, pv_b);
+        { size_t rc = 0;
+          res = refill_pool(&pool, pv_b, &rc);
+          if(res != RES_OK) goto cleanup;
+          if(rc > 0) compact_active_paths(&pool, pv_b); }
+        time_current(&t_cr1);
+        pool.time_harvest_s += time_elapsed_sec(&t_cr0, &t_cr1);
+      }
       time_current(&t_pl1);
       pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[12] = t_pl1;  /* after cpu(B) */
+      t_cy[10] = t_pl1;  /* after merged(B) */
 
       /* -- Housekeeping after B's step (timed) -- */
       time_current(&t_hk);
@@ -4264,40 +5748,30 @@ solve_camera_persistent_wavefront(
             (unsigned long long)pv_b->active_compact);
         }
       }
-      if(pool.total_steps > total_tasks * 1000) {
-        log_err(scn->dev,
-          "pipeline: infinite loop safety break at step %llu\n",
-          (unsigned long long)pool.total_steps);
-        res = RES_BAD_OP;
-        goto cleanup;
-      }
-
-      /* ════════ L3 Timeline output (STARDIS_PIPELINE_LOG=2) ════════ */
+      /* ════════ O11 Timeline output (STARDIS_PIPELINE_LOG=2) ════════ */
       {
         const char* env_tl = getenv("STARDIS_PIPELINE_LOG");
         env_tl="2";
-        if(env_tl && env_tl[0] == '2' && pool.total_steps % 500 == 0) {
+        if(env_tl && env_tl[0] == '2' && pool.total_steps % 1000 == 0) {
           double syncKA   = time_elapsed_sec(&t_cy[0],  &t_cy[1])  * 1000.0;
           double startDA  = time_elapsed_sec(&t_cy[1],  &t_cy[2])  * 1000.0;
           double launchB  = time_elapsed_sec(&t_cy[2],  &t_cy[3])  * 1000.0;
           double waitDA   = time_elapsed_sec(&t_cy[3],  &t_cy[4])  * 1000.0;
-          double postA    = time_elapsed_sec(&t_cy[4],  &t_cy[5])  * 1000.0;
-          double cpuA     = time_elapsed_sec(&t_cy[5],  &t_cy[6])  * 1000.0;
-          double syncKB   = time_elapsed_sec(&t_cy[6],  &t_cy[7])  * 1000.0;
-          double startDB  = time_elapsed_sec(&t_cy[7],  &t_cy[8])  * 1000.0;
-          double launchA  = time_elapsed_sec(&t_cy[8],  &t_cy[9])  * 1000.0;
-          double waitDB   = time_elapsed_sec(&t_cy[9],  &t_cy[10]) * 1000.0;
-          double postB    = time_elapsed_sec(&t_cy[10], &t_cy[11]) * 1000.0;
-          double cpuB     = time_elapsed_sec(&t_cy[11], &t_cy[12]) * 1000.0;
-          double cycle    = time_elapsed_sec(&t_cy[0],  &t_cy[12]) * 1000.0;
+          double cpuA     = time_elapsed_sec(&t_cy[4],  &t_cy[5])  * 1000.0;
+          double syncKB   = time_elapsed_sec(&t_cy[5],  &t_cy[6])  * 1000.0;
+          double startDB  = time_elapsed_sec(&t_cy[6],  &t_cy[7])  * 1000.0;
+          double launchA  = time_elapsed_sec(&t_cy[7],  &t_cy[8])  * 1000.0;
+          double waitDB   = time_elapsed_sec(&t_cy[8],  &t_cy[9])  * 1000.0;
+          double cpuB     = time_elapsed_sec(&t_cy[9],  &t_cy[10]) * 1000.0;
+          double cycle    = time_elapsed_sec(&t_cy[0],  &t_cy[10]) * 1000.0;
           log_info(scn->dev,
             "[TIMELINE] step=%llu "
-            "|syncKA=%.2f|startDA=%.2f|launchB=%.2f|waitDA=%.2f|postA=%.2f|cpuA=%.2f"
-            "|syncKB=%.2f|startDB=%.2f|launchA=%.2f|waitDB=%.2f|postB=%.2f|cpuB=%.2f"
+            "|syncKA=%.2f|startDA=%.2f|launchB=%.2f|waitDA=%.2f|cpuA=%.2f"
+            "|syncKB=%.2f|startDB=%.2f|launchA=%.2f|waitDB=%.2f|cpuB=%.2f"
             "|cycle=%.2fms raysA=%llu raysB=%llu\n",
             (unsigned long long)pool.total_steps,
-            syncKA, startDA, launchB, waitDA, postA, cpuA,
-            syncKB, startDB, launchA, waitDB, postB, cpuB,
+            syncKA, startDA, launchB, waitDA, cpuA,
+            syncKB, startDB, launchA, waitDB, cpuB,
             cycle,
             (unsigned long long)pv_a->ray_count,
             (unsigned long long)pv_b->ray_count);
@@ -4306,13 +5780,13 @@ solve_camera_persistent_wavefront(
 
       /* ════════ Dynamic merge check ════════ */
       if(should_merge(&pool)) {
-        /* Wait for all pending GPU calls */
-        if(pv_a->gpu_pending) {
-          res = gpu_wait_and_postprocess(&pool, pv_a, scn->s3d_view, scn);
+        /* Wait for all pending GPU calls (RT + enc + cp) */
+        if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
+          res = gpu_wait_download_all(&pool, pv_a, scn->s3d_view);
           if(res != RES_OK) goto cleanup;
         }
-        if(pv_b->gpu_pending) {
-          res = gpu_wait_and_postprocess(&pool, pv_b, scn->s3d_view, scn);
+        if(pv_b->gpu_pending || pv_b->enc_gpu_pending || pv_b->cp_gpu_pending) {
+          res = gpu_wait_download_all(&pool, pv_b, scn->s3d_view);
           if(res != RES_OK) goto cleanup;
         }
         log_info(scn->dev,
@@ -4330,21 +5804,23 @@ solve_camera_persistent_wavefront(
         pool.time_housekeeping_s += time_elapsed_sec(&t_hk, &t_hk_end); }
     } /* end dual-pool while */
 
-    /* ---- Drain: wait for last pending GPU calls ---- */
+    /* ---- Drain: wait for last pending GPU calls (RT + enc + cp) ---- */
     if(pool.num_active_views == 2) {
-      if(pv_a->gpu_pending) {
-        res = gpu_wait_and_postprocess(&pool, pv_a, scn->s3d_view, scn);
+      if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
+        res = gpu_wait_download_all(&pool, pv_a, scn->s3d_view);
         if(res != RES_OK) goto cleanup;
         pool.total_steps++;
-        res = cpu_between(&pool, pv_a);
+        res = merged_pass(&pool, pv_a, scn);
         if(res != RES_OK) goto cleanup;
+        compact_active_paths(&pool, pv_a);
       }
-      if(pv_b->gpu_pending) {
-        res = gpu_wait_and_postprocess(&pool, pv_b, scn->s3d_view, scn);
+      if(pv_b->gpu_pending || pv_b->enc_gpu_pending || pv_b->cp_gpu_pending) {
+        res = gpu_wait_download_all(&pool, pv_b, scn->s3d_view);
         if(res != RES_OK) goto cleanup;
         pool.total_steps++;
-        res = cpu_between(&pool, pv_b);
+        res = merged_pass(&pool, pv_b, scn);
         if(res != RES_OK) goto cleanup;
+        compact_active_paths(&pool, pv_b);
       }
     }
 
@@ -4379,166 +5855,33 @@ solve_camera_persistent_wavefront(
     struct pool_view* pv = &pool.views[0]; /* single-pool view */
     pool.total_steps++;
 
-    /* Step A: Stream compaction (M2.5) */
+    /* O11: merged_pass (distribute+cascade+collect+harvest in one scan) */
     time_current(&t_phase0);
-    compact_active_paths(&pool, pv);
-    time_current(&t_phase1);
-    pool.time_compact_s += time_elapsed_sec(&t_phase0, &t_phase1);
-
-    /* Step B: Collect ray requests — bucketed (B-4 M2) */
-    time_current(&t_phase0);
-    pv->ray_count = 0;
-    res = pool_collect_ray_requests_bucketed(&pool, pv);
-    if(res != RES_OK) goto cleanup;
-    time_current(&t_phase1);
-    pool.time_collect_s += time_elapsed_sec(&t_phase0, &t_phase1);
-
-    /* Step C: Batch trace via Phase B-1 (or L4 filtered path) */
-    time_current(&t_phase0);
-    if(pv->ray_count > 0) {
-      struct s3d_batch_trace_stats stats;
-      memset(&stats, 0, sizeof(stats));
-
-      if(pool.use_gpu_filter) {
-        /* L4: single-pool filtered trace (sync 3-step) — Plan E pinned */
-        res = s3d_scene_view_trace_rays_batch_ctx_filtered_pinned_async(
-          scn->s3d_view, pv->batch_ctx, pv->ray_count);
-        if(res != RES_OK) goto cleanup;
-        {
-          res = s3d_scene_view_trace_rays_batch_ctx_filtered_sync_kernel(
-            pv->batch_ctx);
-          if(res != RES_OK) goto cleanup;
-          /* Use CUDA event elapsed time for accurate GPU kernel measurement */
-          pool.trace_kernel_time_ms_sum +=
-            (double)s3d_batch_trace_context_get_last_kernel_ms(pv->batch_ctx);
-        }
-        res = s3d_scene_view_trace_rays_batch_ctx_filtered_start_d2h(
-          pv->batch_ctx, pv->ray_count);
-        if(res != RES_OK) goto cleanup;
-        res = s3d_scene_view_trace_rays_batch_ctx_filtered_wait_d2h(
-          scn->s3d_view, pv->batch_ctx,
-          pv->ray_requests, pv->ray_count,
-          pv->ray_hits, &stats);
-        if(res != RES_OK) goto cleanup;
-      } else {
-        res = s3d_scene_view_trace_rays_batch_ctx(
-          scn->s3d_view, pv->batch_ctx,
-          pv->ray_requests, pv->ray_count,
-          pv->ray_hits, &stats);
-        if(res != RES_OK) goto cleanup;
-      }
-
-      pool.total_rays_traced += pv->ray_count;
-
-      /* Promote per-view pending ray stats to pool (single-pool path) */
-      {
-        pool.rays_radiative           += pv->pending_rays_radiative;
-        pool.rays_conductive_ds       += pv->pending_rays_conductive_ds;
-        pool.rays_conductive_ds_retry += pv->pending_rays_conductive_ds_retry;
-        pool.rays_shadow              += pv->pending_rays_shadow;
-        pool.rays_enclosure           += pv->pending_rays_enclosure;
-        pool.rays_startup             += pv->pending_rays_startup;
-        pool.rays_other               += pv->pending_rays_other;
-      }
-
-      /* Experiment 7+8: accumulate per-call batch trace stats */
-      pool.trace_call_count++;
-      pool.trace_batch_size_sum += pv->ray_count;
-      if(pv->ray_count < pool.trace_batch_size_min)
-        pool.trace_batch_size_min = pv->ray_count;
-      if(pv->ray_count > pool.trace_batch_size_max)
-        pool.trace_batch_size_max = pv->ray_count;
-      pool.trace_batch_time_ms_sum   += stats.batch_time_ms;
-      pool.trace_post_time_ms_sum    += stats.postprocess_time_ms;
-      pool.trace_retrace_time_ms_sum += stats.retrace_time_ms;
-      pool.trace_retrace_accepted_sum += stats.retrace_accepted;
-      pool.trace_retrace_missed_sum   += stats.retrace_missed;
-      pool.trace_filter_rejected_sum  += stats.filter_rejected;
-    }
-    time_current(&t_phase1);
-    pool.time_trace_s += time_elapsed_sec(&t_phase0, &t_phase1);
-
-    /* Step D: Distribute ray results — bucketed dispatch (M3) */
-    time_current(&t_phase0);
-    res = pool_distribute_ray_results(&pool, pv, scn);
-    if(res != RES_OK) goto cleanup;
-    time_current(&t_phase1);
-    pool.time_distribute_s += time_elapsed_sec(&t_phase0, &t_phase1);
-
-    /* Step D2 (M10): Collect + dispatch + distribute enc_locate batch */
-    time_current(&t_phase0);
-    res = pool_collect_enc_locate_requests(&pool, pv);
-    if(res != RES_OK) goto cleanup;
-
-    if(pv->enc_locate_count > 0) {
-      struct s3d_batch_enc_stats enc_stats;
-      memset(&enc_stats, 0, sizeof(enc_stats));
-
-      res = s3d_scene_view_find_enclosure_batch_ctx(
-        scn->s3d_view, pv->enc_batch_ctx,
-        pv->enc_locate_requests, pv->enc_locate_count,
-        pv->enc_locate_results, &enc_stats);
-      if(res != RES_OK) goto cleanup;
-
-      /* Distribute prim_id + side to paths; enc_id resolution happens
-       * in step_enc_locate_result() during cascade (handles degenerate). */
-      res = pool_distribute_enc_locate_results(&pool, pv);
-      if(res != RES_OK) goto cleanup;
-
-      pool.enc_locates_total += pv->enc_locate_count;
-      pool.enc_locates_resolved += enc_stats.resolved;
-      pool.enc_locates_degenerate += enc_stats.degenerate;
-    }
-    time_current(&t_phase1);
-    pool.time_enc_locate_s += time_elapsed_sec(&t_phase0, &t_phase1);
-
-    /* Step D3 (M9): Collect + dispatch + distribute closest_point batch */
-    time_current(&t_phase0);
-    res = pool_collect_cp_requests(&pool, pv);
-    if(res != RES_OK) goto cleanup;
-
-    if(pv->cp_count > 0) {
-      struct s3d_batch_cp_stats cp_stats;
-      memset(&cp_stats, 0, sizeof(cp_stats));
-
-      res = s3d_scene_view_closest_point_batch_ctx(
-        scn->s3d_view, pv->cp_batch_ctx,
-        pv->cp_requests, pv->cp_count,
-        pv->cp_hits, &cp_stats);
-      if(res != RES_OK) goto cleanup;
-
-      res = pool_distribute_cp_results(&pool, pv);
-      if(res != RES_OK) goto cleanup;
-
-      pool.cp_total    += pv->cp_count;
-      pool.cp_accepted += cp_stats.batch_accepted;
-      pool.cp_requeried += cp_stats.requery_accepted;
-    }
-    time_current(&t_phase1);
-    pool.time_cp_s += time_elapsed_sec(&t_phase0, &t_phase1);
-
-    /* P0_OPT: SYNC POINT A removed — step functions write hot_arr directly */
-
-    /* Step E: Cascade non-ray steps (compact) */
-    time_current(&t_phase0);
-    res = pool_cascade_non_ray_steps_compact(&pool, pv, scn);
+    res = merged_pass(&pool, pv, scn);
     if(res != RES_OK) goto cleanup;
     time_current(&t_phase1);
     pool.time_cascade_s += time_elapsed_sec(&t_phase0, &t_phase1);
+    pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
-    /* P0_OPT: SYNC POINT B removed — step functions write hot_arr directly */
-
-    /* Step F+G: Harvest completed paths + refill (timed together) */
+    /* Compact + refill */
     time_current(&t_phase0);
-    compact_active_paths(&pool, pv); /* rebuild done_indices after cascade */
-    res = harvest_completed_paths(&pool, pv);
-    if(res != RES_OK) goto cleanup;
-
-    /* Step G: Refill pool with new tasks (M2) */
+    compact_active_paths(&pool, pv);
     res = refill_pool(&pool, pv, &refill_count);
     if(res != RES_OK) goto cleanup;
     time_current(&t_phase1);
     pool.time_harvest_s += time_elapsed_sec(&t_phase0, &t_phase1);
+
+    /* GPU trace RT+enc+cp (sync in single-pool camera mode) */
+    time_current(&t_phase0);
+#ifdef SDIS_DEBUG_CHECKS
+    assert_no_pending_result_before_dispatch(&pool, pv);
+#endif
+    res = gpu_launch_all(&pool, pv, scn->s3d_view);
+    if(res != RES_OK) goto cleanup;
+    res = gpu_wait_download_all(&pool, pv, scn->s3d_view);
+    if(res != RES_OK) goto cleanup;
+    time_current(&t_phase1);
+    pool.time_trace_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
     /* Steps H-L: Housekeeping (update_active, drain detect, diagnostics,
      * progress reporting, periodic logging, safety check) */
@@ -4605,16 +5948,7 @@ solve_camera_persistent_wavefront(
         pool.in_drain_phase ? "DRAIN" : "refill");
     }
 
-    /* Safety: prevent infinite loops */
-    if(pool.total_steps > total_tasks * 1000) {
-      log_err(scn->dev,
-        "persistent_wavefront: exceeded maximum step count (%llu). "
-        "%llu paths still active.\n",
-        (unsigned long long)pool.total_steps,
-        (unsigned long long)pool.active_count);
-      res = RES_BAD_OP;
-      goto cleanup;
-    }
+
 
     time_current(&t_phase1);
     pool.time_housekeeping_s += time_elapsed_sec(&t_phase0, &t_phase1);

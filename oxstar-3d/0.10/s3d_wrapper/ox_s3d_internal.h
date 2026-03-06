@@ -357,11 +357,59 @@ struct s3d_batch_cp_context {
     CudaBuffer<CPQuery>  d_queries;
     CudaBuffer<CPResult> d_results;
 
+    /* Async support: independent streams + events */
+    cudaStream_t  compute_stream;
+    cudaStream_t  transfer_stream;
+    cudaEvent_t   evt_upload_done;
+    cudaEvent_t   evt_kernel_done;
+    CUdeviceptr   params_ptr;
+    bool          params_allocated;
+
+    /* Pinned host memory for async H2D/D2H */
+    CPQuery*      h_queries_pinned;
+    CPResult*     h_results_pinned;
+
+    /* Async state */
+    bool          async_pending;
+    bool          d2h_pending;
+    size_t        async_count;
+
     s3d_batch_cp_context(size_t max)
-        : max_queries(max) {
+        : max_queries(max)
+        , compute_stream(nullptr)
+        , transfer_stream(nullptr)
+        , evt_upload_done(nullptr)
+        , evt_kernel_done(nullptr)
+        , params_ptr(0)
+        , params_allocated(false)
+        , h_queries_pinned(nullptr)
+        , h_results_pinned(nullptr)
+        , async_pending(false)
+        , d2h_pending(false)
+        , async_count(0)
+    {
         d_queries.alloc(static_cast<unsigned int>(max));
         d_results.alloc(static_cast<unsigned int>(max));
+        CUDA_CHECK(cudaStreamCreate(&compute_stream));
+        CUDA_CHECK(cudaStreamCreate(&transfer_stream));
+        CUDA_CHECK(cudaEventCreateWithFlags(&evt_upload_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreate(&evt_kernel_done));
+        CUDA_CHECK(cudaHostAlloc(&h_queries_pinned, max * sizeof(CPQuery),  cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&h_results_pinned, max * sizeof(CPResult), cudaHostAllocDefault));
     }
+
+    ~s3d_batch_cp_context() {
+        if (params_ptr) { cudaFree(reinterpret_cast<void*>(params_ptr)); params_ptr = 0; }
+        if (h_queries_pinned) { cudaFreeHost(h_queries_pinned); h_queries_pinned = nullptr; }
+        if (h_results_pinned) { cudaFreeHost(h_results_pinned); h_results_pinned = nullptr; }
+        if (evt_upload_done)  { cudaEventDestroy(evt_upload_done);  evt_upload_done  = nullptr; }
+        if (evt_kernel_done)  { cudaEventDestroy(evt_kernel_done);  evt_kernel_done  = nullptr; }
+        if (transfer_stream)  { cudaStreamDestroy(transfer_stream); transfer_stream = nullptr; }
+        if (compute_stream)   { cudaStreamDestroy(compute_stream);  compute_stream  = nullptr; }
+    }
+
+    s3d_batch_cp_context(const s3d_batch_cp_context&) = delete;
+    s3d_batch_cp_context& operator=(const s3d_batch_cp_context&) = delete;
 };
 
 struct s3d_batch_enc_context {
@@ -369,11 +417,80 @@ struct s3d_batch_enc_context {
     CudaBuffer<EnclosureQuery>   d_queries;
     CudaBuffer<EnclosureResult>  d_results;
 
+    /* Decomposed enc_locate GPU work: CP step + RT step */
+    CudaBuffer<CPQuery>   d_cp_queries;
+    CudaBuffer<CPResult>  d_cp_results;
+    CudaBuffer<Ray>       d_rays;
+    CudaBuffer<HitResult> d_hits;
+
+    /* Async support: independent streams + events */
+    cudaStream_t  compute_stream;
+    cudaStream_t  transfer_stream;
+    cudaEvent_t   evt_upload_done;
+    cudaEvent_t   evt_kernels_done;
+    CUdeviceptr   params_ptr_cp;
+    CUdeviceptr   params_ptr_rt;
+    bool          params_allocated;
+
+    /* Pinned host memory for async H2D/D2H */
+    CPQuery*      h_cp_queries_pinned;
+    CPResult*     h_cp_results_pinned;
+    Ray*          h_rays_pinned;
+    HitResult*    h_rt_results_pinned;
+
+    /* Async state */
+    bool          async_pending;
+    bool          d2h_pending;
+    size_t        async_count;
+
     s3d_batch_enc_context(size_t max)
-        : max_queries(max) {
+        : max_queries(max)
+        , compute_stream(nullptr)
+        , transfer_stream(nullptr)
+        , evt_upload_done(nullptr)
+        , evt_kernels_done(nullptr)
+        , params_ptr_cp(0)
+        , params_ptr_rt(0)
+        , params_allocated(false)
+        , h_cp_queries_pinned(nullptr)
+        , h_cp_results_pinned(nullptr)
+        , h_rays_pinned(nullptr)
+        , h_rt_results_pinned(nullptr)
+        , async_pending(false)
+        , d2h_pending(false)
+        , async_count(0)
+    {
         d_queries.alloc(static_cast<unsigned int>(max));
         d_results.alloc(static_cast<unsigned int>(max));
+        d_cp_queries.alloc(static_cast<unsigned int>(max));
+        d_cp_results.alloc(static_cast<unsigned int>(max));
+        d_rays.alloc(static_cast<unsigned int>(max));
+        d_hits.alloc(static_cast<unsigned int>(max));
+        CUDA_CHECK(cudaStreamCreate(&compute_stream));
+        CUDA_CHECK(cudaStreamCreate(&transfer_stream));
+        CUDA_CHECK(cudaEventCreateWithFlags(&evt_upload_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreate(&evt_kernels_done));
+        CUDA_CHECK(cudaHostAlloc(&h_cp_queries_pinned, max * sizeof(CPQuery),  cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&h_cp_results_pinned, max * sizeof(CPResult), cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&h_rays_pinned,       max * sizeof(Ray),       cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&h_rt_results_pinned, max * sizeof(HitResult), cudaHostAllocDefault));
     }
+
+    ~s3d_batch_enc_context() {
+        if (params_ptr_cp) { cudaFree(reinterpret_cast<void*>(params_ptr_cp)); params_ptr_cp = 0; }
+        if (params_ptr_rt) { cudaFree(reinterpret_cast<void*>(params_ptr_rt)); params_ptr_rt = 0; }
+        if (h_cp_queries_pinned) { cudaFreeHost(h_cp_queries_pinned); h_cp_queries_pinned = nullptr; }
+        if (h_cp_results_pinned) { cudaFreeHost(h_cp_results_pinned); h_cp_results_pinned = nullptr; }
+        if (h_rays_pinned)       { cudaFreeHost(h_rays_pinned);       h_rays_pinned       = nullptr; }
+        if (h_rt_results_pinned) { cudaFreeHost(h_rt_results_pinned); h_rt_results_pinned = nullptr; }
+        if (evt_upload_done)  { cudaEventDestroy(evt_upload_done);  evt_upload_done  = nullptr; }
+        if (evt_kernels_done) { cudaEventDestroy(evt_kernels_done); evt_kernels_done = nullptr; }
+        if (transfer_stream)  { cudaStreamDestroy(transfer_stream); transfer_stream = nullptr; }
+        if (compute_stream)   { cudaStreamDestroy(compute_stream);  compute_stream  = nullptr; }
+    }
+
+    s3d_batch_enc_context(const s3d_batch_enc_context&) = delete;
+    s3d_batch_enc_context& operator=(const s3d_batch_enc_context&) = delete;
 };
 
 /* ================================================================

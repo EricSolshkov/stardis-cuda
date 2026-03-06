@@ -226,6 +226,11 @@ public:
     void closestPointBatch(CPQuery* d_queries, CPResult* d_results,
                            unsigned int count, CUstream stream = 0);
 
+    /* Overload accepting external params buffer (async-safe, no per-call malloc) */
+    void closestPointBatch(CPQuery* d_queries, CPResult* d_results,
+                           unsigned int count, CUstream stream,
+                           CUdeviceptr external_params_ptr);
+
     std::vector<CPResult> closestPointBatch(const std::vector<CPQuery>& queries);
 
     /* ================================================================

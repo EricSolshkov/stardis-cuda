@@ -3227,6 +3227,266 @@ res_T s3d_scene_view_closest_point_batch_ctx(s3d_scene_view* sv,
     return batch_cp_impl(sv, requests, nqueries, hits, stats);
 }
 
+/* ===========================================================================
+ * Async CP pipeline: async → sync_kernel → start_d2h → wait_d2h
+ * Mirrors the RT async pattern from batch_trace_filtered_pinned_async_impl.
+ * =========================================================================*/
+
+static res_T batch_cp_async_impl(
+    s3d_scene_view* sv,
+    s3d_batch_cp_context* ctx,
+    const s3d_cp_request* requests,
+    size_t nqueries)
+{
+    res_T rc = ensure_built(sv);
+    if (rc != RES_OK) return rc;
+
+    bool have_mesh = sv->query_mesh_set;
+
+    if (!have_mesh || nqueries == 0) {
+        ctx->async_pending = false;
+        ctx->async_count   = nqueries;
+        return RES_OK;
+    }
+
+    /* Ensure search_radius is sufficient (must be sync — may trigger GAS rebuild) */
+    float max_radius = 0.0f;
+    for (size_t i = 0; i < nqueries; i++) {
+        float r = requests[i].radius;
+        if (!std::isfinite(r) || r > 1e30f) r = 1e30f;
+        if (r > max_radius) max_radius = r;
+    }
+    if (max_radius > sv->search_radius) {
+        sv->search_radius = max_radius;
+        sv->tracer.setSearchRadius(sv->search_radius);
+        sv->tracer.rebuildQueryGAS(/*compact=*/true);
+    }
+
+    /* Convert s3d_cp_request → CPQuery into pinned buffer */
+    unsigned int count = static_cast<unsigned int>(nqueries);
+    for (size_t i = 0; i < nqueries; i++) {
+        ctx->h_queries_pinned[i].position = make_float3(
+            requests[i].pos[0], requests[i].pos[1], requests[i].pos[2]);
+        ctx->h_queries_pinned[i].radius = requests[i].radius;
+    }
+
+    /* H2D upload on transfer_stream */
+    ctx->d_queries.uploadAsync(ctx->h_queries_pinned, count, ctx->transfer_stream);
+    CUDA_CHECK(cudaEventRecord(ctx->evt_upload_done, ctx->transfer_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->compute_stream, ctx->evt_upload_done, 0));
+
+    /* Ensure per-ctx params buffer */
+    if (!ctx->params_allocated) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ctx->params_ptr),
+                              sizeof(UnifiedParams)));
+        ctx->params_allocated = true;
+    }
+
+    /* CP kernel launch on compute_stream */
+    sv->tracer.closestPointBatch(
+        ctx->d_queries.get(), ctx->d_results.get(), count,
+        ctx->compute_stream, ctx->params_ptr);
+    CUDA_CHECK(cudaEventRecord(ctx->evt_kernel_done, ctx->compute_stream));
+
+    ctx->async_pending = true;
+    ctx->async_count   = nqueries;
+    return RES_OK;
+}
+
+static res_T batch_cp_sync_kernel_impl(s3d_batch_cp_context* ctx)
+{
+    if (ctx->async_pending) {
+        cudaStreamSynchronize(ctx->compute_stream);
+        ctx->async_pending = false;
+    }
+    return RES_OK;
+}
+
+static res_T batch_cp_start_d2h_impl(s3d_batch_cp_context* ctx, size_t nqueries)
+{
+    if (nqueries == 0) { ctx->d2h_pending = false; return RES_OK; }
+    unsigned int count = static_cast<unsigned int>(nqueries);
+    /* D2H: transfer_stream waits for kernel, then downloads */
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->transfer_stream, ctx->evt_kernel_done, 0));
+    ctx->d_results.downloadAsync(ctx->h_results_pinned, count, ctx->transfer_stream);
+    ctx->d2h_pending = true;
+    return RES_OK;
+}
+
+static res_T batch_cp_wait_d2h_impl(
+    s3d_scene_view* sv,
+    s3d_batch_cp_context* ctx,
+    const s3d_cp_request* requests,
+    size_t nqueries,
+    s3d_hit* hits,
+    s3d_batch_cp_stats* stats)
+{
+    if (stats) memset(stats, 0, sizeof(*stats));
+    if (stats) stats->total_queries = nqueries;
+
+    bool have_mesh    = sv->query_mesh_set;
+    bool have_spheres = !sv->query_sphere_entries.empty();
+
+    if ((!have_mesh && !have_spheres) || nqueries == 0) {
+        for (size_t i = 0; i < nqueries; i++) hits[i] = S3D_HIT_NULL;
+        if (stats) stats->batch_accepted = nqueries;
+        ctx->d2h_pending = false;
+        return RES_OK;
+    }
+
+    double t0 = now_ms();
+
+    /* Wait for D2H transfer */
+    if (ctx->d2h_pending) {
+        cudaStreamSynchronize(ctx->transfer_stream);
+        ctx->d2h_pending = false;
+    }
+
+    double t1 = now_ms();
+    if (stats) stats->batch_time_ms = t1 - t0;
+
+    /* CPU post-process: identical to batch_cp_impl post-process section */
+    for (size_t i = 0; i < nqueries; i++) {
+        s3d_hit mesh_hit = S3D_HIT_NULL;
+        s3d_hit_filter_function_T mf_func = nullptr;
+        void* mf_data = nullptr;
+
+        if (have_mesh) {
+            const CPResult& c = ctx->h_results_pinned[i];
+            if (c.distance >= 0.0f) {
+                unsigned shape_id = S3D_INVALID_ID;
+                unsigned local_prim = c.prim_idx;
+                s3d_shape* shape = nullptr;
+                s3d_shape* inst_shape = nullptr;
+
+                for (auto& pr : sv->query_prim_ranges) {
+                    if (c.prim_idx >= pr.prim_offset &&
+                        c.prim_idx < pr.prim_offset + pr.prim_count) {
+                        local_prim = c.prim_idx - pr.prim_offset;
+                        shape      = pr.shape;
+                        inst_shape = pr.inst_shape;
+                        if (shape) shape_id = shape->id;
+                        mf_func = pr.filter_func;
+                        mf_data = pr.filter_data;
+                        break;
+                    }
+                }
+
+                mesh_hit.prim.prim_id       = local_prim;
+                mesh_hit.prim.geom_id       = shape_id;
+                mesh_hit.prim.inst_id       = inst_shape
+                    ? (inst_shape->id != S3D_INVALID_ID ? inst_shape->id : S3D_INVALID_ID)
+                    : S3D_INVALID_ID;
+                mesh_hit.prim.scene_prim_id = c.prim_idx;
+                mesh_hit.prim.shape__       = shape;
+                mesh_hit.prim.inst__        = inst_shape;
+                mesh_hit.normal[0] = c.normal[0];
+                mesh_hit.normal[1] = c.normal[1];
+                mesh_hit.normal[2] = c.normal[2];
+                if (shape && shape->type == OX_SHAPE_MESH && !shape->positions.empty() && !shape->indices.empty()) {
+                    if (inst_shape) {
+                        double qp[3] = { (double)requests[i].pos[0], (double)requests[i].pos[1], (double)requests[i].pos[2] };
+                        double ql[3];
+                        inverse_transform_point_d(inst_shape->transform, qp, ql);
+                        unsigned i0 = shape->indices[local_prim*3+0];
+                        unsigned i1 = shape->indices[local_prim*3+1];
+                        unsigned i2 = shape->indices[local_prim*3+2];
+                        double v0d[3], v1d[3], v2d[3];
+                        for (int k = 0; k < 3; k++) {
+                            v0d[k] = (double)shape->positions[i0*3+k];
+                            v1d[k] = (double)shape->positions[i1*3+k];
+                            v2d[k] = (double)shape->positions[i2*3+k];
+                        }
+                        double proj[3], w_d, u_d;
+                        closestPointOnTriHost(ql, v0d, v1d, v2d, proj, w_d, u_d);
+                        mesh_hit.uv[0] = (float)w_d;
+                        mesh_hit.uv[1] = (float)u_d;
+                    } else {
+                        float cp_local[3] = { c.closest_pos[0], c.closest_pos[1], c.closest_pos[2] };
+                        backcompute_bary_double(shape->positions.data(), shape->indices.data(), local_prim,
+                                                cp_local, c.uv[0], c.uv[1],
+                                                mesh_hit.uv[0], mesh_hit.uv[1]);
+                    }
+                } else {
+                    mesh_hit.uv[0] = c.uv[0];
+                    mesh_hit.uv[1] = c.uv[1];
+                }
+                mesh_hit.distance = c.distance;
+
+                if (mf_func) {
+                    float dir[3] = {
+                        c.closest_pos[0] - requests[i].pos[0],
+                        c.closest_pos[1] - requests[i].pos[1],
+                        c.closest_pos[2] - requests[i].pos[2]
+                    };
+                    float rng[2] = { 0.0f, requests[i].radius };
+                    int rej = mf_func(&mesh_hit, requests[i].pos, dir, rng,
+                                       requests[i].query_data, mf_data);
+                    if (rej != 0) {
+                        cp_filter_retry(sv, requests[i].pos, requests[i].radius,
+                                        requests[i].query_data, &mesh_hit);
+                    }
+                }
+            }
+        }
+
+        s3d_hit sphere_hit = S3D_HIT_NULL;
+        if (have_spheres) {
+            float sph_radius = requests[i].radius;
+            cp_try_all_spheres(sv, requests[i].pos, &sph_radius,
+                               requests[i].radius, requests[i].query_data, &sphere_hit);
+        }
+
+        if (!S3D_HIT_NONE(&mesh_hit) && !S3D_HIT_NONE(&sphere_hit)) {
+            hits[i] = (mesh_hit.distance <= sphere_hit.distance) ? mesh_hit : sphere_hit;
+        } else if (!S3D_HIT_NONE(&mesh_hit)) {
+            hits[i] = mesh_hit;
+        } else if (!S3D_HIT_NONE(&sphere_hit)) {
+            hits[i] = sphere_hit;
+        } else {
+            hits[i] = S3D_HIT_NULL;
+            if (stats) stats->batch_accepted++;
+            continue;
+        }
+        if (stats) stats->batch_accepted++;
+    }
+
+    double t2 = now_ms();
+    if (stats) stats->postprocess_time_ms = t2 - t1;
+    return RES_OK;
+}
+
+res_T s3d_scene_view_closest_point_batch_ctx_async(
+    s3d_scene_view* sv, s3d_batch_cp_context* ctx,
+    const s3d_cp_request* requests, size_t nqueries)
+{
+    if (!sv || !ctx || !requests) return RES_BAD_ARG;
+    if (nqueries == 0) { ctx->async_pending = false; ctx->async_count = 0; return RES_OK; }
+    return batch_cp_async_impl(sv, ctx, requests, nqueries);
+}
+
+res_T s3d_scene_view_closest_point_batch_ctx_sync_kernel(s3d_batch_cp_context* ctx)
+{
+    if (!ctx) return RES_BAD_ARG;
+    return batch_cp_sync_kernel_impl(ctx);
+}
+
+res_T s3d_scene_view_closest_point_batch_ctx_start_d2h(
+    s3d_batch_cp_context* ctx, size_t nqueries)
+{
+    if (!ctx) return RES_BAD_ARG;
+    return batch_cp_start_d2h_impl(ctx, nqueries);
+}
+
+res_T s3d_scene_view_closest_point_batch_ctx_wait_d2h(
+    s3d_scene_view* sv, s3d_batch_cp_context* ctx,
+    const s3d_cp_request* requests, size_t nqueries,
+    s3d_hit* hits, s3d_batch_cp_stats* stats)
+{
+    if (!sv || !ctx || !requests || !hits) return RES_BAD_ARG;
+    return batch_cp_wait_d2h_impl(sv, ctx, requests, nqueries, hits, stats);
+}
+
 /* ================================================================
  * Batch enclosure locate
  * ================================================================ */
@@ -3299,6 +3559,204 @@ res_T s3d_scene_view_find_enclosure_batch_ctx(s3d_scene_view* sv,
     if (!sv || !requests || !results) return RES_BAD_ARG;
     if (nqueries == 0) return RES_OK;
     return batch_enc_impl(sv, requests, nqueries, results, stats);
+}
+
+/* ===========================================================================
+ * Async enc_locate pipeline: async → sync_kernel → start_d2h → wait_d2h
+ *
+ * Decomposed enc_locate:
+ *   Step 1 (CP kernel): query_pos → nearest prim (prim_idx, distance)
+ *   Step 2 (RT kernel): query_pos + fixed +X → hit/miss (side detection)
+ * Both steps are independent — launched back-to-back, no inter-step sync.
+ * CPU combines results after D2H in wait_d2h.
+ * =========================================================================*/
+
+static res_T batch_enc_async_impl(
+    s3d_scene_view* sv,
+    s3d_batch_enc_context* ctx,
+    const s3d_enc_locate_request* requests,
+    size_t nqueries)
+{
+    res_T rc = ensure_built(sv);
+    if (rc != RES_OK) return rc;
+
+    if (nqueries == 0) {
+        ctx->async_pending = false;
+        ctx->async_count   = 0;
+        return RES_OK;
+    }
+
+    unsigned int count = static_cast<unsigned int>(nqueries);
+
+    /* Build CP queries and RT rays from enc_locate requests into pinned buffers */
+    for (size_t i = 0; i < nqueries; i++) {
+        /* CP query: find nearest surface primitive */
+        ctx->h_cp_queries_pinned[i].position = make_float3(
+            requests[i].pos[0], requests[i].pos[1], requests[i].pos[2]);
+        ctx->h_cp_queries_pinned[i].radius = 1e30f;  /* unlimited search */
+
+        /* RT ray: cast +X for side detection (doesn't depend on CP result) */
+        ctx->h_rays_pinned[i].origin    = make_float3(
+            requests[i].pos[0], requests[i].pos[1], requests[i].pos[2]);
+        ctx->h_rays_pinned[i].direction = make_float3(1.0f, 0.0f, 0.0f);
+        ctx->h_rays_pinned[i].tmin      = 1e-6f;
+        ctx->h_rays_pinned[i].tmax      = 1e30f;
+    }
+
+    /* H2D uploads on transfer_stream */
+    ctx->d_cp_queries.uploadAsync(ctx->h_cp_queries_pinned, count, ctx->transfer_stream);
+    ctx->d_rays.uploadAsync(ctx->h_rays_pinned, count, ctx->transfer_stream);
+    CUDA_CHECK(cudaEventRecord(ctx->evt_upload_done, ctx->transfer_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->compute_stream, ctx->evt_upload_done, 0));
+
+    /* Ensure per-ctx params buffers */
+    if (!ctx->params_allocated) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ctx->params_ptr_cp),
+                              sizeof(UnifiedParams)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ctx->params_ptr_rt),
+                              sizeof(UnifiedParams)));
+        ctx->params_allocated = true;
+    }
+
+    /* Step 1: CP kernel on compute_stream */
+    sv->tracer.closestPointBatch(
+        ctx->d_cp_queries.get(), ctx->d_cp_results.get(), count,
+        ctx->compute_stream, ctx->params_ptr_cp);
+
+    /* Step 2: RT kernel on compute_stream (back-to-back, no sync needed) */
+    sv->tracer.traceBatch(
+        ctx->d_rays.get(), ctx->d_hits.get(), count,
+        ctx->compute_stream, ctx->params_ptr_rt);
+
+    CUDA_CHECK(cudaEventRecord(ctx->evt_kernels_done, ctx->compute_stream));
+
+    ctx->async_pending = true;
+    ctx->async_count   = nqueries;
+    return RES_OK;
+}
+
+static res_T batch_enc_sync_kernel_impl(s3d_batch_enc_context* ctx)
+{
+    if (ctx->async_pending) {
+        cudaStreamSynchronize(ctx->compute_stream);
+        ctx->async_pending = false;
+    }
+    return RES_OK;
+}
+
+static res_T batch_enc_start_d2h_impl(s3d_batch_enc_context* ctx, size_t nqueries)
+{
+    if (nqueries == 0) { ctx->d2h_pending = false; return RES_OK; }
+    unsigned int count = static_cast<unsigned int>(nqueries);
+    /* D2H: transfer_stream waits for both kernels, then downloads CP + RT results */
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->transfer_stream, ctx->evt_kernels_done, 0));
+    ctx->d_cp_results.downloadAsync(ctx->h_cp_results_pinned, count, ctx->transfer_stream);
+    ctx->d_hits.downloadAsync(ctx->h_rt_results_pinned, count, ctx->transfer_stream);
+    ctx->d2h_pending = true;
+    return RES_OK;
+}
+
+static res_T batch_enc_wait_d2h_impl(
+    s3d_scene_view* sv,
+    s3d_batch_enc_context* ctx,
+    const s3d_enc_locate_request* /*requests*/,
+    size_t nqueries,
+    s3d_enc_locate_result* results,
+    s3d_batch_enc_stats* stats)
+{
+    if (stats) memset(stats, 0, sizeof(*stats));
+    if (stats) stats->total_queries = nqueries;
+
+    if (nqueries == 0) {
+        ctx->d2h_pending = false;
+        return RES_OK;
+    }
+
+    double t0 = now_ms();
+
+    /* Wait for D2H of both CP and RT results */
+    if (ctx->d2h_pending) {
+        cudaStreamSynchronize(ctx->transfer_stream);
+        ctx->d2h_pending = false;
+    }
+
+    double t1 = now_ms();
+    if (stats) stats->batch_time_ms = t1 - t0;
+
+    /* CPU combine: CP (prim_idx, distance) + RT (side detection) → s3d_enc_locate_result */
+    const float DEGENERATE_THRESHOLD = 1e-8f;
+
+    for (size_t i = 0; i < nqueries; i++) {
+        const CPResult& cp = ctx->h_cp_results_pinned[i];
+        const HitResult& rt = ctx->h_rt_results_pinned[i];
+
+        if (cp.distance < 0.0f) {
+            /* No surface found */
+            results[i].prim_id  = -1;
+            results[i].distance = -1.0f;
+            results[i].side     = -1;
+            results[i].enc_id   = S3D_INVALID_ID;
+            if (stats) stats->missed++;
+            continue;
+        }
+
+        results[i].prim_id  = (int32_t)cp.prim_idx;
+        results[i].distance = cp.distance;
+        results[i].enc_id   = S3D_INVALID_ID; /* Solver resolves via prim_props */
+
+        /* Degenerate: too close to surface */
+        if (cp.distance < DEGENERATE_THRESHOLD) {
+            results[i].side = -1;
+            if (stats) stats->degenerate++;
+            continue;
+        }
+
+        /* Determine side from RT hit */
+        if (rt.t < 0.0f) {
+            /* Ray missed — outside */
+            results[i].side = 0;
+        } else {
+            /* dot(ray_dir, hit_normal) — ray_dir = (1,0,0) → dot = normal[0] */
+            float dot_dn = rt.normal[0];
+            results[i].side = (dot_dn < 0.0f) ? 0 : 1;
+        }
+        if (stats) stats->resolved++;
+    }
+
+    double t2 = now_ms();
+    if (stats) stats->postprocess_time_ms = t2 - t1;
+
+    return RES_OK;
+}
+
+res_T s3d_scene_view_find_enclosure_batch_ctx_async(
+    s3d_scene_view* sv, s3d_batch_enc_context* ctx,
+    const s3d_enc_locate_request* requests, size_t nqueries)
+{
+    if (!sv || !ctx || !requests) return RES_BAD_ARG;
+    return batch_enc_async_impl(sv, ctx, requests, nqueries);
+}
+
+res_T s3d_scene_view_find_enclosure_batch_ctx_sync_kernel(s3d_batch_enc_context* ctx)
+{
+    if (!ctx) return RES_BAD_ARG;
+    return batch_enc_sync_kernel_impl(ctx);
+}
+
+res_T s3d_scene_view_find_enclosure_batch_ctx_start_d2h(
+    s3d_batch_enc_context* ctx, size_t nqueries)
+{
+    if (!ctx) return RES_BAD_ARG;
+    return batch_enc_start_d2h_impl(ctx, nqueries);
+}
+
+res_T s3d_scene_view_find_enclosure_batch_ctx_wait_d2h(
+    s3d_scene_view* sv, s3d_batch_enc_context* ctx,
+    const s3d_enc_locate_request* requests, size_t nqueries,
+    s3d_enc_locate_result* results, s3d_batch_enc_stats* stats)
+{
+    if (!sv || !ctx || !results) return RES_BAD_ARG;
+    return batch_enc_wait_d2h_impl(sv, ctx, requests, nqueries, results, stats);
 }
 
 /* ================================================================

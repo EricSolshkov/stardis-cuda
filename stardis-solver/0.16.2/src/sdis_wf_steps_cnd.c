@@ -682,6 +682,10 @@ step_cnd_wos_closest_result(struct path_state* p, struct path_hot* hot, struct s
   }
 
 exit:
+  /* O11_SAFETY: one-shot — poison consumed cached_hit to detect double-read */
+#ifdef SDIS_DEBUG_CHECKS
+  p->locals.cnd_wos.cached_hit.distance = -1e38f;
+#endif
   return res;
 error:
   hot->phase = (uint8_t)PATH_DONE;
@@ -749,6 +753,11 @@ step_cnd_wos_diffusion_check_result(struct path_state* p, struct path_hot* hot, 
     /* Position invalid — need fallback trace_ray */
     step_cnd_wos_fallback_trace(p, hot);
   }
+
+  /* O11_SAFETY: one-shot — poison consumed cached_hit to detect double-read */
+#ifdef SDIS_DEBUG_CHECKS
+  p->locals.cnd_wos.cached_hit.distance = -1e38f;
+#endif
 
   return res;
 }

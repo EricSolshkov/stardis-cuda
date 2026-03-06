@@ -1700,6 +1700,33 @@ void UnifiedTracer::closestPointBatch(
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_params)));
 }
 
+/* Overload with external params buffer — async-safe, no per-call malloc/free.
+ * Each batch context pre-allocates its own params_ptr. */
+void UnifiedTracer::closestPointBatch(
+    CPQuery* d_queries, CPResult* d_results,
+    unsigned int count, CUstream stream,
+    CUdeviceptr external_params_ptr)
+{
+    UnifiedParams lp = {};
+    lp.handle      = m_aabb_gas_handle;
+    lp.count       = count;
+    lp.cp_queries  = d_queries;
+    lp.cp_results  = d_results;
+    lp.nn_vertices = m_d_nn_vertices.get();
+    lp.nn_indices  = m_d_nn_indices.get();
+
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(external_params_ptr),
+                               &lp, sizeof(UnifiedParams),
+                               cudaMemcpyHostToDevice, stream));
+
+    unsigned int w, h;
+    if (count <= 65536) { w = count; h = 1; }
+    else { w = 8192; h = (count + w - 1) / w; }
+
+    OPTIX_CHECK(optixLaunch(m_pipeline, stream, external_params_ptr,
+                            sizeof(UnifiedParams), &m_sbt_cp, w, h, 1));
+}
+
 std::vector<CPResult> UnifiedTracer::closestPointBatch(const std::vector<CPQuery>& queries)
 {
     unsigned int count = static_cast<unsigned int>(queries.size());

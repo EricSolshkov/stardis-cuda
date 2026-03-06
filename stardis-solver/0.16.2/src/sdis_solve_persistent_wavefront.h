@@ -230,6 +230,8 @@ struct pool_view {
 
   /* ---- Async tracking (P4) ---- */
   int gpu_pending;           /* 1 = async GPU trace in flight        */
+  int enc_gpu_pending;       /* 1 = async enc_locate in flight       */
+  int cp_gpu_pending;        /* 1 = async closest_point in flight    */
 
   /* ---- Per-step pending ray stats (accumulated in collect, promoted
    *      to pool counters only when trace completes in wait_and_postprocess) */
@@ -437,6 +439,12 @@ struct wavefront_pool {
 
   /* === L4: GPU inline filter mode === */
   int use_gpu_filter;  /* 1 = filtered trace (Mode A), 0 = legacy retrace */
+
+  /* Pre-allocated per-thread ray buffers for OMP merged_pass.
+   * Lazily allocated on first merged_pass call, freed in pool_destroy.
+   * Each element is a malloc'd struct tl_ray_entry[TL_RAY_BUF_MAX]. */
+  void** tl_ray_bufs;   /* [tl_ray_nbufs], cast to struct tl_ray_entry* */
+  int tl_ray_nbufs;     /* number of allocated buffers   */
 };
 
 /*******************************************************************************

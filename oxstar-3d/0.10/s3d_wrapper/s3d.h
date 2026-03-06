@@ -554,6 +554,25 @@ S3D_API res_T s3d_scene_view_closest_point_batch_ctx(
   const struct s3d_cp_request* requests, size_t nqueries,
   struct s3d_hit* hits, struct s3d_batch_cp_stats* stats);
 
+/* ---- Async CP pipeline (mirrors RT async pattern) ---- */
+
+S3D_API res_T s3d_scene_view_closest_point_batch_ctx_async(
+  struct s3d_scene_view* scnview,
+  struct s3d_batch_cp_context* ctx,
+  const struct s3d_cp_request* requests, size_t nqueries);
+
+S3D_API res_T s3d_scene_view_closest_point_batch_ctx_sync_kernel(
+  struct s3d_batch_cp_context* ctx);
+
+S3D_API res_T s3d_scene_view_closest_point_batch_ctx_start_d2h(
+  struct s3d_batch_cp_context* ctx, size_t nqueries);
+
+S3D_API res_T s3d_scene_view_closest_point_batch_ctx_wait_d2h(
+  struct s3d_scene_view* scnview,
+  struct s3d_batch_cp_context* ctx,
+  const struct s3d_cp_request* requests, size_t nqueries,
+  struct s3d_hit* hits, struct s3d_batch_cp_stats* stats);
+
 /*******************************************************************************
  * Batch Point-in-Enclosure Query
  ******************************************************************************/
@@ -592,6 +611,25 @@ S3D_API void s3d_batch_enc_context_destroy(
   struct s3d_batch_enc_context* ctx);
 
 S3D_API res_T s3d_scene_view_find_enclosure_batch_ctx(
+  struct s3d_scene_view* scnview,
+  struct s3d_batch_enc_context* ctx,
+  const struct s3d_enc_locate_request* requests, size_t nqueries,
+  struct s3d_enc_locate_result* results, struct s3d_batch_enc_stats* stats);
+
+/* ---- Async enc_locate pipeline (mirrors RT async pattern) ---- */
+
+S3D_API res_T s3d_scene_view_find_enclosure_batch_ctx_async(
+  struct s3d_scene_view* scnview,
+  struct s3d_batch_enc_context* ctx,
+  const struct s3d_enc_locate_request* requests, size_t nqueries);
+
+S3D_API res_T s3d_scene_view_find_enclosure_batch_ctx_sync_kernel(
+  struct s3d_batch_enc_context* ctx);
+
+S3D_API res_T s3d_scene_view_find_enclosure_batch_ctx_start_d2h(
+  struct s3d_batch_enc_context* ctx, size_t nqueries);
+
+S3D_API res_T s3d_scene_view_find_enclosure_batch_ctx_wait_d2h(
   struct s3d_scene_view* scnview,
   struct s3d_batch_enc_context* ctx,
   const struct s3d_enc_locate_request* requests, size_t nqueries,

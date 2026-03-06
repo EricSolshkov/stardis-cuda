@@ -102,7 +102,19 @@ step_enc_locate_result(struct path_state* p, struct path_hot* hot,
   /* else: prim_id < 0 → miss, enc_id stays ENCLOSURE_ID_NULL */
 
   enc->locate.resolved_enc_id = enc_id;
+  /* Propagate to top-level resolved_enc_id so callers like
+   * step_cnd_ds_step_advance that read enc->resolved_enc_id
+   * (rather than enc->locate.resolved_enc_id) see the result.
+   * This is needed when enc_query escalates to enc_locate. */
+  enc->resolved_enc_id = enc_id;
   hot->phase = (uint8_t)enc->locate.return_state;
+
+  /* O11_SAFETY: one-shot \u2014 poison consumed fields to detect double-read */
+#ifdef SDIS_DEBUG_CHECKS
+  enc->locate.prim_id = -99999;
+  enc->locate.side = -99999;
+#endif
+
   return RES_OK;
 }
 
