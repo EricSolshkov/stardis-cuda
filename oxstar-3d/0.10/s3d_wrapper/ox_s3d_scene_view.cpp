@@ -1642,6 +1642,7 @@ static res_T batch_trace_async_impl(
     }
 
     /* P1: kernel launch on compute_stream (waits for H2D via event) */
+    CUDA_CHECK(cudaEventRecord(ctx->evt_kernel_start, ctx->compute_stream));
     sv->tracer.traceBatchMultiHit(
         ctx->d_rays.get(), ctx->d_multi_hits.get(), count,
         ctx->compute_stream, ctx->params_ptr);
@@ -2042,7 +2043,12 @@ static res_T batch_trace_sync_kernel_impl(
 {
     if (ctx->async_pending) {
         cudaStreamSynchronize(ctx->compute_stream);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, ctx->evt_kernel_start, ctx->evt_kernel_done);
+        ctx->last_kernel_ms = ms;
         ctx->async_pending = false;
+    } else {
+        ctx->last_kernel_ms = 0.0f;
     }
     return RES_OK;
 }
@@ -2544,6 +2550,7 @@ static res_T batch_trace_filtered_async_impl(
     }
 
     /* L4: filtered kernel launch on compute_stream */
+    CUDA_CHECK(cudaEventRecord(ctx->evt_kernel_start, ctx->compute_stream));
     sv->tracer.traceBatchMultiHitFiltered(
         ctx->d_rays.get(),
         ctx->d_hits_filtered.get(),
@@ -2595,6 +2602,7 @@ static res_T batch_trace_filtered_pinned_async_impl(
     }
 
     /* L4: filtered kernel launch on compute_stream */
+    CUDA_CHECK(cudaEventRecord(ctx->evt_kernel_start, ctx->compute_stream));
     sv->tracer.traceBatchMultiHitFiltered(
         ctx->d_rays.get(),
         ctx->d_hits_filtered.get(),
@@ -2633,7 +2641,13 @@ static res_T batch_trace_filtered_sync_kernel_impl(
 {
     if (ctx->async_pending) {
         cudaStreamSynchronize(ctx->compute_stream);
+        /* Query true GPU kernel elapsed time via CUDA events */
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, ctx->evt_kernel_start, ctx->evt_kernel_done);
+        ctx->last_kernel_ms = ms;
         ctx->async_pending = false;
+    } else {
+        ctx->last_kernel_ms = 0.0f;
     }
     return RES_OK;
 }
@@ -2829,6 +2843,14 @@ res_T s3d_scene_view_trace_rays_batch_ctx_filtered_wait_d2h(
     if (!scnview || !ctx || !hits) return RES_BAD_ARG;
     return batch_trace_filtered_wait_d2h_impl(scnview, ctx, requests, nrays,
                                                hits, stats);
+}
+
+/* Query GPU kernel elapsed time (ms) from last sync_kernel call */
+float s3d_batch_trace_context_get_last_kernel_ms(
+    s3d_batch_trace_context* ctx)
+{
+    if (!ctx) return 0.0f;
+    return ctx->last_kernel_ms;
 }
 
 /* Plan E: public API for pinned buffer access */

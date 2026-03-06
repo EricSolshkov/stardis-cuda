@@ -3418,7 +3418,9 @@ gpu_sync_kernel(struct wavefront_pool* pool, struct pool_view* pv)
   else
     rc = s3d_scene_view_trace_rays_batch_ctx_sync_kernel(pv->batch_ctx);
   time_current(&k1);
-  pool->trace_kernel_time_ms_sum += time_elapsed_sec(&k0, &k1) * 1000.0;
+  /* Use CUDA event elapsed time for accurate GPU kernel measurement */
+  pool->trace_kernel_time_ms_sum +=
+    (double)s3d_batch_trace_context_get_last_kernel_ms(pv->batch_ctx);
   return rc;
 }
 
@@ -4403,13 +4405,12 @@ solve_camera_persistent_wavefront(
           scn->s3d_view, pv->batch_ctx, pv->ray_count);
         if(res != RES_OK) goto cleanup;
         {
-          struct time k0, k1;
-          time_current(&k0);
           res = s3d_scene_view_trace_rays_batch_ctx_filtered_sync_kernel(
             pv->batch_ctx);
           if(res != RES_OK) goto cleanup;
-          time_current(&k1);
-          pool.trace_kernel_time_ms_sum += time_elapsed_sec(&k0, &k1) * 1000.0;
+          /* Use CUDA event elapsed time for accurate GPU kernel measurement */
+          pool.trace_kernel_time_ms_sum +=
+            (double)s3d_batch_trace_context_get_last_kernel_ms(pv->batch_ctx);
         }
         res = s3d_scene_view_trace_rays_batch_ctx_filtered_start_d2h(
           pv->batch_ctx, pv->ray_count);

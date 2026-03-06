@@ -277,7 +277,9 @@ struct s3d_batch_trace_context {
     /* === L3: dual-stream + pinned memory === */
     cudaStream_t                transfer_stream; /* D2H download stream */
     cudaEvent_t                 evt_upload_done; /* H2D upload completed */
-    cudaEvent_t                 evt_kernel_done; /* kernel completed */
+    cudaEvent_t                 evt_kernel_start; /* kernel start (timing) */
+    cudaEvent_t                 evt_kernel_done; /* kernel completed (timing) */
+    float                       last_kernel_ms;  /* last kernel elapsed (ms) */
     Ray*                        h_rays_pinned;   /* pinned host staging (rays) */
     MultiHitResult*             h_mhits_pinned;  /* pinned host staging (hits) */
     size_t                      pinned_capacity; /* allocated pinned count */
@@ -302,7 +304,9 @@ struct s3d_batch_trace_context {
         , async_nrays(0)
         , transfer_stream(nullptr)
         , evt_upload_done(nullptr)
+        , evt_kernel_start(nullptr)
         , evt_kernel_done(nullptr)
+        , last_kernel_ms(0.0f)
         , h_rays_pinned(nullptr)
         , h_mhits_pinned(nullptr)
         , pinned_capacity(max)
@@ -319,7 +323,8 @@ struct s3d_batch_trace_context {
         CUDA_CHECK(cudaStreamCreate(&compute_stream));
         CUDA_CHECK(cudaStreamCreate(&transfer_stream));
         CUDA_CHECK(cudaEventCreateWithFlags(&evt_upload_done, cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&evt_kernel_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreate(&evt_kernel_start));
+        CUDA_CHECK(cudaEventCreate(&evt_kernel_done));
         CUDA_CHECK(cudaHostAlloc(&h_rays_pinned,   max * sizeof(Ray),             cudaHostAllocDefault));
         CUDA_CHECK(cudaHostAlloc(&h_mhits_pinned,  max * sizeof(MultiHitResult),  cudaHostAllocDefault));
         CUDA_CHECK(cudaHostAlloc(&h_filter_pinned,  max * sizeof(FilterPerRayData), cudaHostAllocDefault));
@@ -335,8 +340,9 @@ struct s3d_batch_trace_context {
         if (h_mhits_pinned)  { cudaFreeHost(h_mhits_pinned);  h_mhits_pinned  = nullptr; }
         if (h_filter_pinned) { cudaFreeHost(h_filter_pinned);  h_filter_pinned = nullptr; }
         if (h_hits_pinned)   { cudaFreeHost(h_hits_pinned);    h_hits_pinned   = nullptr; }
-        if (evt_upload_done) { cudaEventDestroy(evt_upload_done); evt_upload_done = nullptr; }
-        if (evt_kernel_done) { cudaEventDestroy(evt_kernel_done); evt_kernel_done = nullptr; }
+        if (evt_upload_done)  { cudaEventDestroy(evt_upload_done);  evt_upload_done  = nullptr; }
+        if (evt_kernel_start) { cudaEventDestroy(evt_kernel_start); evt_kernel_start = nullptr; }
+        if (evt_kernel_done)  { cudaEventDestroy(evt_kernel_done);  evt_kernel_done  = nullptr; }
         if (transfer_stream) { cudaStreamDestroy(transfer_stream); transfer_stream = nullptr; }
         if (compute_stream)  { cudaStreamDestroy(compute_stream);  compute_stream  = nullptr; }
     }

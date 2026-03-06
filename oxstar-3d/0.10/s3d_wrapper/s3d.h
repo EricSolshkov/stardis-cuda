@@ -477,6 +477,11 @@ S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_filtered_async(
 S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_filtered_sync_kernel(
   struct s3d_batch_trace_context* ctx);
 
+/* Query true GPU kernel elapsed time (ms) from last sync_kernel call.
+ * Uses CUDA event timing — valid only after sync_kernel returns. */
+S3D_API float s3d_batch_trace_context_get_last_kernel_ms(
+  struct s3d_batch_trace_context* ctx);
+
 /* L4: start filtered D2H (downloads HitResult, not MultiHitResult) */
 S3D_API res_T s3d_scene_view_trace_rays_batch_ctx_filtered_start_d2h(
   struct s3d_batch_trace_context* ctx, size_t nrays);
