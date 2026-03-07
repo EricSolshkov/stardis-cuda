@@ -842,19 +842,15 @@ init_single_path(
   hot->ray_count_ext = 0;
 
   /* Zero scratch areas */
-  p->ds_delta_solid = 0;
-  p->ds_initialized = 0;
-  p->ds_enc_id = ENCLOSURE_ID_NULL;
-  p->ds_medium = NULL;
-  p->ds_props_ref = SOLID_PROPS_NULL;
-  p->ds_green_power_term = 0;
-  memset(p->ds_position_start, 0, sizeof(p->ds_position_start));
-  p->ds_robust_attempt = 0;
-  p->ds_delta = 0;
-  p->ds_delta_solid_param = 0;
-  p->bnd_reinject_distance = 0;
-  p->bnd_solid_enc_id = ENCLOSURE_ID_NULL;
-  p->bnd_retry_count = 0;
+  p->locals.cnd_ds.initialized = 0;
+  p->locals.cnd_ds.enc_id = ENCLOSURE_ID_NULL;
+  p->locals.cnd_ds.medium = NULL;
+  p->locals.cnd_ds.props_ref = SOLID_PROPS_NULL;
+  p->locals.cnd_ds.green_power_term = 0;
+  memset(p->locals.cnd_ds.position_start, 0, sizeof(p->locals.cnd_ds.position_start));
+  p->locals.cnd_ds.robust_attempt = 0;
+  p->locals.cnd_ds.delta = 0;
+  p->locals.cnd_ds.delta_solid_param = 0;
   p->coupled_nbranchings = -1;
   p->steps_taken = 0;
   p->done_reason = 0;
@@ -1051,19 +1047,15 @@ probe_init_path(struct path_state* p,
   hot->ray_count_ext = 0;
 
   /* Zero scratch areas */
-  p->ds_delta_solid = 0;
-  p->ds_initialized = 0;
-  p->ds_enc_id = ENCLOSURE_ID_NULL;
-  p->ds_medium = NULL;
-  p->ds_props_ref = SOLID_PROPS_NULL;
-  p->ds_green_power_term = 0;
-  memset(p->ds_position_start, 0, sizeof(p->ds_position_start));
-  p->ds_robust_attempt = 0;
-  p->ds_delta = 0;
-  p->ds_delta_solid_param = 0;
-  p->bnd_reinject_distance = 0;
-  p->bnd_solid_enc_id = ENCLOSURE_ID_NULL;
-  p->bnd_retry_count = 0;
+  p->locals.cnd_ds.initialized = 0;
+  p->locals.cnd_ds.enc_id = ENCLOSURE_ID_NULL;
+  p->locals.cnd_ds.medium = NULL;
+  p->locals.cnd_ds.props_ref = SOLID_PROPS_NULL;
+  p->locals.cnd_ds.green_power_term = 0;
+  memset(p->locals.cnd_ds.position_start, 0, sizeof(p->locals.cnd_ds.position_start));
+  p->locals.cnd_ds.robust_attempt = 0;
+  p->locals.cnd_ds.delta = 0;
+  p->locals.cnd_ds.delta_solid_param = 0;
   p->coupled_nbranchings = 0;
   p->steps_taken = 0;
   p->done_reason = 0;
@@ -1224,19 +1216,15 @@ probe_batch_init_path(struct path_state* p,
   hot->ray_bucket = 0;
   hot->ray_count_ext = 0;
 
-  p->ds_delta_solid = 0;
-  p->ds_initialized = 0;
-  p->ds_enc_id = ENCLOSURE_ID_NULL;
-  p->ds_medium = NULL;
-  p->ds_props_ref = SOLID_PROPS_NULL;
-  p->ds_green_power_term = 0;
-  memset(p->ds_position_start, 0, sizeof(p->ds_position_start));
-  p->ds_robust_attempt = 0;
-  p->ds_delta = 0;
-  p->ds_delta_solid_param = 0;
-  p->bnd_reinject_distance = 0;
-  p->bnd_solid_enc_id = ENCLOSURE_ID_NULL;
-  p->bnd_retry_count = 0;
+  p->locals.cnd_ds.initialized = 0;
+  p->locals.cnd_ds.enc_id = ENCLOSURE_ID_NULL;
+  p->locals.cnd_ds.medium = NULL;
+  p->locals.cnd_ds.props_ref = SOLID_PROPS_NULL;
+  p->locals.cnd_ds.green_power_term = 0;
+  memset(p->locals.cnd_ds.position_start, 0, sizeof(p->locals.cnd_ds.position_start));
+  p->locals.cnd_ds.robust_attempt = 0;
+  p->locals.cnd_ds.delta = 0;
+  p->locals.cnd_ds.delta_solid_param = 0;
   p->coupled_nbranchings = 0;
   p->steps_taken = 0;
   p->done_reason = 0;
@@ -1450,7 +1438,7 @@ pool_collect_ray_requests_compact(struct wavefront_pool* pool)
         pool->rays_radiative += nrays; break;
       case PATH_COUPLED_COND_DS_PENDING:
       case PATH_CND_DS_STEP_TRACE:
-        if(p->ds_robust_attempt > 0) pool->rays_conductive_ds_retry += nrays;
+        if(p->locals.cnd_ds.robust_attempt > 0) pool->rays_conductive_ds_retry += nrays;
         else                         pool->rays_conductive_ds += nrays;
         break;
       case PATH_BND_EXT_DIRECT_TRACE:
@@ -1732,7 +1720,7 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
             tl_rays_radiative += nrays; break;
           case PATH_COUPLED_COND_DS_PENDING:
           case PATH_CND_DS_STEP_TRACE:
-            if(p->ds_robust_attempt > 0) tl_rays_cond_ds_retry += nrays;
+            if(p->locals.cnd_ds.robust_attempt > 0) tl_rays_cond_ds_retry += nrays;
             else                         tl_rays_cond_ds += nrays;
             break;
           case PATH_BND_EXT_DIRECT_TRACE:
@@ -1921,7 +1909,7 @@ pool_collect_ray_requests_bucketed(struct wavefront_pool* pool,
           pv->pending_rays_radiative += nrays; break;
         case PATH_COUPLED_COND_DS_PENDING:
         case PATH_CND_DS_STEP_TRACE:
-          if(p->ds_robust_attempt > 0) pv->pending_rays_conductive_ds_retry += nrays;
+          if(p->locals.cnd_ds.robust_attempt > 0) pv->pending_rays_conductive_ds_retry += nrays;
           else                         pv->pending_rays_conductive_ds += nrays;
           break;
         case PATH_BND_EXT_DIRECT_TRACE:
@@ -4397,7 +4385,7 @@ merged_pass(struct wavefront_pool* pool,
               pv->pending_rays_radiative += nrays; break;
             case PATH_COUPLED_COND_DS_PENDING:
             case PATH_CND_DS_STEP_TRACE:
-              if(p->ds_robust_attempt > 0) pv->pending_rays_conductive_ds_retry += nrays;
+              if(p->locals.cnd_ds.robust_attempt > 0) pv->pending_rays_conductive_ds_retry += nrays;
               else                          pv->pending_rays_conductive_ds += nrays;
               break;
             case PATH_BND_EXT_DIRECT_TRACE:
@@ -4621,7 +4609,7 @@ merged_pass(struct wavefront_pool* pool,
               tl_rays_radiative += nrays; break;
             case PATH_COUPLED_COND_DS_PENDING:
             case PATH_CND_DS_STEP_TRACE:
-              if(p->ds_robust_attempt > 0) tl_rays_cond_ds_retry += nrays;
+              if(p->locals.cnd_ds.robust_attempt > 0) tl_rays_cond_ds_retry += nrays;
               else                          tl_rays_cond_ds += nrays;
               break;
             case PATH_BND_EXT_DIRECT_TRACE:

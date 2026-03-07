@@ -268,19 +268,15 @@ init_all_paths(
       p->needs_ray = 0;
 
       /* Zero the scratch areas */
-      p->ds_delta_solid = 0;
-      p->ds_initialized = 0;
-      p->ds_enc_id = ENCLOSURE_ID_NULL;
-      p->ds_medium = NULL;
-      p->ds_props_ref = SOLID_PROPS_NULL;
-      p->ds_green_power_term = 0;
-      memset(p->ds_position_start, 0, sizeof(p->ds_position_start));
-      p->ds_robust_attempt = 0;
-      p->ds_delta = 0;
-      p->ds_delta_solid_param = 0;
-      p->bnd_reinject_distance = 0;
-      p->bnd_solid_enc_id = ENCLOSURE_ID_NULL;
-      p->bnd_retry_count = 0;
+      p->locals.cnd_ds.initialized = 0;
+      p->locals.cnd_ds.enc_id = ENCLOSURE_ID_NULL;
+      p->locals.cnd_ds.medium = NULL;
+      p->locals.cnd_ds.props_ref = SOLID_PROPS_NULL;
+      p->locals.cnd_ds.green_power_term = 0;
+      memset(p->locals.cnd_ds.position_start, 0, sizeof(p->locals.cnd_ds.position_start));
+      p->locals.cnd_ds.robust_attempt = 0;
+      p->locals.cnd_ds.delta = 0;
+      p->locals.cnd_ds.delta_solid_param = 0;
       p->coupled_nbranchings = -1; /* sentinel: not yet entered sample_coupled_path */
       p->steps_taken = 0;
       p->done_reason = 0;
@@ -310,7 +306,7 @@ collect_ray_requests(struct wavefront_context* wf)
       wf->rays_radiative += (size_t)p->ray_req.ray_count;
     else if(p->phase == PATH_COUPLED_COND_DS_PENDING) {
       wf->conductive_steps++;
-      if(p->ds_robust_attempt > 0)
+      if(p->locals.cnd_ds.robust_attempt > 0)
         wf->rays_conductive_ds_retry += (size_t)p->ray_req.ray_count;
       else
         wf->rays_conductive_ds += (size_t)p->ray_req.ray_count;
@@ -1094,19 +1090,15 @@ init_paths_from_probe(
     p->needs_ray = 0;
 
     /* Zero scratch areas (same as init_all_paths) */
-    p->ds_delta_solid = 0;
-    p->ds_initialized = 0;
-    p->ds_enc_id = ENCLOSURE_ID_NULL;
-    p->ds_medium = NULL;
-    p->ds_props_ref = SOLID_PROPS_NULL;
-    p->ds_green_power_term = 0;
-    memset(p->ds_position_start, 0, sizeof(p->ds_position_start));
-    p->ds_robust_attempt = 0;
-    p->ds_delta = 0;
-    p->ds_delta_solid_param = 0;
-    p->bnd_reinject_distance = 0;
-    p->bnd_solid_enc_id = ENCLOSURE_ID_NULL;
-    p->bnd_retry_count = 0;
+    p->locals.cnd_ds.initialized = 0;
+    p->locals.cnd_ds.enc_id = ENCLOSURE_ID_NULL;
+    p->locals.cnd_ds.medium = NULL;
+    p->locals.cnd_ds.props_ref = SOLID_PROPS_NULL;
+    p->locals.cnd_ds.green_power_term = 0;
+    memset(p->locals.cnd_ds.position_start, 0, sizeof(p->locals.cnd_ds.position_start));
+    p->locals.cnd_ds.robust_attempt = 0;
+    p->locals.cnd_ds.delta = 0;
+    p->locals.cnd_ds.delta_solid_param = 0;
     /* Probe mode: nbranchings already set to 0 above, so sync the
      * coupled_nbranchings to 0 (not -1 sentinel) to match. */
     p->coupled_nbranchings = 0;

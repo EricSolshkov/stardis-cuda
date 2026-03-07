@@ -230,27 +230,8 @@ struct path_state {
   /* --- Coupled path scratch --- */
   int     coupled_nbranchings;
 
-  /* --- Conductive delta-sphere scratch --- */
-  float   ds_dir0[3], ds_dir1[3];
-  struct s3d_hit ds_hit0, ds_hit1;
-  double  ds_delta_solid;
-
-  /* --- Conductive delta-sphere persistent state (wavefront M3) --- */
-  int     ds_initialized;         /* 1 = init phase done                   */
-  unsigned ds_enc_id;             /* enclosure id for conductive walk       */
-  struct sdis_medium* ds_medium;  /* solid medium pointer                   */
-  struct solid_props  ds_props_ref; /* reference properties at start        */
-  double  ds_green_power_term;    /* accumulated green function power       */
-  double  ds_position_start[3];   /* starting position backup              */
-  int     ds_robust_attempt;      /* robust retry counter                   */
-  float   ds_delta;               /* computed step distance                 */
-  float   ds_delta_solid_param;   /* props.delta (medium step parameter)    */
-
-  /* --- Boundary reinjection scratch --- */
-  struct s3d_hit bnd_hit0, bnd_hit1;
-  double  bnd_reinject_distance;
-  unsigned bnd_solid_enc_id;
-  int     bnd_retry_count;
+  /* (BND scratch fields removed — dead code from pre-B4 refactoring)
+   * (DS fields moved into locals.cnd_ds — see union below)            */
 
   /* --- Filter data for current ray request --- */
   struct hit_filter_data  filter_data_storage;
@@ -347,6 +328,20 @@ struct path_state {
       double  rho_cp;
       double  S_over_V;
     } cnv;
+
+    struct {                            /* conductive delta-sphere         */
+      float   dir0[3], dir1[3];
+      struct s3d_hit hit0, hit1;
+      int     initialized;              /* 1 = init phase done             */
+      unsigned enc_id;                  /* enclosure id for conductive walk */
+      struct sdis_medium* medium;       /* solid medium pointer            */
+      struct solid_props  props_ref;    /* reference properties at start   */
+      double  green_power_term;         /* accumulated green function power*/
+      double  position_start[3];        /* starting position backup        */
+      int     robust_attempt;           /* robust retry counter            */
+      float   delta;                    /* computed step distance           */
+      float   delta_solid_param;        /* props.delta (medium step param) */
+    } cnd_ds;
   } locals;
 
   /* --- B-4 M7/M10/M1-v2/M8: Cold blocks moved to SoA arrays (P1) ---

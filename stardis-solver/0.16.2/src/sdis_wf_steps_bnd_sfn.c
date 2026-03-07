@@ -265,7 +265,7 @@ step_bnd_sfn_prob_dispatch(struct path_state* p, struct path_hot* hot,
     }
 
     if(p->T.func == conductive_path_3d) {
-      p->ds_initialized = 0;
+      p->locals.cnd_ds.initialized = 0;
       p->locals.cnd_wos.wos_initialized = 0; /* union was bnd_sfn — clear */
       hot->phase = (uint8_t)PATH_COUPLED_CONDUCTIVE;
     } else if(p->T.func == boundary_path_3d) {

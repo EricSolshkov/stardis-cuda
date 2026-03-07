@@ -574,7 +574,7 @@ step_bnd_sf_prob_dispatch(struct path_state* p, struct path_hot* hot, struct sdi
 
     /* Route based on T.func set by solid_reinjection */
     if(p->T.func == conductive_path_3d) {
-      p->ds_initialized = 0; /* reset for fresh conductive entry */
+      p->locals.cnd_ds.initialized = 0; /* reset for fresh conductive entry */
       p->locals.cnd_wos.wos_initialized = 0; /* union was bnd_sf — clear */
       hot->phase = (uint8_t)PATH_COUPLED_CONDUCTIVE;
     } else if(p->T.func == boundary_path_3d) {

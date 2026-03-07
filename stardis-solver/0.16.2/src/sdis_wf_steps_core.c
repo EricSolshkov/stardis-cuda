@@ -150,29 +150,29 @@ setup_delta_sphere_rays(struct path_state* p, struct path_hot* hot, struct sdis_
   /* Random sphere direction — matches sample_next_step's RNG call */
   ssp_ran_sphere_uniform_float(p->rng, dir, NULL);
 
-  p->ds_dir0[0] = dir[0];
-  p->ds_dir0[1] = dir[1];
-  p->ds_dir0[2] = dir[2];
-  p->ds_dir1[0] = -dir[0];
-  p->ds_dir1[1] = -dir[1];
-  p->ds_dir1[2] = -dir[2];
+  p->locals.cnd_ds.dir0[0] = dir[0];
+  p->locals.cnd_ds.dir0[1] = dir[1];
+  p->locals.cnd_ds.dir0[2] = dir[2];
+  p->locals.cnd_ds.dir1[0] = -dir[0];
+  p->locals.cnd_ds.dir1[1] = -dir[1];
+  p->locals.cnd_ds.dir1[2] = -dir[2];
 
   /* Ray 0: forward */
   p->ray_req.origin[0] = pos[0];
   p->ray_req.origin[1] = pos[1];
   p->ray_req.origin[2] = pos[2];
-  p->ray_req.direction[0] = p->ds_dir0[0];
-  p->ray_req.direction[1] = p->ds_dir0[1];
-  p->ray_req.direction[2] = p->ds_dir0[2];
+  p->ray_req.direction[0] = p->locals.cnd_ds.dir0[0];
+  p->ray_req.direction[1] = p->locals.cnd_ds.dir0[1];
+  p->ray_req.direction[2] = p->locals.cnd_ds.dir0[2];
   p->ray_req.range[0] = FLT_MIN;
-  p->ray_req.range[1] = p->ds_delta_solid_param * RAY_RANGE_MAX_SCALE;
+  p->ray_req.range[1] = p->locals.cnd_ds.delta_solid_param * RAY_RANGE_MAX_SCALE;
 
   /* Ray 1: backward */
-  p->ray_req.direction2[0] = p->ds_dir1[0];
-  p->ray_req.direction2[1] = p->ds_dir1[1];
-  p->ray_req.direction2[2] = p->ds_dir1[2];
+  p->ray_req.direction2[0] = p->locals.cnd_ds.dir1[0];
+  p->ray_req.direction2[1] = p->locals.cnd_ds.dir1[1];
+  p->ray_req.direction2[2] = p->locals.cnd_ds.dir1[2];
   p->ray_req.range2[0] = FLT_MIN;
-  p->ray_req.range2[1] = p->ds_delta_solid_param * RAY_RANGE_MAX_SCALE;
+  p->ray_req.range2[1] = p->locals.cnd_ds.delta_solid_param * RAY_RANGE_MAX_SCALE;
 
   p->ray_req.ray_count = 2;
 
@@ -509,7 +509,7 @@ step_conductive(struct path_state* p, struct path_hot* hot, struct sdis_scene* s
   /* ----- Delta-sphere wavefront path (M4 fine-grained) ----- */
 
   /* Initialization: first entry dispatches ENC sub-state */
-  if(!p->ds_initialized) {
+  if(!p->locals.cnd_ds.initialized) {
     /* Emit 6-ray enc_query from current position.
      * After result, PATH_CND_DS_CHECK_TEMP finalises init. */
     step_enc_query_emit(p, hot, enc, p->rwalk.vtx.P, PATH_CND_DS_CHECK_TEMP);
@@ -547,12 +547,12 @@ step_conductive_ds_process(
 {
   res_T res = RES_OK;
   float delta;
-  const float delta_solid = p->ds_delta_solid_param;
+  const float delta_solid = p->locals.cnd_ds.delta_solid_param;
 
   ASSERT(p && scn && hit0 && hit1);
 
-  p->ds_hit0 = *hit0;
-  p->ds_hit1 = *hit1;
+  p->locals.cnd_ds.hit0 = *hit0;
+  p->locals.cnd_ds.hit1 = *hit1;
 
   /* ------ Replicate sample_next_step logic ------ */
   /* Compute delta = min of the two hit distances */
@@ -579,38 +579,38 @@ step_conductive_ds_process(
     /* Swap: walk toward hit1 (the backward direction) */
     float tmp[3];
     struct s3d_hit tmp_hit;
-    f3_set(tmp, p->ds_dir0);
-    f3_set(p->ds_dir0, p->ds_dir1);
-    f3_set(p->ds_dir1, tmp);
-    tmp_hit = p->ds_hit0;
-    p->ds_hit0 = p->ds_hit1;
-    p->ds_hit1 = tmp_hit;
+    f3_set(tmp, p->locals.cnd_ds.dir0);
+    f3_set(p->locals.cnd_ds.dir0, p->locals.cnd_ds.dir1);
+    f3_set(p->locals.cnd_ds.dir1, tmp);
+    tmp_hit = p->locals.cnd_ds.hit0;
+    p->locals.cnd_ds.hit0 = p->locals.cnd_ds.hit1;
+    p->locals.cnd_ds.hit1 = tmp_hit;
     /* Recompute hit0 reference */
-    hit0 = &p->ds_hit0;
-    hit1 = &p->ds_hit1;
+    hit0 = &p->locals.cnd_ds.hit0;
+    hit1 = &p->locals.cnd_ds.hit1;
   } else if(delta == hit0->distance) {
     /* dir1 = dir0 (both track the same hit) */
-    f3_set(p->ds_dir1, p->ds_dir0);
-    p->ds_hit1 = *hit0;
+    f3_set(p->locals.cnd_ds.dir1, p->locals.cnd_ds.dir0);
+    p->locals.cnd_ds.hit1 = *hit0;
   } else if(!S3D_HIT_NONE(hit1) && delta == hit1->distance) {
     /* dir1 tracks the backward hit */
-    f3_set(p->ds_dir1, p->ds_dir1); /* already correct */
-    p->ds_hit1 = *hit1;
+    f3_set(p->locals.cnd_ds.dir1, p->locals.cnd_ds.dir1); /* already correct */
+    p->locals.cnd_ds.hit1 = *hit1;
   } else {
     /* No intersection drove delta -- dir1 doesn't correspond to a hit */
-    p->ds_dir1[0] = 0; p->ds_dir1[1] = 0; p->ds_dir1[2] = 0;
-    p->ds_hit1 = S3D_HIT_NULL;
+    p->locals.cnd_ds.dir1[0] = 0; p->locals.cnd_ds.dir1[1] = 0; p->locals.cnd_ds.dir1[2] = 0;
+    p->locals.cnd_ds.hit1 = S3D_HIT_NULL;
   }
-  p->ds_delta = delta;
+  p->locals.cnd_ds.delta = delta;
 
   /* ------ Enclosure verification decision (M4: deferred to cascade) ---- */
-  if(S3D_HIT_NONE(&p->ds_hit0) || p->ds_hit0.distance > delta) {
+  if(S3D_HIT_NONE(&p->locals.cnd_ds.hit0) || p->locals.cnd_ds.hit0.distance > delta) {
     /* No hit in forward direction at delta — need batched ENC query at
      * the projected next position.  Store pos_next for the ENC verify
      * step; cascade will call step_cnd_ds_step_enc_verify(). */
     double pos_next[3];
     d3_set(pos_next, p->rwalk.vtx.P);
-    move_pos_3d(pos_next, p->ds_dir0, delta);
+    move_pos_3d(pos_next, p->locals.cnd_ds.dir0, delta);
     d3_set(enc->query_pos, pos_next);
     hot->phase = (uint8_t)PATH_CND_DS_STEP_ENC_VERIFY;
     hot->needs_ray = 0;
@@ -618,14 +618,14 @@ step_conductive_ds_process(
     /* Hit at forward — get enclosure from hit primitive (pure compute) */
     unsigned enc_ids[2] = {ENCLOSURE_ID_NULL, ENCLOSURE_ID_NULL};
     unsigned enc_id;
-    scene_get_enclosure_ids(scn, p->ds_hit0.prim.prim_id, enc_ids);
-    enc_id = f3_dot(p->ds_dir0, p->ds_hit0.normal) < 0
+    scene_get_enclosure_ids(scn, p->locals.cnd_ds.hit0.prim.prim_id, enc_ids);
+    enc_id = f3_dot(p->locals.cnd_ds.dir0, p->locals.cnd_ds.hit0.normal) < 0
            ? enc_ids[0] : enc_ids[1];
 
-    if(enc_id != p->ds_enc_id) {
+    if(enc_id != p->locals.cnd_ds.enc_id) {
       /* Enclosure mismatch — retry with new direction (deferred) */
-      p->ds_robust_attempt++;
-      if(p->ds_robust_attempt >= 100) {
+      p->locals.cnd_ds.robust_attempt++;
+      if(p->locals.cnd_ds.robust_attempt >= 100) {
         log_warn(scn->dev,
           "wavefront: conductive delta_sphere robust exceeded 100 attempts "
           "at (%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));

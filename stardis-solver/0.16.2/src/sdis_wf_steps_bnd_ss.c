@@ -729,7 +729,7 @@ step_bnd_ss_reinject_decide(struct path_state* p, struct path_hot* hot, struct s
 
   /* solid_reinjection sets T.func to indicate next step */
   if(p->T.func == conductive_path_3d) {
-    p->ds_initialized = 0; /* reset for fresh conductive entry */
+    p->locals.cnd_ds.initialized = 0; /* reset for fresh conductive entry */
     p->locals.cnd_wos.wos_initialized = 0; /* union was bnd_ss — clear */
     hot->phase = (uint8_t)PATH_COUPLED_CONDUCTIVE;
   } else if(p->T.func == boundary_path_3d) {

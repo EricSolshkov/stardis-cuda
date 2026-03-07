@@ -60,7 +60,7 @@ step_cnd_ds_check_temp(struct path_state* p, struct path_hot* hot, struct sdis_s
   ASSERT(p && scn);
 
   /* Finalize initialisation from ENC resolve (runs only once per entry) */
-  if(!p->ds_initialized) {
+  if(!p->locals.cnd_ds.initialized) {
     unsigned enc_id = enc->resolved_enc_id;
     struct sdis_medium* mdm = NULL;
 
@@ -100,20 +100,20 @@ step_cnd_ds_check_temp(struct path_state* p, struct path_hot* hot, struct sdis_s
       }
     }
 
-    p->ds_enc_id = enc_id;
-    p->ds_medium = mdm;
-    d3_set(p->ds_position_start, p->rwalk.vtx.P);
-    solid_get_properties(mdm, &p->rwalk.vtx, &p->ds_props_ref);
-    p->ds_green_power_term = 0;
-    p->ds_initialized = 1;
-    p->ds_robust_attempt = 0;
+    p->locals.cnd_ds.enc_id = enc_id;
+    p->locals.cnd_ds.medium = mdm;
+    d3_set(p->locals.cnd_ds.position_start, p->rwalk.vtx.P);
+    solid_get_properties(mdm, &p->rwalk.vtx, &p->locals.cnd_ds.props_ref);
+    p->locals.cnd_ds.green_power_term = 0;
+    p->locals.cnd_ds.initialized = 1;
+    p->locals.cnd_ds.robust_attempt = 0;
   }
 
   /* --- Each loop iteration: fetch properties, check temperature --- */
-  res = solid_get_properties(p->ds_medium, &p->rwalk.vtx, &props);
+  res = solid_get_properties(p->locals.cnd_ds.medium, &p->rwalk.vtx, &props);
   if(res != RES_OK) goto error;
   res = check_solid_constant_properties(
-    scn->dev, p->ctx.green_path != NULL, 0, &p->ds_props_ref, &props);
+    scn->dev, p->ctx.green_path != NULL, 0, &p->locals.cnd_ds.props_ref, &props);
   if(res != RES_OK) goto error;
 
   /* Temperature known? */
@@ -133,7 +133,7 @@ step_cnd_ds_check_temp(struct path_state* p, struct path_hot* hot, struct sdis_s
    * reset in step_cnd_ds_step_advance after the enclosure check passes.
    * Resetting here would defeat the 100-retry limit because enc-mismatch
    * retries also transition to CHECK_TEMP.) */
-  p->ds_delta_solid_param = (float)props.delta;
+  p->locals.cnd_ds.delta_solid_param = (float)props.delta;
 
   /* Emit 2 rays (forward + backward) */
   setup_delta_sphere_rays(p, hot, scn);
@@ -165,8 +165,8 @@ step_cnd_ds_step_advance(struct path_state* p, struct path_hot* hot, struct sdis
 {
   res_T res = RES_OK;
   struct solid_props props = SOLID_PROPS_NULL;
-  const float delta = p->ds_delta;
-  const float delta_solid = p->ds_delta_solid_param;
+  const float delta = p->locals.cnd_ds.delta;
+  const float delta_solid = p->locals.cnd_ds.delta_solid_param;
   double delta_m, mu;
 
   ASSERT(p && scn);
@@ -175,10 +175,10 @@ step_cnd_ds_step_advance(struct path_state* p, struct path_hot* hot, struct sdis
   /* enc_query.resolved_enc_id is set by:
    *   - step_conductive_ds_process (direct from hit primitive), or
    *   - step_enc_query_resolve (from batched 6-ray query).            */
-  if(enc->resolved_enc_id != p->ds_enc_id) {
+  if(enc->resolved_enc_id != p->locals.cnd_ds.enc_id) {
     /* Enclosure mismatch — retry with new direction */
-    p->ds_robust_attempt++;
-    if(p->ds_robust_attempt >= 100) {
+    p->locals.cnd_ds.robust_attempt++;
+    if(p->locals.cnd_ds.robust_attempt >= 100) {
       log_warn(scn->dev,
         "wavefront: conductive delta_sphere robust exceeded 100 attempts "
         "at (%g, %g, %g)\n", SPLIT3(p->rwalk.vtx.P));
@@ -192,15 +192,15 @@ step_cnd_ds_step_advance(struct path_state* p, struct path_hot* hot, struct sdis
   }
 
   /* ------ Robust check passed — proceed with step ------ */
-  p->ds_robust_attempt = 0;  /* reset only on successful enc match */
-  res = solid_get_properties(p->ds_medium, &p->rwalk.vtx, &props);
+  p->locals.cnd_ds.robust_attempt = 0;  /* reset only on successful enc match */
+  res = solid_get_properties(p->locals.cnd_ds.medium, &p->rwalk.vtx, &props);
   if(res != RES_OK) goto error;
 
   /* Handle volumic power */
   if(props.power != SDIS_VOLUMIC_POWER_NONE) {
     double power_term = 0;
     /* Inline handle_volumic_power logic for 3D */
-    if(S3D_HIT_NONE(&p->ds_hit0) && S3D_HIT_NONE(&p->ds_hit1)) {
+    if(S3D_HIT_NONE(&p->locals.cnd_ds.hit0) && S3D_HIT_NONE(&p->locals.cnd_ds.hit1)) {
       double dim = (double)delta * scn->fp_to_meter;
       power_term = dim * dim / (2.0 * 3 * props.lambda);
       p->T.value += props.power * power_term;
@@ -210,12 +210,12 @@ step_cnd_ds_step_advance(struct path_state* p, struct path_hot* hot, struct sdis
       float N[3] = {0, 0, 0};
       double cos_U_N, h, h_in_meter;
 
-      if(delta == p->ds_hit0.distance) {
-        f3_normalize(N, p->ds_hit0.normal);
-        cos_U_N = f3_dot(p->ds_dir0, N);
+      if(delta == p->locals.cnd_ds.hit0.distance) {
+        f3_normalize(N, p->locals.cnd_ds.hit0.normal);
+        cos_U_N = f3_dot(p->locals.cnd_ds.dir0, N);
       } else {
-        f3_normalize(N, p->ds_hit1.normal);
-        cos_U_N = f3_dot(p->ds_dir1, N);
+        f3_normalize(N, p->locals.cnd_ds.hit1.normal);
+        cos_U_N = f3_dot(p->locals.cnd_ds.dir1, N);
       }
       h = delta * fabs(cos_U_N);
       h_in_meter = h * scn->fp_to_meter;
@@ -236,7 +236,7 @@ step_cnd_ds_step_advance(struct path_state* p, struct path_hot* hot, struct sdis
     }
 
     if(p->ctx.green_path && props.power != SDIS_VOLUMIC_POWER_NONE) {
-      p->ds_green_power_term += power_term;
+      p->locals.cnd_ds.green_power_term += power_term;
     }
   }
 
@@ -253,17 +253,17 @@ step_cnd_ds_step_advance(struct path_state* p, struct path_hot* hot, struct sdis
   }
 
   /* Update hit info */
-  if(S3D_HIT_NONE(&p->ds_hit0) || p->ds_hit0.distance > delta) {
+  if(S3D_HIT_NONE(&p->locals.cnd_ds.hit0) || p->locals.cnd_ds.hit0.distance > delta) {
     p->rwalk.hit_3d = S3D_HIT_NULL;
     p->rwalk.hit_side = SDIS_SIDE_NULL__;
   } else {
-    p->rwalk.hit_3d = p->ds_hit0;
-    p->rwalk.hit_side = f3_dot(p->ds_hit0.normal, p->ds_dir0) < 0
+    p->rwalk.hit_3d = p->locals.cnd_ds.hit0;
+    p->rwalk.hit_side = f3_dot(p->locals.cnd_ds.hit0.normal, p->locals.cnd_ds.dir0) < 0
                       ? SDIS_FRONT : SDIS_BACK;
   }
 
   /* Move position */
-  move_pos_3d(p->rwalk.vtx.P, p->ds_dir0, delta);
+  move_pos_3d(p->rwalk.vtx.P, p->locals.cnd_ds.dir0, delta);
 
   /* Register heat path vertex */
   res = register_heat_vertex(p->ctx.heat_path, &p->rwalk.vtx, p->T.value,
@@ -277,14 +277,14 @@ step_cnd_ds_step_advance(struct path_state* p, struct path_hot* hot, struct sdis
     hot->needs_ray = 0;
   } else {
     /* Hit boundary — register green power term and transition */
-    if(p->ctx.green_path && p->ds_props_ref.power != SDIS_VOLUMIC_POWER_NONE) {
+    if(p->ctx.green_path && p->locals.cnd_ds.props_ref.power != SDIS_VOLUMIC_POWER_NONE) {
       green_path_add_power_term(
-        p->ctx.green_path, p->ds_medium,
-        &p->rwalk.vtx, p->ds_green_power_term);
+        p->ctx.green_path, p->locals.cnd_ds.medium,
+        &p->rwalk.vtx, p->locals.cnd_ds.green_power_term);
     }
     p->T.func = boundary_path_3d;
     p->rwalk.enc_id = ENCLOSURE_ID_NULL;
-    p->ds_initialized = 0; /* reset for next conductive entry */
+    p->locals.cnd_ds.initialized = 0; /* reset for next conductive entry */
     hot->phase = (uint8_t)PATH_COUPLED_BOUNDARY;
     hot->needs_ray = 0;
   }
