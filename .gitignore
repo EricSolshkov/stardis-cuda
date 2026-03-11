@@ -17,4 +17,7 @@ CTestTestfile.cmake
 
 # ===== temp =====
 **/*~
-**/*.logbuild_ninja/
+**/*.log
+
+# ===== LLM local work log =====
+CHANGE_LOG

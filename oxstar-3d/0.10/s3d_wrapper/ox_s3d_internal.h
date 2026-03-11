@@ -214,6 +214,16 @@ struct s3d_scene_view {
     float                 total_area;
     bool                  cdf_valid;
 
+    /* Fast postprocess lookup table: indexed by tracer geom_id (contiguous
+     * 0..N-1).  Eliminates per-ray std::map lookups in the hot path. */
+    struct pp_entry {
+        s3d_shape* shape;        /* resolved shape pointer */
+        unsigned   shape_id;     /* API-level shape id */
+        s3d_shape* inst;         /* instance shape, or nullptr */
+        bool       flip_surface; /* build-time snapshot */
+    };
+    std::vector<pp_entry> pp_table;
+
     /* Persistent retrace GPU buffers (grow-only, avoid per-call alloc).
      * Must be members (not static) so they are freed while CUDA context
      * is still alive — static locals outlive the device and crash on

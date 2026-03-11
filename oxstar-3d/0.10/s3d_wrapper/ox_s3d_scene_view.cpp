@@ -584,6 +584,41 @@ static res_T rebuild_tracer(s3d_scene_view* sv) {
     }
     sv->has_geometry = geometry_added;
 
+    /* Build flat postprocess lookup table: geom_id → {shape, shape_id, inst, flip}.
+     * geom_ids are contiguous 0..N-1 from UnifiedTracer, so a flat vector
+     * replaces per-ray std::map lookups (O(1) vs O(log N)). */
+    {
+        size_t n_geom = sv->geom_to_shape.size();
+        sv->pp_table.clear();
+        sv->pp_table.resize(n_geom);
+        for (auto& kv : sv->geom_to_shape) {
+            unsigned gid = kv.first;
+            unsigned sid = kv.second;
+            if (gid >= n_geom) {
+                sv->pp_table.resize(gid + 1);
+            }
+            s3d_scene_view::pp_entry& e = sv->pp_table[gid];
+            e.shape_id = sid;
+            e.shape    = nullptr;
+            e.inst     = nullptr;
+            e.flip_surface = false;
+            auto sit = sv->scn->shapes.find(sid);
+            if (sit != sv->scn->shapes.end()) {
+                e.shape = sit->second;
+            }
+            auto iit = sv->geom_to_inst.find(gid);
+            if (iit != sv->geom_to_inst.end()) {
+                e.inst = iit->second;
+                if (!e.shape && e.inst && e.inst->child_scene) {
+                    auto csit = e.inst->child_scene->shapes.find(sid);
+                    if (csit != e.inst->child_scene->shapes.end())
+                        e.shape = csit->second;
+                }
+            }
+            e.flip_surface = e.shape ? e.shape->flip_surface : false;
+        }
+    }
+
     /* Also build query mesh (closest-point uses same geometry) */
     /* Merge all mesh shapes (including instance children) into a single query mesh.
      * Also collect sphere entries for host-side analytical CP. */
@@ -2722,6 +2757,8 @@ static res_T batch_trace_filtered_wait_d2h_impl(
 
       if (pp_use_omp) {
         size_t omp_accepted = 0;
+        const size_t pp_sz = sv->pp_table.size();
+        const s3d_scene_view::pp_entry* pp = pp_sz ? sv->pp_table.data() : nullptr;
 
         #pragma omp parallel for num_threads(pp_nthreads) \
           schedule(static) reduction(+: omp_accepted)
@@ -2732,10 +2769,18 @@ static res_T batch_trace_filtered_wait_d2h_impl(
                 continue;
             }
             unsigned int shape_id = 0;
-            s3d_shape* shape = resolve_shape(sv, hr.geom_id, shape_id);
-            s3d_shape* inst = nullptr;
-            if (sv->geom_to_inst.count(hr.geom_id))
-                inst = sv->geom_to_inst.at(hr.geom_id);
+            s3d_shape* shape = nullptr;
+            s3d_shape* inst  = nullptr;
+            if (pp && hr.geom_id < (unsigned)pp_sz) {
+                const s3d_scene_view::pp_entry& e = pp[hr.geom_id];
+                shape    = e.shape;
+                shape_id = e.shape_id;
+                inst     = e.inst;
+            } else {
+                shape = resolve_shape(sv, hr.geom_id, shape_id);
+                if (sv->geom_to_inst.count(hr.geom_id))
+                    inst = sv->geom_to_inst.at(hr.geom_id);
+            }
             hitresult_to_s3d_hit(sv, hr, shape, shape_id, hr.prim_idx,
                                  &hits[ii], inst);
             omp_accepted++;
@@ -2746,20 +2791,31 @@ static res_T batch_trace_filtered_wait_d2h_impl(
     }
 #endif
 
-    for (unsigned int i = 0; i < count; i++) {
-        const HitResult& hr = h_hits[i];
-        if (hr.t < 0.0f) {
-            hits[i] = S3D_HIT_NULL;
-            continue;
+    {
+        const size_t pp_sz = sv->pp_table.size();
+        const s3d_scene_view::pp_entry* pp = pp_sz ? sv->pp_table.data() : nullptr;
+        for (unsigned int i = 0; i < count; i++) {
+            const HitResult& hr = h_hits[i];
+            if (hr.t < 0.0f) {
+                hits[i] = S3D_HIT_NULL;
+                continue;
+            }
+            unsigned int shape_id = 0;
+            s3d_shape* shape = nullptr;
+            s3d_shape* inst  = nullptr;
+            if (pp && hr.geom_id < (unsigned)pp_sz) {
+                const s3d_scene_view::pp_entry& e = pp[hr.geom_id];
+                shape    = e.shape;
+                shape_id = e.shape_id;
+                inst     = e.inst;
+            } else {
+                shape = resolve_shape(sv, hr.geom_id, shape_id);
+                if (sv->geom_to_inst.count(hr.geom_id))
+                    inst = sv->geom_to_inst.at(hr.geom_id);
+            }
+            hitresult_to_s3d_hit(sv, hr, shape, shape_id, hr.prim_idx, &hits[i], inst);
+            accepted++;
         }
-        unsigned int shape_id = 0;
-        s3d_shape* shape = resolve_shape(sv, hr.geom_id, shape_id);
-        s3d_shape* inst = nullptr;
-        if (sv->geom_to_inst.count(hr.geom_id))
-            inst = sv->geom_to_inst.at(hr.geom_id);
-
-        hitresult_to_s3d_hit(sv, hr, shape, shape_id, hr.prim_idx, &hits[i], inst);
-        accepted++;
     }
 
 postprocess_done_filtered:
