@@ -3968,13 +3968,32 @@ merged_pass_distribute_step(
 #endif
 
     /* Call step function based on bucket type (absorbed from old distribute).
+     *
+     * RADIATIVE guard: only PATH_RAD_TRACE_PENDING is a true radiative
+     * trace.  Other phases (BND_SF_NULLCOLL_RAD_TRACE, BND_SFN_RAD_TRACE,
+     * BND_EXT_DIFFUSE_TRACE, CND_WOS_FALLBACK_TRACE, etc.) also set
+     * ray_bucket=RADIATIVE for GPU batching but must go through
+     * advance_one_step_with_ray for correct per-phase dispatch.
+     * (Main branch uses phase-based bucketing in compact_active_paths
+     * which routes only RAD_TRACE_PENDING to step_radiative_trace.)
+     *
      * STEP_PAIR guard: only CND_DS_STEP_TRACE / COUPLED_COND_DS_PENDING are
      * true conductive DS step-pairs.  Other 2-ray phases (BND_SF_REINJECT,
      * BND_SS_REINJECT) also set ray_bucket=STEP_PAIR for GPU batching but
      * must go through advance_one_step_with_ray for correct dispatch. */
     switch((enum ray_bucket_type)hot->ray_bucket) {
     case RAY_BUCKET_RADIATIVE:
-      lr = step_radiative_trace(p, hot, scn, h0);
+      if(ph_before == PATH_RAD_TRACE_PENDING) {
+        lr = step_radiative_trace(p, hot, scn, h0);
+      } else {
+        /* Non-RAD_TRACE phases sharing RADIATIVE bucket — generic dispatch */
+        lr = advance_one_step_with_ray(p, hot, scn, h0, h1,
+                                        pool, (size_t)slot);
+        if(ph_before == PATH_ENC_QUERY_FB_EMIT
+        && (enum path_phase)hot->phase == PATH_ENC_LOCATE_PENDING) {
+          (*tl_enc_escalated)++;
+        }
+      }
       break;
     case RAY_BUCKET_STEP_PAIR:
       if(ph_before == PATH_CND_DS_STEP_TRACE
@@ -4586,12 +4605,16 @@ merged_pass(struct wavefront_pool* pool,
           (enum path_phase)hot->phase, hot->ray_count_ext, p);
         size_t added;
 
-        /* Safety: don't overflow stack buffer */
+        /* Mid-loop flush: if buffer would overflow, flush to pinned
+         * and reset.  Atomic reservation ensures no overlap. */
         if(tl_ray_count + nrays > TL_RAY_BUF_MAX) {
-          /* This should not happen with pool=20K and 32 threads.
-           * Each thread handles ~625 paths, max 6 rays each = 3750. */
-          tl_fatal = 1;
-        } else {
+          size_t ray_base = (size_t)_InterlockedExchangeAdd64(
+            (volatile long long*)&total_rays, (long long)tl_ray_count);
+          merged_pass_flush_tl_rays(pool, pv, tl_rays, tl_ray_count, ray_base);
+          tl_ray_count = 0;
+        }
+
+        {
           added = merged_pass_collect_ray(pool, pv, p, hot, slot,
                                            tl_rays, tl_ray_count);
           /* Ray stats */
@@ -4941,6 +4964,26 @@ pool_run_single(struct wavefront_pool* pool,
     /* Step 5: GPU wait + D2H for RT + enc + cp */
     res = gpu_wait_download_all(pool, pv, sv);
     if(res != RES_OK) return res;
+
+    /* DIAG_V3: optional extra cascade after enc/cp distribution.
+     * Main branch resolves enc_locate/cp synchronously within the same
+     * iteration *before* cascade.  Merge-phase defers them to GPU,
+     * meaning freshly-distributed enc/cp RESULT phases wait until the
+     * next iteration's Phase B cascade.  Enable with env var
+     * STARDIS_DIAG_V3=1 to add a compensating cascade sweep here.
+     * If results then match main, the enc/cp timing gap causes the
+     * residual divergence (H2). */
+    {
+      static int diag_v3 = -1;
+      if(diag_v3 < 0) {
+        const char* e = getenv("STARDIS_DIAG_V3");
+        diag_v3 = (e && e[0] == '1') ? 1 : 0;
+      }
+      if(diag_v3) {
+        res = pool_cascade_non_ray_steps_compact(pool, pv, scn);
+        if(res != RES_OK) return res;
+      }
+    }
 
     pool_update_active_count(pool);
 

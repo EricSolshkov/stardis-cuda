@@ -310,25 +310,25 @@ step_bnd_sf_reinject_process(
       //  (double)p->locals.bnd_sf.chosen_dst);
     }
     if(p->locals.bnd_sf.retry_count >= 10) {
-      //log_warn(scn->dev,
-      //  "M5_SF_FAIL path=%u px=%u,%u spp=%u steps=%zu prim=%u pos=%g,%g,%g N=%g,%g,%g solid_side=%d solid_enc=%u enc0=%u enc1=%u delta=%g dst=%g h0miss=%d h1miss=%d dir0=%g,%g,%g dir1=%g,%g,%g\n",
-      //  p->path_id, p->pixel_x, p->pixel_y,
-      //  p->realisation_idx, p->steps_taken,
-      //  p->rwalk.hit_3d.prim.prim_id, SPLIT3(p->rwalk.vtx.P),
-      //  p->rwalk.hit_3d.normal[0], p->rwalk.hit_3d.normal[1],
-      //  p->rwalk.hit_3d.normal[2], (int)p->locals.bnd_sf.solid_side,
-      //  p->locals.bnd_sf.solid_enc_id,
-      //  p->locals.bnd_sf.enc0_id, p->locals.bnd_sf.enc1_id,
-      //  p->locals.bnd_sf.delta_boundary,
-      //  (double)p->locals.bnd_sf.chosen_dst,
-      //  S3D_HIT_NONE(hit0) ? 1 : 0,
-      //  S3D_HIT_NONE(hit1) ? 1 : 0,
-      //  (double)p->locals.bnd_sf.reinject_dir[0][0],
-      //  (double)p->locals.bnd_sf.reinject_dir[0][1],
-      //  (double)p->locals.bnd_sf.reinject_dir[0][2],
-      //  (double)p->locals.bnd_sf.reinject_dir[1][0],
-      //  (double)p->locals.bnd_sf.reinject_dir[1][1],
-      //  (double)p->locals.bnd_sf.reinject_dir[1][2]);
+      log_warn(scn->dev,
+        "M5_SF_FAIL path=%u px=%u,%u spp=%u steps=%zu prim=%u pos=%g,%g,%g N=%g,%g,%g solid_side=%d solid_enc=%u enc0=%u enc1=%u delta=%g dst=%g h0miss=%d h1miss=%d dir0=%g,%g,%g dir1=%g,%g,%g\n",
+        p->path_id, p->pixel_x, p->pixel_y,
+        p->realisation_idx, p->steps_taken,
+        p->rwalk.hit_3d.prim.prim_id, SPLIT3(p->rwalk.vtx.P),
+        p->rwalk.hit_3d.normal[0], p->rwalk.hit_3d.normal[1],
+        p->rwalk.hit_3d.normal[2], (int)p->locals.bnd_sf.solid_side,
+        p->locals.bnd_sf.solid_enc_id,
+        p->locals.bnd_sf.enc0_id, p->locals.bnd_sf.enc1_id,
+        p->locals.bnd_sf.delta_boundary,
+        (double)p->locals.bnd_sf.chosen_dst,
+        S3D_HIT_NONE(hit0) ? 1 : 0,
+        S3D_HIT_NONE(hit1) ? 1 : 0,
+        (double)p->locals.bnd_sf.reinject_dir[0][0],
+        (double)p->locals.bnd_sf.reinject_dir[0][1],
+        (double)p->locals.bnd_sf.reinject_dir[0][2],
+        (double)p->locals.bnd_sf.reinject_dir[1][0],
+        (double)p->locals.bnd_sf.reinject_dir[1][1],
+        (double)p->locals.bnd_sf.reinject_dir[1][2]);
       res = RES_BAD_OP_IRRECOVERABLE;
       goto error;
     }

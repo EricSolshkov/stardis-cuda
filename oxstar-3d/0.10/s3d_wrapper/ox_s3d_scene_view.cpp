@@ -3821,7 +3821,12 @@ res_T s3d_scene_view_find_enclosure_batch_ctx_wait_d2h(
 res_T s3d_batch_trace_context_create(s3d_batch_trace_context** ctx,
                                       size_t max_rays) {
     if (!ctx) return RES_BAD_ARG;
-    *ctx = new (std::nothrow) s3d_batch_trace_context(max_rays);
+    try {
+        *ctx = new (std::nothrow) s3d_batch_trace_context(max_rays);
+    } catch (const std::exception&) {
+        *ctx = nullptr;
+        return RES_UNKNOWN_ERR;
+    }
     return *ctx ? RES_OK : RES_MEM_ERR;
 }
 
@@ -3832,7 +3837,12 @@ void s3d_batch_trace_context_destroy(s3d_batch_trace_context* ctx) {
 res_T s3d_batch_cp_context_create(s3d_batch_cp_context** ctx,
                                    size_t max_queries) {
     if (!ctx) return RES_BAD_ARG;
-    *ctx = new (std::nothrow) s3d_batch_cp_context(max_queries);
+    try {
+        *ctx = new (std::nothrow) s3d_batch_cp_context(max_queries);
+    } catch (const std::exception&) {
+        *ctx = nullptr;
+        return RES_UNKNOWN_ERR;
+    }
     return *ctx ? RES_OK : RES_MEM_ERR;
 }
 
@@ -3843,7 +3853,12 @@ void s3d_batch_cp_context_destroy(s3d_batch_cp_context* ctx) {
 res_T s3d_batch_enc_context_create(s3d_batch_enc_context** ctx,
                                     size_t max_queries) {
     if (!ctx) return RES_BAD_ARG;
-    *ctx = new (std::nothrow) s3d_batch_enc_context(max_queries);
+    try {
+        *ctx = new (std::nothrow) s3d_batch_enc_context(max_queries);
+    } catch (const std::exception&) {
+        *ctx = nullptr;
+        return RES_UNKNOWN_ERR;
+    }
     return *ctx ? RES_OK : RES_MEM_ERR;
 }
 
