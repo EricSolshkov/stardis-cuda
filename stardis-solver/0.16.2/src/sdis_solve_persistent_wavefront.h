@@ -48,8 +48,9 @@
 #define SDIS_SOLVE_PERSISTENT_WAVEFRONT_H
 
 #include "sdis.h"
-#include "sdis_solve_wavefront.h"  /* path_state, path_phase, ray_request */
-#include "sdis_wf_hot.h"               /* P0_OPT: path_hot */
+#include "sdis_wf_types.h"  /* path_phase, ray_request */
+#include "sdis_wf_state.h"  /* path_state */
+#include "sdis_wf_hot.h"    /* P0_OPT: path_hot */
 
 #include <star/s3d.h>
 #include <star/ssp.h>
@@ -461,16 +462,10 @@ count_path_rays(const struct path_state* p)
 {
   /* B-4 M1-v2: 6-ray enc_query uses ray_count_ext for extra rays.
    * P0_OPT: phase/ray_count_ext moved to path_hot; this legacy helper
-   * is only compiled for the old wavefront path (sdis_solve_wavefront.c).
+   * retained for old code paths that don't have SoA context.
    * The persistent wavefront uses count_path_rays_soa() instead. */
-#ifdef SDIS_P0_OPT
   (void)p;
   return (size_t)p->ray_req.ray_count;  /* hot fields unavailable */
-#else
-  if(p->phase == PATH_ENC_QUERY_EMIT && p->ray_count_ext == 6)
-    return 6;
-  return (size_t)p->ray_req.ray_count;
-#endif
 }
 
 /* P1: SoA-friendly variant — reads phase + ray_count_ext from SoA,

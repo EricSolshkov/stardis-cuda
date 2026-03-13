@@ -1675,25 +1675,13 @@ sdis_solve_probe
    const struct sdis_solve_probe_args* args,
    struct sdis_estimator** estimator);
 
-/* Wavefront (breadth-first) variant of sdis_solve_probe.
+/* Persistent wavefront variant — runs Monte-Carlo realisations in a single
+ * persistent wavefront pool for improved GPU utilisation.
  *
  * Semantically identical to sdis_solve_probe — same input args / output
- * estimator — but the Monte-Carlo realisations are advanced in lockstep
- * using the wavefront execution model (batch ray-tracing).
- *
- * Intended for GPU acceleration and for validating wavefront / depth-first
- * numerical equivalence. */
-SDIS_API res_T
-sdis_solve_wavefront_probe
-  (struct sdis_scene* scn,
-   const struct sdis_solve_probe_args* args,
-   struct sdis_estimator** estimator);
-
-/* Persistent wavefront variant of sdis_solve_wavefront_probe.
- *
- * Uses the persistent wavefront pool (same main loop as the camera solver)
- * with probe-specific vtable dispatch.  Avoids the O(nrealisations) memory
- * allocation of the non-persistent variant. */
+ * estimator — but uses the persistent wavefront pool (same main loop as the
+ * camera solver) with probe-specific vtable dispatch.  Avoids the
+ * O(nrealisations) memory allocation. */
 SDIS_API res_T
 sdis_solve_persistent_wavefront_probe
   (struct sdis_scene* scn,

@@ -17,7 +17,6 @@
 /* Wavefront steps: core dispatch + utility + ray setup.  Split from sdis_wf_steps.c. */
 
 #include "sdis_wf_steps.h"
-#include "sdis_solve_wavefront.h"  /* struct wavefront_context (used by types) */
 #include "sdis_solve_persistent_wavefront.h"  /* P1: full wavefront_pool definition */
 #include "sdis.h"
 

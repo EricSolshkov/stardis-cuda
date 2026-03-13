@@ -67,7 +67,6 @@ set(SDIS_SOURCES
     src/sdis_scene.c
     src/sdis_solve.c
     src/sdis_solve_camera.c
-    src/sdis_solve_wavefront.c
     src/sdis_wf_steps_core.c
     src/sdis_wf_steps_enc.c
     src/sdis_wf_steps_cnd.c
@@ -78,7 +77,6 @@ set(SDIS_SOURCES
     src/sdis_wf_steps_cnv.c
     src/sdis_solve_persistent_wavefront.c
     src/sdis_wf_hot.c
-    src/sdis_wf_soa.c
     src/sdis_wf_rng_adapter.cpp
     src/sdis_source.c
     src/sdis_tile.c
@@ -154,10 +152,6 @@ else()
     target_compile_definitions(sdis_obj PUBLIC  SDIS_STATIC_BUILD)
     add_library(sdis STATIC)
 endif()
-
-# P0_OPT: hot fields (phase, active, needs_ray, ray_bucket, ray_count_ext)
-# extracted from path_state into path_hot.  Old wavefront code disabled.
-target_compile_definitions(sdis_obj PUBLIC SDIS_P0_OPT)
 
 target_link_libraries(sdis PUBLIC sdis_obj)
 
@@ -340,15 +334,6 @@ if(ENABLE_TESTS)
     add_test(NAME test_sdis_wavefront_benchmark
              COMMAND test_sdis_wavefront_benchmark)
     set_tests_properties(test_sdis_wavefront_benchmark PROPERTIES TIMEOUT 1200)
-
-    # ---- P1 dispatch SoA unit tests ----
-    add_executable(test_sdis_dispatch_soa
-        src/test_sdis_dispatch_soa.c)
-    target_link_libraries(test_sdis_dispatch_soa PRIVATE sdis_obj)
-    add_test(NAME test_sdis_dispatch_soa COMMAND test_sdis_dispatch_soa)
-    set_tests_properties(test_sdis_dispatch_soa PROPERTIES
-        TIMEOUT 60
-        LABELS "wf;p1;soa")
 
     # ---- P0 wavefront numerical correctness tests ----
     # Links sdis_obj (OBJECT lib) for LOCAL_SYM access, same as B-4 tests.

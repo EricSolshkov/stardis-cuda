@@ -17,7 +17,6 @@
 /* Wavefront steps: external net flux (M7).  Split from sdis_wf_steps.c. */
 
 #include "sdis_wf_steps.h"
-#include "sdis_solve_wavefront.h"  /* struct wavefront_context (used by types) */
 #include "sdis.h"
 
 #include <rsys/float33.h>   /* f33_rotation, f33_mulf3, f33_basis (B-4 M1) */
@@ -53,12 +52,12 @@
  * batch trace pipeline.
  *
  * State flow:
- *   EXT_CHECK â†?(shadow)   EXT_DIRECT_TRACE â†?EXT_DIRECT_RESULT
- *             â†?(diffuse)  EXT_DIFFUSE_TRACE â†?EXT_DIFFUSE_RESULT
- *                          â†?(reflect) EXT_DIFFUSE_SHADOW_TRACE
- *                                      â†?EXT_DIFFUSE_SHADOW_RESULT â†?loop
- *                          â†?(miss/absorb) EXT_FINALIZE
- *             â†?(no flux)  return_state (bypass)
+ *   EXT_CHECK ï¿½?(shadow)   EXT_DIRECT_TRACE ï¿½?EXT_DIRECT_RESULT
+ *             ï¿½?(diffuse)  EXT_DIFFUSE_TRACE ï¿½?EXT_DIFFUSE_RESULT
+ *                          ï¿½?(reflect) EXT_DIFFUSE_SHADOW_TRACE
+ *                                      ï¿½?EXT_DIFFUSE_SHADOW_RESULT ï¿½?loop
+ *                          ï¿½?(miss/absorb) EXT_FINALIZE
+ *             ï¿½?(no flux)  return_state (bypass)
  *
  * See CPU reference: sdis_heat_path_boundary_Xd_handle_external_net_flux.h
  ******************************************************************************/
@@ -109,7 +108,7 @@ step_bnd_ext_check(struct path_state* p, struct path_hot* hot,
   handle_flux = interface_side_is_external_flux_handled(interf, &frag);
   handle_flux = handle_flux && (scn->source != NULL);
   if(!handle_flux) {
-    /* No external flux â†?skip directly to caller */
+    /* No external flux ï¿½?skip directly to caller */
     hot->phase = (uint8_t)ext->return_state;
     hot->needs_ray = 0;
     goto exit;
@@ -161,7 +160,7 @@ step_bnd_ext_check(struct path_state* p, struct path_hot* hot,
   ext->cos_theta = cos_theta;
 
   if(cos_theta > 0) {
-    /* Source is above the surface â†?emit shadow ray to check occlusion */
+    /* Source is above the surface ï¿½?emit shadow ray to check occlusion */
     float pos_f[3];
     f3_set_d3(pos_f, ext->frag_P);
 
@@ -191,7 +190,7 @@ step_bnd_ext_check(struct path_state* p, struct path_hot* hot,
     hot->needs_ray = 1;
     hot->phase = (uint8_t)PATH_BND_EXT_DIRECT_TRACE;
   } else {
-    /* Source behind surface â†?skip direct contribution, go to diffuse */
+    /* Source behind surface ï¿½?skip direct contribution, go to diffuse */
     ext->flux_direct = 0;
 
     /* Set up initial diffuse bounce ray */
@@ -260,11 +259,11 @@ step_bnd_ext_direct_result(struct path_state* p, struct path_hot* hot,
 
   ASSERT(p && scn && hit);
 
-  /* Shadow ray: if we hit something, source is occluded â†?direct = 0 */
+  /* Shadow ray: if we hit something, source is occluded ï¿½?direct = 0 */
   if(!S3D_HIT_NONE(hit)) {
     ext->flux_direct = 0;
   } else {
-    /* Source visible â†?compute direct contribution */
+    /* Source visible ï¿½?compute direct contribution */
     double Ld = ext->src_sample.radiance_term; /* [W/m^2/sr] */
     ext->flux_direct =
         ext->cos_theta * Ld / ext->src_sample.pdf; /* [W/m^2] */
@@ -323,7 +322,7 @@ step_bnd_ext_diffuse_result(struct path_state* p, struct path_hot* hot,
 
   ASSERT(p && scn && hit);
 
-  /* --- Miss: ray escaped to environment â†?scattered flux = PI --- */
+  /* --- Miss: ray escaped to environment ï¿½?scattered flux = PI --- */
   if(S3D_HIT_NONE(hit)) {
     ext->flux_scattered = PI;
     ext->scattered_dir[0] = ext->dir[0];
@@ -389,7 +388,7 @@ step_bnd_ext_diffuse_result(struct path_state* p, struct path_hot* hot,
 
       /* Absorption test */
       if(ssp_rng_canonical(p->rng) < brdf.emissivity) {
-        /* Absorbed â†?diffuse bounce terminates with no further contribution */
+        /* Absorbed ï¿½?diffuse bounce terminates with no further contribution */
         hot->phase = (uint8_t)PATH_BND_EXT_FINALIZE;
         hot->needs_ray = 0;
         goto exit;
@@ -453,7 +452,7 @@ step_bnd_ext_diffuse_result(struct path_state* p, struct path_hot* hot,
           ext->dir[2] = (float)bounce.dir[2];
           goto exit;
         }
-        /* Source not reachable from specular bounce â†?no shadow ray needed,
+        /* Source not reachable from specular bounce ï¿½?no shadow ray needed,
          * just continue bouncing in the specular direction */
         ext->dir[0] = (float)bounce.dir[0];
         ext->dir[1] = (float)bounce.dir[1];
@@ -472,7 +471,7 @@ step_bnd_ext_diffuse_result(struct path_state* p, struct path_hot* hot,
 
         cos_theta_bounce = d3_dot(samp.dir, N);
         if(cos_theta_bounce > 0) {
-          /* Source above this surface â†?emit shadow ray */
+          /* Source above this surface ï¿½?emit shadow ray */
           ext->src_sample = samp;
           ext->cos_theta = cos_theta_bounce;
 
@@ -503,14 +502,14 @@ step_bnd_ext_diffuse_result(struct path_state* p, struct path_hot* hot,
           ext->dir[2] = (float)bounce.dir[2];
           goto exit;
         }
-        /* Source behind this surface â†?L = 0, no shadow ray needed */
+        /* Source behind this surface ï¿½?L = 0, no shadow ray needed */
         /* Just continue bouncing */
         ext->dir[0] = (float)bounce.dir[0];
         ext->dir[1] = (float)bounce.dir[1];
         ext->dir[2] = (float)bounce.dir[2];
       }
 
-      /* No shadow ray needed at this bounce â†?emit next diffuse bounce ray */
+      /* No shadow ray needed at this bounce ï¿½?emit next diffuse bounce ray */
       ext->nbounces++;
 
       p->ray_req.origin[0] = ext->pos[0];
@@ -559,7 +558,7 @@ step_bnd_ext_diffuse_shadow_result(struct path_state* p,
 
   /* Process shadow ray result at bounce position */
   if(S3D_HIT_NONE(hit)) {
-    /* Not occluded â†?accumulate direct contribution at this bounce.
+    /* Not occluded ï¿½?accumulate direct contribution at this bounce.
      * For specular bounces, L = Ld (radiance_term).
      * For diffuse bounces, L = Ld * cos_theta / (PI * pdf). */
     double Ld = ext->src_sample.radiance_term;

@@ -17,7 +17,6 @@
 /* Wavefront steps: enclosure locate (M10) + 6-ray query (M1-v2).  Split from sdis_wf_steps.c. */
 
 #include "sdis_wf_steps.h"
-#include "sdis_solve_wavefront.h"  /* struct wavefront_context (used by types) */
 #include "sdis.h"
 
 #include <rsys/float33.h>   /* f33_rotation, f33_mulf3, f33_basis (B-4 M1) */

@@ -22,7 +22,6 @@
 #include "sdis_medium_c.h"
 #include "sdis_realisation.h"
 #include "sdis_scene_c.h"
-#include "sdis_solve_wavefront.h"
 #include "sdis_solve_persistent_wavefront.h"
 #include "sdis_tile.h"
 #ifdef SDIS_ENABLE_MPI
@@ -637,158 +636,22 @@ sdis_solve_camera
   register_paths = is_master_process
     ? args->register_paths : SDIS_HEAT_PATH_NONE;
 
-  /* Phase B-3: persistent wavefront mode.
-   * Set STARDIS_PERSISTENT_WF=1 to use the persistent wavefront pool that
-   * processes the entire image in a single global pool (no per-tile
-   * isolation).  This dramatically improves GPU utilisation. */
-  {
-    const char* pwf_env = getenv("STARDIS_PERSISTENT_WF");
-    //const int use_persistent_wf = (pwf_env && pwf_env[0] == '1');
-    const int use_persistent_wf = 1;
+  /* Phase B-3: persistent wavefront solver (only active path).
+   * Processes the entire image in a single global pool for optimal GPU utilisation. */
+  log_info(scn->dev, "Persistent wavefront solver enabled (Phase B-3).\n");
 
-    if(use_persistent_wf) {
-      log_info(scn->dev, "Persistent wavefront solver enabled (Phase B-3).\n");
-
-      res = solve_camera_persistent_wavefront(
-        scn, per_thread_rng, scn->dev->nthreads,
-        enc_id, args->cam, args->time_range,
-        args->image_definition, args->spp, register_paths,
-        pix_sz, args->picard_order, args->diff_algo, buf,
-        progress, pcent_progress, PROGRESS_MSG);
-      if(res != RES_OK) goto error;
-
-      print_progress_completion(scn->dev, progress, PROGRESS_MSG);
-
-      /* Skip tile-based loop and gather — results already in buf */
-      goto persistent_wf_done;
-    }
-  }
-
-  /* Phase B-2: wavefront mode toggle.
-   * Set STARDIS_WAVEFRONT=1 to use the wavefront solver instead of the
-   * original per-pixel depth-first solver.  The wavefront solver batches
-   * ray requests across all active paths in a tile and traces them via the
-   * Phase B-1 batch trace API. */
-  {
-    const char* wf_env = getenv("STARDIS_WAVEFRONT");
-    /* Default to wavefront ON; set STARDIS_WAVEFRONT=0 to disable */
-    const int use_wavefront = !(wf_env && wf_env[0] == '0');
-
-    if(use_wavefront) {
-      log_info(scn->dev, "Wavefront solver enabled (Phase B-2).\n");
-    }
-
-  #pragma omp parallel for schedule(static, 1/*chunk size*/)
-  for(mcode = mcode_1st; mcode < (int64_t)ntiles_adjusted; mcode+=mcode_incr) {
-    size_t tile_org[2] = {0, 0};
-    size_t tile_sz[2] = {0, 0};
-    struct tile* tile = NULL;
-    const int ithread = omp_get_thread_num();
-    struct ssp_rng* rng = per_thread_rng[ithread];
-    size_t n;
-    int pcent;
-    res_T res_local = RES_OK;
-
-    if(ATOMIC_GET(&res) != RES_OK) continue;
-
-    tile_org[0] = morton2D_decode_u16((uint32_t)(mcode>>0));
-    if(tile_org[0] >= ntiles_x) continue; /* Discard tile */
-    tile_org[1] = morton2D_decode_u16((uint32_t)(mcode>>1));
-    if(tile_org[1] >= ntiles_y) continue; /* Discard tile */
-
-    res_local = tile_create(scn->dev->allocator, &tile);
-    if(tile == NULL) {
-      log_err(scn->dev, "%s: error allocating the tile (%lu, %lu) -- %s\n",
-        FUNC_NAME,
-        (unsigned long)tile_org[0],
-        (unsigned long)tile_org[1],
-        res_to_cstr(res_local));
-      ATOMIC_SET(&res, res_local);
-      continue;
-    }
-
-    /* Register the tile */
-    #pragma omp critical
-    list_add_tail(&tiles, &tile->node);
-
-    /* Setup the tile coordinates */
-    tile->data.x = (uint16_t)tile_org[0];
-    tile->data.y = (uint16_t)tile_org[1];
-
-    /* Setup the tile coordinates in the image plane */
-    tile_org[0] *= TILE_SIZE;
-    tile_org[1] *= TILE_SIZE;
-    tile_sz[0] = MMIN(TILE_SIZE, args->image_definition[0] - tile_org[0]);
-    tile_sz[1] = MMIN(TILE_SIZE, args->image_definition[1] - tile_org[1]);
-
-    /* Draw the tile */
-    if(use_wavefront) {
-#ifdef SDIS_P0_OPT
-      /* P0_OPT: old per-tile wavefront disabled; camera mode uses the
-       * persistent wavefront exclusively (solve_persistent_wavefront). */
-      (void)solve_tile;
-      res_local = RES_BAD_OP;  /* should never reach here */
-#else
-      res_local = solve_tile_wavefront
-        (scn, rng, enc_id, args->cam, args->time_range, tile_org, tile_sz,
-         args->spp, register_paths, pix_sz, args->picard_order, args->diff_algo,
-         buf, tile);
-#endif
-    } else {
-      res_local = solve_tile
-        (scn, rng, enc_id, args->cam, args->time_range, tile_org, tile_sz,
-         args->spp, register_paths, pix_sz, args->picard_order, args->diff_algo,
-         buf, tile);
-    }
-    if(res_local != RES_OK) {
-      ATOMIC_SET(&res, res_local);
-      continue;
-    }
-
-    /* Update progress */
-    n = (size_t)ATOMIC_INCR(&nsolved_tiles);
-    pcent = (int)((double)n*100.0 / (double)ntiles_proc + 0.5/*round*/);
-    #pragma omp critical
-    if(pcent/pcent_progress > progress[0]/pcent_progress) {
-      progress[0] = pcent;
-      print_progress_update(scn->dev, progress, PROGRESS_MSG);
-    }
-  }
-  } /* end use_wavefront scope */
-
-  /* Synchronise the processes */
-  process_barrier(scn->dev);
-
-  res = gather_res_T(scn->dev, (res_T)res);
-  if(res != RES_OK) 
-      goto error;
+  res = solve_camera_persistent_wavefront(
+    scn, per_thread_rng, scn->dev->nthreads,
+    enc_id, args->cam, args->time_range,
+    args->image_definition, args->spp, register_paths,
+    pix_sz, args->picard_order, args->diff_algo, buf,
+    progress, pcent_progress, PROGRESS_MSG);
+  if(res != RES_OK) goto error;
 
   print_progress_completion(scn->dev, progress, PROGRESS_MSG);
   #undef PROGRESS_MSG
 
-  /* Report computation time */
-  time_sub(&time0, time_current(&time1), &time0);
-  time_dump(&time0, TIME_ALL, NULL, buffer, sizeof(buffer));
-  log_info(scn->dev, "Image rendered in %s.\n", buffer);
-
-  /* Gather the RNG proxy sequence IDs and ensure that the RNG proxy state of
-   * the master process is greater than the RNG proxy state of all other
-   * processes */
-  res = gather_rng_proxy_sequence_id(scn->dev, rng_proxy);
-  if(res != RES_OK) 
-      goto error;
-
-  time_current(&time0);
-
-  res = gather_tiles(scn->dev, buf, args->spp, ntiles, &tiles);
-  if(res != RES_OK) 
-      goto error;
-
-  time_sub(&time0, time_current(&time1), &time0);
-  time_dump(&time0, TIME_ALL, NULL, buffer, sizeof(buffer));
-  log_info(scn->dev, "Image tiles gathered in %s.\n", buffer);
-
-persistent_wf_done:
+  /* Finalize estimator buffer */
   if(is_master_process) {
     res = finalize_estimator_buffer(buf, rng_proxy, args->spp);
     if(res != RES_OK) 
