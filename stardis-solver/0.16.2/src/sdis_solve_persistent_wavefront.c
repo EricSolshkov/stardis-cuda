@@ -3810,7 +3810,7 @@ gpu_wait_d2h_all(struct wavefront_pool* pool,
   time_current(&t1);
   pool->time_trace_s += time_elapsed_sec(&t0, &t1);
 
-  /* ── enc_locate wait + post-process + distribute ── */
+  /* ── enc_locate wait + post-process (distribute deferred to merged_pass Phase A) ── */
   time_current(&t0);
   if(pv->enc_gpu_pending) {
     struct s3d_batch_enc_stats enc_stats;
@@ -3823,10 +3823,6 @@ gpu_wait_d2h_all(struct wavefront_pool* pool,
     if(res != RES_OK) return res;
     pv->enc_gpu_pending = 0;
 
-    /* Distribute enc results to path_state (same as post_merged_enc_cp) */
-    res = pool_distribute_enc_locate_results(pool, pv);
-    if(res != RES_OK) return res;
-
     pool->enc_locates_total     += pv->enc_locate_count;
     pool->enc_locates_resolved  += enc_stats.resolved;
     pool->enc_locates_degenerate += enc_stats.degenerate;
@@ -3834,7 +3830,7 @@ gpu_wait_d2h_all(struct wavefront_pool* pool,
   time_current(&t1);
   pool->time_enc_locate_s += time_elapsed_sec(&t0, &t1);
 
-  /* ── closest_point wait + post-process + distribute ── */
+  /* ── closest_point wait + post-process (distribute deferred to merged_pass Phase A) ── */
   time_current(&t0);
   if(pv->cp_gpu_pending) {
     struct s3d_batch_cp_stats cp_stats;
@@ -3846,10 +3842,6 @@ gpu_wait_d2h_all(struct wavefront_pool* pool,
       pv->cp_hits, &cp_stats);
     if(res != RES_OK) return res;
     pv->cp_gpu_pending = 0;
-
-    /* Distribute cp results to path_state (same as post_merged_enc_cp) */
-    res = pool_distribute_cp_results(pool, pv);
-    if(res != RES_OK) return res;
 
     pool->cp_total     += pv->cp_count;
     pool->cp_accepted  += cp_stats.batch_accepted;
@@ -4336,6 +4328,7 @@ merged_pass(struct wavefront_pool* pool,
   int had_fatal = 0;
   size_t n = pv->active_compact;
   size_t total_rays = 0;
+  res_T res = RES_OK;
 
   if(omp_nthreads < 1) omp_nthreads = 1;
 
@@ -4344,7 +4337,21 @@ merged_pass(struct wavefront_pool* pool,
   assert_result_phases_backed(pool, pv);
 #endif
 
-  /* Reset per-view counters */
+  /* ── Phase A: Distribute all GPU results ── */
+
+  /* A-enc: distribute enc_locate results (batch-level, before counter reset) */
+  if(pv->enc_locate_count > 0 && !pv->enc_gpu_pending) {
+    res = pool_distribute_enc_locate_results(pool, pv);
+    if(res != RES_OK) return res;
+  }
+
+  /* A-cp: distribute closest_point results (batch-level, before counter reset) */
+  if(pv->cp_count > 0 && !pv->cp_gpu_pending) {
+    res = pool_distribute_cp_results(pool, pv);
+    if(res != RES_OK) return res;
+  }
+
+  /* Reset per-view counters (enc/cp counts consumed above; A-rt below in per-path loop) */
   pv->ray_count = 0;
   pv->enc_locate_count = 0;
   pv->cp_count = 0;
