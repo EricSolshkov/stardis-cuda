@@ -359,6 +359,34 @@ should_split(const struct wavefront_pool* pool)
 static void
 merge_to_single_pool(struct wavefront_pool* pool)
 {
+  /* ── Fix: invalidate stale batch_idx for former V1 paths ──
+   *
+   * Each pool_view owns a separate ray_hits[] buffer.  After merge the
+   * single-pool loop uses views[0]'s buffer exclusively.  V1 paths whose
+   * needs_ray==1 still carry batch_idx values that index into views[1]'s
+   * ray_hits — reading from views[0]'s buffer at those offsets yields
+   * wrong ray results (root cause of post-merge M5_SF_FAIL failures).
+   *
+   * Setting batch_idx to the sentinel value makes merged_pass Phase A
+   * skip these paths.  Phase B (cascade) is a no-op because it exits
+   * immediately on needs_ray==1.  Phase C re-collects the ray requests
+   * into views[0]'s buffer with correct indices.  The cost is one extra
+   * GPU trace batch for these paths (~V1 active count, typically < 12.5%
+   * of pool at merge time). */
+  {
+    size_t v1_base = pool->views[1].base;
+    size_t v1_end  = v1_base + pool->views[1].view_size;
+    size_t i;
+    size_t invalidated = 0;
+    for(i = v1_base; i < v1_end; i++) {
+      if(pool->hot_arr[i].active && pool->hot_arr[i].needs_ray) {
+        pool->slots[i].ray_req.batch_idx = (uint32_t)-1;
+        invalidated++;
+      }
+    }
+    (void)invalidated; /* used only for debugging */
+  }
+
   /* Expand views[0] to cover the full pool */
   pool->views[0].base      = 0;
   pool->views[0].view_size = pool->pool_size;
