@@ -59,6 +59,12 @@
 #include <string.h>
 #include <stdio.h>  /* pixel trace */
 
+/* O13: Windows thread API for async submit */
+#ifdef _WIN32
+#include <windows.h>
+#include <process.h>   /* _beginthreadex */
+#endif
+
 /* O7: Software prefetch — portable macro for MSVC / GCC / Clang */
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -2638,10 +2644,12 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     (unsigned long long)pool->max_path_depth,
     (unsigned long long)pool->diag_refill_count);
 
-  /* Pipeline phase timing (fine-grained) */
+  /* Pipeline phase timing (fine-grained)
+   * O13: submit runs on a background thread, overlapping with merged_pass.
+   * When coverage > 100%, the excess is submit time hidden behind CPU work. */
   log_info(dev,
     "  timing (pipeline phases):\n"
-    "    submit       =%8.3fs [%4.1f%%]%s\n"
+    "    submit       =%8.3fs [%4.1f%%] (async thread, overlapped)%s\n"
     "    wait_d2h     =%8.3fs [%4.1f%%]  (trace=%.3fs  enc=%.3fs  cp=%.3fs)\n"
     "      trace_stall=%8.3fs           (device: kern=%.3fs d2h=%.3fs, %.0f%% hidden)\n"
     "      trace_post =%8.3fs           (host: post=%.3fs retrace=%.3fs)\n"
@@ -4291,6 +4299,143 @@ pool_run_single(struct wavefront_pool* pool,
 }
 
 /*******************************************************************************
+ * O13: Async submit thread — per-view completion events
+ *
+ * A dedicated thread runs gpu_submit_all() so the main thread can immediately
+ * proceed with the other view's wait_d2h + merged_pass.
+ *
+ * Key design: per-view done events (submit_evt_done[0], submit_evt_done[1]).
+ * Each half-cycle waits for the SAME view's submit from the PREVIOUS cycle
+ * (which had a full opposing half-cycle to complete), NOT for the other view's
+ * submit that was just signaled.
+ *
+ *   submit_evt_go      — main sets to trigger a new submit job
+ *   submit_evt_done[i] — submit thread sets when view i's job is finished
+ *
+ * Timeline per full cycle:
+ *   Half-A: ensure_done(view=0) → wait_d2h(A) → merged(A) → signal(A)
+ *   Half-B: ensure_done(view=1) → wait_d2h(B) → merged(B) → signal(B)
+ *
+ * submit(A) from Half-A runs during Half-B's ~40s CPU work.
+ * ensure_done(view=0) in the NEXT cycle's Half-A sees A's submit already done.
+ ******************************************************************************/
+#ifdef _WIN32
+
+static unsigned __stdcall
+submit_thread_func(void* arg)
+{
+  struct wavefront_pool* pool = (struct wavefront_pool*)arg;
+  HANDLE handles[2];
+  handles[0] = (HANDLE)pool->submit_evt_go[0];
+  handles[1] = (HANDLE)pool->submit_evt_go[1];
+
+  while(!pool->submit_shutdown) {
+    DWORD r = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+    if(pool->submit_shutdown) break;
+
+    {
+      int vi = (int)(r - WAIT_OBJECT_0);
+      struct time t0, t1;
+      if(vi < 0 || vi > 1) break; /* unexpected */
+
+      /* go[vi] was auto-reset → already consumed by Wait */
+      time_current(&t0);
+      pool->submit_result[vi] = gpu_submit_all(pool, pool->submit_pv[vi],
+                                                pool->submit_sv[vi]);
+      time_current(&t1);
+      pool->submit_elapsed_s[vi] = time_elapsed_sec(&t0, &t1);
+
+      SetEvent((HANDLE)pool->submit_evt_done[vi]);
+    }
+  }
+  return 0;
+}
+
+static void
+submit_thread_init(struct wavefront_pool* pool)
+{
+  pool->submit_evt_go[0]   = (void*)CreateEventA(NULL, FALSE, FALSE, NULL); /* auto-reset */
+  pool->submit_evt_go[1]   = (void*)CreateEventA(NULL, FALSE, FALSE, NULL); /* auto-reset */
+  pool->submit_evt_done[0] = (void*)CreateEventA(NULL, TRUE, TRUE, NULL);  /* manual, start signaled */
+  pool->submit_evt_done[1] = (void*)CreateEventA(NULL, TRUE, TRUE, NULL);  /* manual, start signaled */
+  pool->submit_shutdown = 0;
+  pool->submit_result[0] = RES_OK;
+  pool->submit_result[1] = RES_OK;
+  pool->submit_elapsed_s[0] = 0;
+  pool->submit_elapsed_s[1] = 0;
+  pool->submit_pv[0] = NULL;  pool->submit_pv[1] = NULL;
+  pool->submit_sv[0] = NULL;  pool->submit_sv[1] = NULL;
+  pool->submit_thread_handle = (void*)_beginthreadex(
+    NULL, 0, submit_thread_func, pool, 0, NULL);
+}
+
+static void
+submit_thread_destroy(struct wavefront_pool* pool)
+{
+  if(!pool->submit_thread_handle) return;
+
+  pool->submit_shutdown = 1;
+  _ReadWriteBarrier();
+  SetEvent((HANDLE)pool->submit_evt_go[0]);
+  SetEvent((HANDLE)pool->submit_evt_go[1]);
+
+  WaitForSingleObject((HANDLE)pool->submit_thread_handle, INFINITE);
+
+  CloseHandle((HANDLE)pool->submit_thread_handle);
+  CloseHandle((HANDLE)pool->submit_evt_go[0]);
+  CloseHandle((HANDLE)pool->submit_evt_go[1]);
+  CloseHandle((HANDLE)pool->submit_evt_done[0]);
+  CloseHandle((HANDLE)pool->submit_evt_done[1]);
+
+  pool->submit_thread_handle = NULL;
+  pool->submit_evt_go[0] = NULL;
+  pool->submit_evt_go[1] = NULL;
+  pool->submit_evt_done[0] = NULL;
+  pool->submit_evt_done[1] = NULL;
+}
+
+/** Fire-and-forget: queue a submit job for view_idx. No serialization needed. */
+static void
+submit_thread_signal(struct wavefront_pool* pool,
+                     struct pool_view* pv,
+                     struct s3d_scene_view* sv,
+                     int view_idx)
+{
+  ResetEvent((HANDLE)pool->submit_evt_done[view_idx]);
+  pool->submit_pv[view_idx] = pv;
+  pool->submit_sv[view_idx] = sv;
+  _ReadWriteBarrier();
+  SetEvent((HANDLE)pool->submit_evt_go[view_idx]);
+}
+
+/** Block until view_idx's submit completes. Returns that view's result. */
+static res_T
+submit_thread_wait_view(struct wavefront_pool* pool, int view_idx)
+{
+  WaitForSingleObject((HANDLE)pool->submit_evt_done[view_idx], INFINITE);
+  return pool->submit_result[view_idx];
+}
+
+#else
+/* Non-Windows stub: synchronous fallback */
+static void submit_thread_init(struct wavefront_pool* pool) { (void)pool; }
+static void submit_thread_destroy(struct wavefront_pool* pool) { (void)pool; }
+static void submit_thread_signal(struct wavefront_pool* pool,
+                                 struct pool_view* pv,
+                                 struct s3d_scene_view* sv,
+                                 int view_idx) {
+  struct time t0, t1;
+  time_current(&t0);
+  pool->submit_result[view_idx] = gpu_submit_all(pool, pv, sv);
+  time_current(&t1);
+  pool->submit_elapsed_s[view_idx] = time_elapsed_sec(&t0, &t1);
+}
+static res_T submit_thread_wait_view(struct wavefront_pool* pool, int view_idx) {
+  return pool->submit_result[view_idx];
+}
+#endif
+
+/*******************************************************************************
  * pool_run_dual — Dual-buffer pipeline main loop (stream auto-ordering).
  *
  * O12: Each view's submit queues H2D→Kernel→D2H as consecutive async calls
@@ -4298,12 +4443,14 @@ pool_run_single(struct wavefront_pool* pool,
  * (transfer_stream waits for kernel_done before D2H) replace the old
  * explicit CPU-side kernel sync.
  *
- * Pipeline shape per half-cycle:
- *   wait_d2h(X) → merged_pass(X) + compact + refill → submit(X)
+ * O13: Submit is offloaded to a dedicated thread.  After compact+refill(X),
+ * the main thread signals submit(X) and immediately proceeds to wait_d2h(Y).
+ * The submit thread runs gpu_submit_all() concurrently with the main thread's
+ * merged_pass(Y).
  *
- * PCIe overlap opportunity: after submit(X) queues H2D(X), the CPU
- * immediately proceeds to wait_d2h(Y).  If Y's D2H is still in-flight,
- * the two transfers run on separate copy engines (full duplex).
+ * Pipeline shape per half-cycle:
+ *   ensure_submit_done(X) → wait_d2h(X) → merged_pass(X) + compact + refill
+ *   → signal_submit(X) → [proceed to Y immediately]
  ******************************************************************************/
 static res_T
 pool_run_dual(struct wavefront_pool* pool,
@@ -4315,37 +4462,40 @@ pool_run_dual(struct wavefront_pool* pool,
   res_T res;
   size_t refill_count = 0;
 
+  /* ═══════ O13: Start submit thread ═══════ */
+  submit_thread_init(pool);
+
   /* ═══════ Startup: prepare both views, then submit both ═══════ */
 
   /* A: initial CPU work */
   compact_active_paths(pool, pv_a);
   res = merged_pass(pool, pv_a, scn);
-  if(res != RES_OK) return res;
+  if(res != RES_OK) goto dual_cleanup;
   compact_active_paths(pool, pv_a);
   res = refill_pool(pool, pv_a, &refill_count);
-  if(res != RES_OK) return res;
+  if(res != RES_OK) goto dual_cleanup;
 
   /* B: initial CPU work */
   compact_active_paths(pool, pv_b);
   res = merged_pass(pool, pv_b, scn);
-  if(res != RES_OK) return res;
+  if(res != RES_OK) goto dual_cleanup;
   compact_active_paths(pool, pv_b);
   res = refill_pool(pool, pv_b, &refill_count);
-  if(res != RES_OK) return res;
+  if(res != RES_OK) goto dual_cleanup;
 
-  /* Submit both: H2D→Kernel→D2H fully queued on each view's streams */
+  /* Startup submit: both views synchronously (thread not warmed up yet) */
   { struct time t_sub0, t_sub1;
     time_current(&t_sub0);
 #ifdef SDIS_DEBUG_CHECKS
     assert_no_pending_result_before_dispatch(pool, pv_a);
 #endif
     res = gpu_submit_all(pool, pv_a, sv);
-    if(res != RES_OK) return res;
+    if(res != RES_OK) goto dual_cleanup;
 #ifdef SDIS_DEBUG_CHECKS
     assert_no_pending_result_before_dispatch(pool, pv_b);
 #endif
     res = gpu_submit_all(pool, pv_b, sv);
-    if(res != RES_OK) return res;
+    if(res != RES_OK) goto dual_cleanup;
     time_current(&t_sub1);
     pool->time_submit_s += time_elapsed_sec(&t_sub0, &t_sub1);
   }
@@ -4353,21 +4503,29 @@ pool_run_dual(struct wavefront_pool* pool,
   while(pool->active_count > 0 || pool->task_next < pool->task_count) {
     struct time t_pl0, t_pl1;
 
-    /* ════════ Phase 1: wait D2H(A) → CPU on A → submit(A) ════════ */
+    /* ════════ Half-A: wait D2H(A) → CPU on A → async submit(A) ════════ */
+
+    /* Ensure A's submit from the PREVIOUS cycle completed.
+     * First iter: evt_done[0] starts signaled → instant return.
+     * Steady state: A was signaled 1 full cycle ago (during previous
+     * Half-A), so the submit thread had ~40s of Half-B to finish it. */
+    res = submit_thread_wait_view(pool, 0);
+    if(res != RES_OK) goto dual_cleanup;
+    pool->time_submit_s += pool->submit_elapsed_s[0];
+
     time_current(&t_pl0);
     res = gpu_wait_d2h_only(pool, pv_a, sv);
-    if(res != RES_OK) return res;
+    if(res != RES_OK) goto dual_cleanup;
     time_current(&t_pl1);
     pool->time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
 
     pool->total_steps++;
 
     time_current(&t_pl0);
-    /* O11: merged_pass on A (distribute+cascade+collect+harvest) */
     { struct time t_mp0, t_mp1;
       time_current(&t_mp0);
       res = merged_pass(pool, pv_a, scn);
-      if(res != RES_OK) return res;
+      if(res != RES_OK) goto dual_cleanup;
       time_current(&t_mp1);
       pool->time_cascade_s += time_elapsed_sec(&t_mp0, &t_mp1);
     }
@@ -4375,7 +4533,7 @@ pool_run_dual(struct wavefront_pool* pool,
       time_current(&t_cr0);
       compact_active_paths(pool, pv_a);
       res = refill_pool(pool, pv_a, &refill_count);
-      if(res != RES_OK) return res;
+      if(res != RES_OK) goto dual_cleanup;
       if(refill_count > 0) compact_active_paths(pool, pv_a);
       time_current(&t_cr1);
       pool->time_harvest_s += time_elapsed_sec(&t_cr0, &t_cr1);
@@ -4383,18 +4541,13 @@ pool_run_dual(struct wavefront_pool* pool,
     time_current(&t_pl1);
     pool->time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
 
-    /* O12: submit(A) — H2D→Kernel→D2H queued async.
-     * B's D2H may still be in-flight → PCIe full duplex with A's H2D. */
-    { struct time t_sub0, t_sub1;
-      time_current(&t_sub0);
+    /* O13: async submit(A) — fires on background thread.
+     * The submit thread runs gpu_submit_all(A) concurrently with
+     * Half-B's entire CPU pipeline below (~40s to hide 12.8s submit). */
 #ifdef SDIS_DEBUG_CHECKS
-      assert_no_pending_result_before_dispatch(pool, pv_a);
+    assert_no_pending_result_before_dispatch(pool, pv_a);
 #endif
-      res = gpu_submit_all(pool, pv_a, sv);
-      if(res != RES_OK) return res;
-      time_current(&t_sub1);
-      pool->time_submit_s += time_elapsed_sec(&t_sub0, &t_sub1);
-    }
+    submit_thread_signal(pool, pv_a, sv, 0);
 
     pool_update_active_count(pool);
 
@@ -4403,24 +4556,32 @@ pool_run_dual(struct wavefront_pool* pool,
     }
 
     if(pool->total_steps > pool->task_count * 1000) {
-      return RES_BAD_OP;
+      res = RES_BAD_OP;
+      goto dual_cleanup;
     }
 
-    /* ════════ Phase 2: wait D2H(B) → CPU on B → submit(B) ════════ */
+    /* ════════ Half-B: wait D2H(B) → CPU on B → async submit(B) ════════ */
+
+    /* Ensure B's submit from the PREVIOUS cycle completed.
+     * First iter: evt_done[1] starts signaled → instant.
+     * Steady state: B was signaled 1 full cycle ago. */
+    res = submit_thread_wait_view(pool, 1);
+    if(res != RES_OK) goto dual_cleanup;
+    pool->time_submit_s += pool->submit_elapsed_s[1];
+
     time_current(&t_pl0);
     res = gpu_wait_d2h_only(pool, pv_b, sv);
-    if(res != RES_OK) return res;
+    if(res != RES_OK) goto dual_cleanup;
     time_current(&t_pl1);
     pool->time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
 
     pool->total_steps++;
 
     time_current(&t_pl0);
-    /* O11: merged_pass on B */
     { struct time t_mp0, t_mp1;
       time_current(&t_mp0);
       res = merged_pass(pool, pv_b, scn);
-      if(res != RES_OK) return res;
+      if(res != RES_OK) goto dual_cleanup;
       time_current(&t_mp1);
       pool->time_cascade_s += time_elapsed_sec(&t_mp0, &t_mp1);
     }
@@ -4428,7 +4589,7 @@ pool_run_dual(struct wavefront_pool* pool,
       time_current(&t_cr0);
       compact_active_paths(pool, pv_b);
       res = refill_pool(pool, pv_b, &refill_count);
-      if(res != RES_OK) return res;
+      if(res != RES_OK) goto dual_cleanup;
       if(refill_count > 0) compact_active_paths(pool, pv_b);
       time_current(&t_cr1);
       pool->time_harvest_s += time_elapsed_sec(&t_cr0, &t_cr1);
@@ -4436,18 +4597,11 @@ pool_run_dual(struct wavefront_pool* pool,
     time_current(&t_pl1);
     pool->time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
 
-    /* O12: submit(B) — H2D→Kernel→D2H queued async.
-     * A's D2H may still be in-flight → PCIe full duplex with B's H2D. */
-    { struct time t_sub0, t_sub1;
-      time_current(&t_sub0);
+    /* O13: async submit(B) */
 #ifdef SDIS_DEBUG_CHECKS
-      assert_no_pending_result_before_dispatch(pool, pv_b);
+    assert_no_pending_result_before_dispatch(pool, pv_b);
 #endif
-      res = gpu_submit_all(pool, pv_b, sv);
-      if(res != RES_OK) return res;
-      time_current(&t_sub1);
-      pool->time_submit_s += time_elapsed_sec(&t_sub0, &t_sub1);
-    }
+    submit_thread_signal(pool, pv_b, sv, 1);
 
     pool_update_active_count(pool);
 
@@ -4456,7 +4610,8 @@ pool_run_dual(struct wavefront_pool* pool,
     }
 
     if(pool->total_steps > pool->task_count * 1000) {
-      return RES_BAD_OP;
+      res = RES_BAD_OP;
+      goto dual_cleanup;
     }
 
     /* ════════ Dynamic merge check ════════ */
@@ -4468,15 +4623,22 @@ pool_run_dual(struct wavefront_pool* pool,
         pool->views[1].active_compact, pool->views[1].view_size,
         pool->views[0].view_size / 8,
         pool->task_next, pool->task_count);
+      /* Wait for both views' async submits before touching GPU state */
+      res = submit_thread_wait_view(pool, 0);
+      if(res != RES_OK) goto dual_cleanup;
+      pool->time_submit_s += pool->submit_elapsed_s[0];
+      res = submit_thread_wait_view(pool, 1);
+      if(res != RES_OK) goto dual_cleanup;
+      pool->time_submit_s += pool->submit_elapsed_s[1];
       /* Both views have pending submit (H2D→Kernel→D2H).
        * gpu_wait_d2h_only drains the full pipeline via stream events. */
       if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
         res = gpu_wait_d2h_only(pool, pv_a, sv);
-        if(res != RES_OK) return res;
+        if(res != RES_OK) goto dual_cleanup;
       }
       if(pv_b->gpu_pending || pv_b->enc_gpu_pending || pv_b->cp_gpu_pending) {
         res = gpu_wait_d2h_only(pool, pv_b, sv);
-        if(res != RES_OK) return res;
+        if(res != RES_OK) goto dual_cleanup;
       }
       merge_to_single_pool(pool);
       break;
@@ -4485,25 +4647,35 @@ pool_run_dual(struct wavefront_pool* pool,
 
   /* Drain: wait for last pending GPU pipelines */
   if(pool->num_active_views == 2) {
+    /* Ensure both views' async submits finished */
+    res = submit_thread_wait_view(pool, 0);
+    if(res != RES_OK) goto dual_cleanup;
+    pool->time_submit_s += pool->submit_elapsed_s[0];
+    res = submit_thread_wait_view(pool, 1);
+    if(res != RES_OK) goto dual_cleanup;
+    pool->time_submit_s += pool->submit_elapsed_s[1];
+
     if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
       res = gpu_wait_d2h_only(pool, pv_a, sv);
-      if(res != RES_OK) return res;
+      if(res != RES_OK) goto dual_cleanup;
       pool->total_steps++;
       res = merged_pass(pool, pv_a, scn);
-      if(res != RES_OK) return res;
+      if(res != RES_OK) goto dual_cleanup;
       compact_active_paths(pool, pv_a);
     }
     if(pv_b->gpu_pending || pv_b->enc_gpu_pending || pv_b->cp_gpu_pending) {
       res = gpu_wait_d2h_only(pool, pv_b, sv);
-      if(res != RES_OK) return res;
+      if(res != RES_OK) goto dual_cleanup;
       pool->total_steps++;
       res = merged_pass(pool, pv_b, scn);
-      if(res != RES_OK) return res;
+      if(res != RES_OK) goto dual_cleanup;
       compact_active_paths(pool, pv_b);
     }
   }
 
-  return RES_OK;
+dual_cleanup:
+  submit_thread_destroy(pool);
+  return res;
 }
 
 /*******************************************************************************
@@ -4813,10 +4985,13 @@ solve_camera_persistent_wavefront(
     struct pool_view* pv_b = &pool.views[1];
 
     log_info(scn->dev,
-      "pipeline: starting dual-buffer mode, half=%llu\n",
+      "pipeline: starting dual-buffer mode (O13 async submit), half=%llu\n",
       (unsigned long long)pv_a->view_size);
 
-    /* ---- O11 Startup: merged_pass(A) → launch GPU(A) ---- */
+    /* O13: Start submit thread */
+    submit_thread_init(&pool);
+
+    /* ---- O11 Startup: merged_pass(A) ---- */
     compact_active_paths(&pool, pv_a);
     log_info(scn->dev,
       "O11_STARTUP A pre-merge: active=%llu need_ray=%llu done=%llu\n",
@@ -4835,11 +5010,6 @@ solve_camera_persistent_wavefront(
     { size_t rc = 0;
       res = refill_pool(&pool, pv_a, &rc);
       if(res != RES_OK) goto cleanup; }
-#ifdef SDIS_DEBUG_CHECKS
-    assert_no_pending_result_before_dispatch(&pool, pv_a);
-#endif
-    res = gpu_launch_all(&pool, pv_a, scn->s3d_view);
-    if(res != RES_OK) goto cleanup;
 
     /* ---- O11 Startup: merged_pass(B) ---- */
     compact_active_paths(&pool, pv_b);
@@ -4860,54 +5030,52 @@ solve_camera_persistent_wavefront(
     { size_t rc = 0;
       res = refill_pool(&pool, pv_b, &rc);
       if(res != RES_OK) goto cleanup; }
-    /* B's enc/cp requests pending — will be launched in first gpu_launch_all(B) */
 
-    while(pool.active_count > 0 || pool.task_next < pool.task_count) {
-      struct time t_pl0, t_pl1, t_hk;
-      /* O11 timeline: 11 timestamps spanning one full A+B cycle
-       * [0]=start
-       * [1]=syncKernA [2]=startD2hA [3]=launchB [4]=waitD2hA [5]=cpuA(merged)
-       * [6]=syncKernB [7]=startD2hB [8]=launchA [9]=waitD2hB [10]=cpuB(merged)
-       */
-      struct time t_cy[11];
-
-      /* ════════ Phase 1: syncK(A) → d2h↓(A) → launch(B) → waitD2h(A) → O11 merged(A) ════════ */
-      time_current(&t_cy[0]);
-
-      /* 1a. Sync compute kernels: RT + enc + cp (no D2H yet) */
-      res = gpu_sync_kernel_all(&pool, pv_a);
+    /* Startup submit: both views synchronously */
+    { struct time t_sub0, t_sub1;
+      time_current(&t_sub0);
+#ifdef SDIS_DEBUG_CHECKS
+      assert_no_pending_result_before_dispatch(&pool, pv_a);
+#endif
+      res = gpu_submit_all(&pool, pv_a, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
-      time_current(&t_cy[1]);  /* after syncKernel(A) */
-
-      /* 1b. Start async D2H for RT + enc + cp — returns immediately */
-      res = gpu_start_d2h_all(&pool, pv_a);
-      if(res != RES_OK) goto cleanup;
-      time_current(&t_cy[2]);  /* after startD2h(A) */
-
-      /* 1c. Launch GPU(B) RT+enc+cp — overlap with D2H(A) */
 #ifdef SDIS_DEBUG_CHECKS
       assert_no_pending_result_before_dispatch(&pool, pv_b);
 #endif
-      res = gpu_launch_all(&pool, pv_b, scn->s3d_view);
+      res = gpu_submit_all(&pool, pv_b, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
-      time_current(&t_cy[3]);  /* after launch(B) */
+      time_current(&t_sub1);
+      pool.time_submit_s += time_elapsed_sec(&t_sub0, &t_sub1);
+    }
 
-      /* Accumulate Phase 1 untimed GPU ops */
-      pool.time_gpu_sync_s   += time_elapsed_sec(&t_cy[0], &t_cy[1]);
-      pool.time_gpu_launch_s += time_elapsed_sec(&t_cy[1], &t_cy[3]);
-      pool.time_submit_s     += time_elapsed_sec(&t_cy[0], &t_cy[3]);
+    while(pool.active_count > 0 || pool.task_next < pool.task_count) {
+      struct time t_pl0, t_pl1, t_hk;
+      /* O13 timeline: 6 timestamps per half-cycle
+       * [0]=ensure_done  [1]=after_wait_d2h(A)  [2]=after_cpu(A)
+       * [3]=after_wait_d2h(B)  [4]=after_cpu(B)  [5]=cycle_end */
+      struct time t_cy[6];
 
-      /* 1d. Wait D2H(A) for RT + enc + cp + distribute enc/cp results */
+      /* ════════ Half-A: wait D2H(A) → CPU on A → async submit(A) ════════ */
+      time_current(&t_cy[0]);
+
+      /* Ensure A's submit from the PREVIOUS cycle completed.
+       * First iter: evt_done[0] starts signaled → instant return.
+       * Steady state: A was signaled 1 full cycle ago. */
+      res = submit_thread_wait_view(&pool, 0);
+      if(res != RES_OK) goto cleanup;
+      pool.time_submit_s += pool.submit_elapsed_s[0];
+
+      /* Wait D2H(A) */
       time_current(&t_pl0);
       res = gpu_wait_d2h_all(&pool, pv_a, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
       time_current(&t_pl1);
       pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[4] = t_pl1;  /* after waitD2h(A) */
+      t_cy[1] = t_pl1;
 
-      pool.total_steps++;  /* view A completed one step */
+      pool.total_steps++;
 
-      /* 1e. O11 merged_pass on A (distribute+cascade+collect+harvest) */
+      /* O11 merged_pass + compact + refill on A */
       time_current(&t_pl0);
       { struct time t_mp0, t_mp1;
         time_current(&t_mp0);
@@ -4928,9 +5096,15 @@ solve_camera_persistent_wavefront(
       }
       time_current(&t_pl1);
       pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[5] = t_pl1;  /* after merged(A) */
+      t_cy[2] = t_pl1;
 
-      /* -- Housekeeping after A's step (timed) -- */
+      /* O13: async submit(A) */
+#ifdef SDIS_DEBUG_CHECKS
+      assert_no_pending_result_before_dispatch(&pool, pv_a);
+#endif
+      submit_thread_signal(&pool, pv_a, scn->s3d_view, 0);
+
+      /* -- Housekeeping after A's step -- */
       time_current(&t_hk);
       pool_update_active_count(&pool);
 
@@ -4980,56 +5154,28 @@ solve_camera_persistent_wavefront(
           (unsigned long long)total_tasks,
           pool.in_drain_phase ? "DRAIN" : "refill");
       }
-      { /* STARDIS_PIPELINE_LOG */
-        const char* env_log = getenv("STARDIS_PIPELINE_LOG");
-        if(env_log && env_log[0] == '1') {
-          log_info(scn->dev,
-            "[A] step %llu: rays=%llu, active=%llu\n",
-            (unsigned long long)pool.total_steps,
-            (unsigned long long)pv_a->ray_count,
-            (unsigned long long)pv_a->active_compact);
-        }
-      }
       { struct time t_hk_end; time_current(&t_hk_end);
-        pool.time_housekeeping_s += time_elapsed_sec(&t_hk, &t_hk_end);
-        t_hk = t_hk_end; } /* t_hk now = end of housekeeping A */
+        pool.time_housekeeping_s += time_elapsed_sec(&t_hk, &t_hk_end); }
 
-      /* ════════ Phase 2: syncK(B) → d2h↓(B) → launch(A) → waitD2h(B) → O11 merged(B) ════════ */
+      /* ════════ Half-B: wait D2H(B) → CPU on B → async submit(B) ════════ */
 
-      /* 2a. Sync compute kernels: RT + enc + cp (no D2H yet) */
-      res = gpu_sync_kernel_all(&pool, pv_b);
+      /* Ensure B's submit from the PREVIOUS cycle completed.
+       * Steady state: B was signaled 1 full cycle ago. */
+      res = submit_thread_wait_view(&pool, 1);
       if(res != RES_OK) goto cleanup;
-      time_current(&t_cy[6]);  /* after syncKernel(B) */
+      pool.time_submit_s += pool.submit_elapsed_s[1];
 
-      /* 2b. Start async D2H for RT + enc + cp — returns immediately */
-      res = gpu_start_d2h_all(&pool, pv_b);
-      if(res != RES_OK) goto cleanup;
-      time_current(&t_cy[7]);  /* after startD2h(B) */
-
-      /* 2c. Launch GPU(A) RT+enc+cp — overlap with D2H(B) */
-#ifdef SDIS_DEBUG_CHECKS
-      assert_no_pending_result_before_dispatch(&pool, pv_a);
-#endif
-      res = gpu_launch_all(&pool, pv_a, scn->s3d_view);
-      if(res != RES_OK) goto cleanup;
-      time_current(&t_cy[8]);  /* after launch(A) */
-
-      /* Accumulate Phase 2 untimed GPU ops (t_hk = end of housekeeping A) */
-      pool.time_gpu_sync_s   += time_elapsed_sec(&t_hk, &t_cy[6]);
-      pool.time_gpu_launch_s += time_elapsed_sec(&t_cy[6], &t_cy[8]);
-      pool.time_submit_s     += time_elapsed_sec(&t_hk, &t_cy[8]);
-
-      /* 2d. Wait D2H(B) for RT + enc + cp + distribute enc/cp results */
+      /* Wait D2H(B) */
       time_current(&t_pl0);
       res = gpu_wait_d2h_all(&pool, pv_b, scn->s3d_view);
       if(res != RES_OK) goto cleanup;
       time_current(&t_pl1);
       pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[9] = t_pl1;  /* after waitD2h(B) */
+      t_cy[3] = t_pl1;
 
-      pool.total_steps++;  /* view B completed one step */
+      pool.total_steps++;
 
-      /* 2e. O11 merged_pass on B */
+      /* O11 merged_pass + compact + refill on B */
       time_current(&t_pl0);
       { struct time t_mp0, t_mp1;
         time_current(&t_mp0);
@@ -5050,9 +5196,15 @@ solve_camera_persistent_wavefront(
       }
       time_current(&t_pl1);
       pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[10] = t_pl1;  /* after merged(B) */
+      t_cy[4] = t_pl1;
 
-      /* -- Housekeeping after B's step (timed) -- */
+      /* O13: async submit(B) */
+#ifdef SDIS_DEBUG_CHECKS
+      assert_no_pending_result_before_dispatch(&pool, pv_b);
+#endif
+      submit_thread_signal(&pool, pv_b, scn->s3d_view, 1);
+
+      /* -- Housekeeping after B's step -- */
       time_current(&t_hk);
       pool_update_active_count(&pool);
 
@@ -5102,41 +5254,26 @@ solve_camera_persistent_wavefront(
           (unsigned long long)total_tasks,
           pool.in_drain_phase ? "DRAIN" : "refill");
       }
-      { /* STARDIS_PIPELINE_LOG */
-        const char* env_log = getenv("STARDIS_PIPELINE_LOG");
-        if(env_log && env_log[0] == '1') {
-          log_info(scn->dev,
-            "[B] step %llu: rays=%llu, active=%llu\n",
-            (unsigned long long)pool.total_steps,
-            (unsigned long long)pv_b->ray_count,
-            (unsigned long long)pv_b->active_compact);
-        }
-      }
-      /* ════════ O11 Timeline output (STARDIS_PIPELINE_LOG=2) ════════ */
+
+      /* ════════ O13 Timeline output (STARDIS_PIPELINE_LOG=2) ════════ */
+      time_current(&t_cy[5]);
       {
         const char* env_tl = getenv("STARDIS_PIPELINE_LOG");
         env_tl="2";
         if(env_tl && env_tl[0] == '2' && pool.total_steps % 1000 == 0) {
-          double syncKA   = time_elapsed_sec(&t_cy[0],  &t_cy[1])  * 1000.0;
-          double startDA  = time_elapsed_sec(&t_cy[1],  &t_cy[2])  * 1000.0;
-          double launchB  = time_elapsed_sec(&t_cy[2],  &t_cy[3])  * 1000.0;
-          double waitDA   = time_elapsed_sec(&t_cy[3],  &t_cy[4])  * 1000.0;
-          double cpuA     = time_elapsed_sec(&t_cy[4],  &t_cy[5])  * 1000.0;
-          double syncKB   = time_elapsed_sec(&t_cy[5],  &t_cy[6])  * 1000.0;
-          double startDB  = time_elapsed_sec(&t_cy[6],  &t_cy[7])  * 1000.0;
-          double launchA  = time_elapsed_sec(&t_cy[7],  &t_cy[8])  * 1000.0;
-          double waitDB   = time_elapsed_sec(&t_cy[8],  &t_cy[9])  * 1000.0;
-          double cpuB     = time_elapsed_sec(&t_cy[9],  &t_cy[10]) * 1000.0;
-          double cycle    = time_elapsed_sec(&t_cy[0],  &t_cy[10]) * 1000.0;
+          double waitA  = time_elapsed_sec(&t_cy[0],  &t_cy[1])  * 1000.0;
+          double cpuA   = time_elapsed_sec(&t_cy[1],  &t_cy[2])  * 1000.0;
+          double waitB  = time_elapsed_sec(&t_cy[2],  &t_cy[3])  * 1000.0;
+          double cpuB   = time_elapsed_sec(&t_cy[3],  &t_cy[4])  * 1000.0;
+          double cycle  = time_elapsed_sec(&t_cy[0],  &t_cy[5])  * 1000.0;
+          double sub_ms = (pool.submit_elapsed_s[0] + pool.submit_elapsed_s[1]) * 1000.0;
           log_info(scn->dev,
             "[TIMELINE] step=%llu "
-            "|syncKA=%.2f|startDA=%.2f|launchB=%.2f|waitDA=%.2f|cpuA=%.2f"
-            "|syncKB=%.2f|startDB=%.2f|launchA=%.2f|waitDB=%.2f|cpuB=%.2f"
-            "|cycle=%.2fms raysA=%llu raysB=%llu\n",
+            "|waitA=%.2f|cpuA=%.2f|waitB=%.2f|cpuB=%.2f"
+            "|submit=%.2f(async)|cycle=%.2fms raysA=%llu raysB=%llu\n",
             (unsigned long long)pool.total_steps,
-            syncKA, startDA, launchB, waitDA, cpuA,
-            syncKB, startDB, launchA, waitDB, cpuB,
-            cycle,
+            waitA, cpuA, waitB, cpuB,
+            sub_ms, cycle,
             (unsigned long long)pv_a->ray_count,
             (unsigned long long)pv_b->ray_count);
         }
@@ -5144,6 +5281,13 @@ solve_camera_persistent_wavefront(
 
       /* ════════ Dynamic merge check ════════ */
       if(should_merge(&pool)) {
+        /* Wait for both views' async submits before touching GPU state */
+        res = submit_thread_wait_view(&pool, 0);
+        if(res != RES_OK) goto cleanup;
+        pool.time_submit_s += pool.submit_elapsed_s[0];
+        res = submit_thread_wait_view(&pool, 1);
+        if(res != RES_OK) goto cleanup;
+        pool.time_submit_s += pool.submit_elapsed_s[1];
         /* Wait for all pending GPU calls (RT + enc + cp) */
         if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
           res = gpu_wait_download_all(&pool, pv_a, scn->s3d_view);
@@ -5170,6 +5314,14 @@ solve_camera_persistent_wavefront(
 
     /* ---- Drain: wait for last pending GPU calls (RT + enc + cp) ---- */
     if(pool.num_active_views == 2) {
+      /* Ensure both views' async submits finished */
+      res = submit_thread_wait_view(&pool, 0);
+      if(res != RES_OK) goto cleanup;
+      pool.time_submit_s += pool.submit_elapsed_s[0];
+      res = submit_thread_wait_view(&pool, 1);
+      if(res != RES_OK) goto cleanup;
+      pool.time_submit_s += pool.submit_elapsed_s[1];
+
       if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
         res = gpu_wait_download_all(&pool, pv_a, scn->s3d_view);
         if(res != RES_OK) goto cleanup;
@@ -5188,6 +5340,9 @@ solve_camera_persistent_wavefront(
       }
     }
 
+    /* O13: Destroy submit thread */
+    submit_thread_destroy(&pool);
+
     /* Log pipeline stats */
     {
       struct time t_now;
@@ -5197,11 +5352,11 @@ solve_camera_persistent_wavefront(
       if(pipeline_wall <= 0) pipeline_wall = 1e-9;
       log_info(scn->dev,
         "pipeline stats: wall=%.3fs, gpu_wait=%.3fs, cpu_between=%.3fs, "
-        "gpu_util=%.1f%%, steps=%llu\n",
+        "submit=%.3fs(async), steps=%llu\n",
         pipeline_wall,
         pool.time_pipeline_wait_s,
         pool.time_pipeline_cpu_between_s,
-        100.0 * (1.0 - pool.time_pipeline_gpu_idle_s / pipeline_wall),
+        pool.time_submit_s,
         (unsigned long long)pool.total_steps);
     }
   } /* end if(num_active_views == 2) */

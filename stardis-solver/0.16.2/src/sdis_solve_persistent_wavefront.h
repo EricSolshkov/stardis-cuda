@@ -447,6 +447,17 @@ struct wavefront_pool {
    * Each element is a malloc'd struct tl_ray_entry[TL_RAY_BUF_MAX]. */
   void** tl_ray_bufs;   /* [tl_ray_nbufs], cast to struct tl_ray_entry* */
   int tl_ray_nbufs;     /* number of allocated buffers   */
+
+  /* === O13: Async submit thread (per-view channels) === */
+  void*  submit_thread_handle;   /* HANDLE from _beginthreadex       */
+  void*  submit_evt_go[2];       /* per-view auto-reset triggers     */
+  void*  submit_evt_done[2];     /* per-view manual-reset completion */
+  volatile int submit_shutdown;  /* 1 = thread should exit           */
+  /* Per-view job params (independent slots — no sharing) */
+  struct pool_view*      submit_pv[2];
+  struct s3d_scene_view* submit_sv[2];
+  res_T                  submit_result[2];
+  double                 submit_elapsed_s[2];
 };
 
 /*******************************************************************************
