@@ -2098,6 +2098,10 @@ static res_T batch_trace_start_d2h_impl(
 {
     if (nrays == 0) { ctx->d2h_pending = false; return RES_OK; }
     unsigned int count = static_cast<unsigned int>(nrays);
+    /* Stream auto-order: transfer_stream waits for kernel completion
+     * before issuing D2H.  Allows gpu_submit_all() to queue
+     * H2D→Kernel→D2H without an explicit CPU-side kernel sync. */
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->transfer_stream, ctx->evt_kernel_done, 0));
     ctx->d_multi_hits.downloadAsync(ctx->h_mhits_pinned, count,
                                      ctx->transfer_stream);
     ctx->d2h_pending = true;
@@ -2694,6 +2698,8 @@ static res_T batch_trace_filtered_start_d2h_impl(
 {
     if (nrays == 0) { ctx->d2h_pending = false; return RES_OK; }
     unsigned int count = static_cast<unsigned int>(nrays);
+    /* Stream auto-order: transfer_stream waits for kernel completion */
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->transfer_stream, ctx->evt_kernel_done, 0));
     ctx->d_hits_filtered.downloadAsync(
         reinterpret_cast<HitResult*>(ctx->h_hits_pinned),
         count, ctx->transfer_stream);

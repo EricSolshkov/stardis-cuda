@@ -403,6 +403,7 @@ struct wavefront_pool {
   double time_trace_cpu_s;  /* trace CPU component (postprocess+retrace) ms→s  */
   double time_gpu_sync_s;   /* cumulative GPU kernel sync wait (dual-buffer)   */
   double time_gpu_launch_s; /* cumulative GPU launch+startD2h (dual-buffer)    */
+  double time_submit_s;     /* cumulative gpu_submit_all API overhead (O12)    */
   double time_refill_phase_s; /* wall-clock of refill phase total    */
   double time_drain_phase_s;  /* wall-clock of drain phase total     */
 

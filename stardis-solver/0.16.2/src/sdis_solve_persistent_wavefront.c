@@ -2543,6 +2543,8 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
   double avg_width = 0;
   double trace_gpu_s, trace_cpu_s;
   double total_timed, wall_s, coverage;
+  double submit_s, wait_d2h_s;
+  double trace_stall_s, gpu_hidden_pct;
   if(pool->total_rays_traced > 0) {
     drain_ray_pct = (double)pool->diag_drain_rays * 100.0
                   / (double)pool->total_rays_traced;
@@ -2557,23 +2559,48 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
   trace_cpu_s = (pool->trace_post_time_ms_sum
                + pool->trace_retrace_time_ms_sum) * 1e-3;
 
-  /* Total timed = sum of all instrumented phase timers */
-  total_timed = pool->time_compact_s
-              + pool->time_collect_s
-              + pool->time_trace_s
-              + pool->time_distribute_s
-              + pool->time_enc_locate_s
-              + pool->time_cp_s
+  /* Primary pipeline phases — mutually exclusive, sum ≈ wall time.
+   *
+   * submit_s:    API overhead for queuing H2D→Kernel→D2H
+   *              (time_submit_s in O12, or gpu_sync+gpu_launch in camera-mode)
+   * wait_d2h_s:  CPU blocked waiting for GPU D2H + host post-process
+   *              (time_pipeline_wait_s in dual, or trace+enc+cp from inner)
+   * cascade_s:   merged_pass (distribute+cascade+collect+harvest)
+   * harvest_s:   compact + refill
+   * housekeeping: diagnostics, progress, etc.
+   */
+  submit_s = pool->time_submit_s;
+  if(submit_s <= 0)
+    submit_s = pool->time_gpu_sync_s + pool->time_gpu_launch_s;
+
+  wait_d2h_s = pool->time_pipeline_wait_s;
+  if(wait_d2h_s <= 0)
+    wait_d2h_s = pool->time_trace_s + pool->time_enc_locate_s
+               + pool->time_cp_s;
+
+  total_timed = submit_s
+              + wait_d2h_s
               + pool->time_cascade_s
               + pool->time_harvest_s
-              + pool->time_housekeeping_s
-              + pool->time_gpu_sync_s
-              + pool->time_gpu_launch_s;
+              + pool->time_housekeeping_s;
 
   /* Wall = refill + drain phase durations */
   wall_s = pool->time_refill_phase_s + pool->time_drain_phase_s;
   if(wall_s <= 0) wall_s = total_timed;  /* fallback if phases not recorded */
   coverage = (wall_s > 0) ? total_timed / wall_s * 100.0 : 0.0;
+
+  /* Trace stall = wait_d2h(trace) minus CPU post-process.
+   * This is time the CPU blocks purely on cudaStreamSynchronize. */
+  trace_stall_s = pool->time_trace_s - trace_cpu_s;
+  if(trace_stall_s < 0) trace_stall_s = 0;
+
+  /* GPU hidden fraction: how much of device time was overlapped with CPU */
+  gpu_hidden_pct = 0;
+  if(trace_gpu_s > 0) {
+    gpu_hidden_pct = (1.0 - trace_stall_s / trace_gpu_s) * 100.0;
+    if(gpu_hidden_pct < 0) gpu_hidden_pct = 0;
+    if(gpu_hidden_pct > 100) gpu_hidden_pct = 100;
+  }
 
   log_info(dev,
     "persistent wavefront summary:\n"
@@ -2584,13 +2611,7 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     "  rays: radiative=%llu  cond_ds=%llu(retry=%llu)  "
     "shadow=%llu  enclosure=%llu  startup=%llu  other=%llu\n"
     "  paths: completed=%llu, failed=%llu, truncated=%llu, max_depth=%llu\n"
-    "  refills=%llu\n"
-    "  timing: compact=%.3fs  collect=%.3fs  trace=%.3fs(gpu=%.3fs cpu=%.3fs)\n"
-    "          distribute=%.3fs  enc_locate=%.3fs  cp=%.3fs\n"
-    "          cascade=%.3fs\n"
-    "          harvest+refill=%.3fs  housekeeping=%.3fs\n"
-    "          gpu_sync=%.3fs  gpu_launch=%.3fs\n"
-    "          total_timed=%.3fs  wall=%.3fs  coverage=%.1f%%\n",
+    "  refills=%llu\n",
     (unsigned long long)pool->total_steps,
     (unsigned long long)pool->total_rays_traced,
     avg_width,
@@ -2615,19 +2636,48 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
     (unsigned long long)pool->paths_failed,
     (unsigned long long)pool->paths_truncated,
     (unsigned long long)pool->max_path_depth,
-    (unsigned long long)pool->diag_refill_count,
-    pool->time_compact_s,
-    pool->time_collect_s,
-    pool->time_trace_s, trace_gpu_s, trace_cpu_s,
-    pool->time_distribute_s,
-    pool->time_enc_locate_s,
-    pool->time_cp_s,
+    (unsigned long long)pool->diag_refill_count);
+
+  /* Pipeline phase timing (fine-grained) */
+  log_info(dev,
+    "  timing (pipeline phases):\n"
+    "    submit       =%8.3fs [%4.1f%%]%s\n"
+    "    wait_d2h     =%8.3fs [%4.1f%%]  (trace=%.3fs  enc=%.3fs  cp=%.3fs)\n"
+    "      trace_stall=%8.3fs           (device: kern=%.3fs d2h=%.3fs, %.0f%% hidden)\n"
+    "      trace_post =%8.3fs           (host: post=%.3fs retrace=%.3fs)\n"
+    "    merged_pass  =%8.3fs [%4.1f%%]\n"
+    "    compact+rfill=%8.3fs [%4.1f%%]\n"
+    "    housekeeping =%8.3fs [%4.1f%%]\n"
+    "    total=%8.3fs  wall=%.3fs  coverage=%.1f%%\n",
+    submit_s,
+    wall_s > 0 ? submit_s / wall_s * 100.0 : 0.0,
+    (pool->time_gpu_sync_s > 0 || pool->time_gpu_launch_s > 0)
+      ? ""  /* sub-breakdown logged separately below */
+      : "",
+    wait_d2h_s,
+    wall_s > 0 ? wait_d2h_s / wall_s * 100.0 : 0.0,
+    pool->time_trace_s, pool->time_enc_locate_s, pool->time_cp_s,
+    trace_stall_s,
+    pool->trace_kernel_time_ms_sum * 1e-3,
+    pool->trace_batch_time_ms_sum * 1e-3,
+    gpu_hidden_pct,
+    trace_cpu_s,
+    pool->trace_post_time_ms_sum * 1e-3,
+    pool->trace_retrace_time_ms_sum * 1e-3,
     pool->time_cascade_s,
+    wall_s > 0 ? pool->time_cascade_s / wall_s * 100.0 : 0.0,
     pool->time_harvest_s,
+    wall_s > 0 ? pool->time_harvest_s / wall_s * 100.0 : 0.0,
     pool->time_housekeeping_s,
-    pool->time_gpu_sync_s,
-    pool->time_gpu_launch_s,
+    wall_s > 0 ? pool->time_housekeeping_s / wall_s * 100.0 : 0.0,
     total_timed, wall_s, coverage);
+
+  /* Camera-mode submit sub-breakdown (syncK + launch separate) */
+  if(pool->time_gpu_sync_s > 0 || pool->time_gpu_launch_s > 0) {
+    log_info(dev,
+      "    submit breakdown: sync_kernel=%.3fs  start_d2h+launch=%.3fs\n",
+      pool->time_gpu_sync_s, pool->time_gpu_launch_s);
+  }
 
   /* Verify ray stats sum == total_rays_traced */
   {
@@ -3124,6 +3174,45 @@ gpu_wait_download_all(struct wavefront_pool* pool,
   if(res != RES_OK) return res;
   res = gpu_start_d2h_all(pool, pv);
   if(res != RES_OK) return res;
+  return gpu_wait_d2h_all(pool, pv, sv);
+}
+
+/**
+ * gpu_submit_all — queue H2D→Kernel→D2H for RT + enc + cp (all async).
+ *
+ * Stream auto-ordering: gpu_launch_all() enqueues H2D + kernel on each
+ * context's transfer/compute streams.  gpu_start_d2h_all() then enqueues
+ * D2H on each transfer_stream, with an event dependency on kernel_done.
+ * The entire pipeline is queued without any CPU-side blocking.
+ *
+ * This enables PCIe full-duplex: if the other view's D2H is still in-flight
+ * when this view's H2D is issued, the two transfers can overlap on the
+ * separate copy engines.
+ */
+static res_T
+gpu_submit_all(struct wavefront_pool* pool,
+               struct pool_view* pv,
+               struct s3d_scene_view* sv)
+{
+  res_T res;
+  res = gpu_launch_all(pool, pv, sv);     /* H2D + kernel (async) */
+  if(res != RES_OK) return res;
+  res = gpu_start_d2h_all(pool, pv);      /* D2H (async, event-gated) */
+  return res;
+}
+
+/**
+ * gpu_wait_d2h_only — wait for D2H completion + post-process + distribute.
+ *
+ * Unlike gpu_wait_download_all(), this does NOT call gpu_sync_kernel_all().
+ * The kernel→D2H dependency is handled by stream events (cudaStreamWaitEvent
+ * inside start_d2h), so we only need to synchronise the transfer_stream.
+ */
+static res_T
+gpu_wait_d2h_only(struct wavefront_pool* pool,
+                  struct pool_view* pv,
+                  struct s3d_scene_view* sv)
+{
   return gpu_wait_d2h_all(pool, pv, sv);
 }
 
@@ -4160,9 +4249,14 @@ pool_run_single(struct wavefront_pool* pool,
     if(res != RES_OK) return res;
     time_current(&t1);
     pool->time_gpu_launch_s += time_elapsed_sec(&t0, &t1);
+    pool->time_submit_s     += time_elapsed_sec(&t0, &t1);
 
     /* Step 5: GPU wait + D2H for RT + enc + cp */
+    time_current(&t0);
     res = gpu_wait_download_all(pool, pv, sv);
+    if(res != RES_OK) return res;
+    time_current(&t1);
+    pool->time_pipeline_wait_s += time_elapsed_sec(&t0, &t1);
     if(res != RES_OK) return res;
 
     /* DIAG_V3: optional extra cascade after enc/cp distribution.
@@ -4197,11 +4291,19 @@ pool_run_single(struct wavefront_pool* pool,
 }
 
 /*******************************************************************************
- * pool_run_dual — Dual-buffer pipeline main loop (bare, no progress).
+ * pool_run_dual — Dual-buffer pipeline main loop (stream auto-ordering).
  *
- * O11: Overlaps GPU trace on one view with merged_pass on the other.
- * Each half-cycle: wait GPU(X) → merged_pass(X) + compact + refill +
- *   enc/cp batch on X → gpu_launch(X).
+ * O12: Each view's submit queues H2D→Kernel→D2H as consecutive async calls
+ * on the view's dedicated streams.  Stream-level event dependencies
+ * (transfer_stream waits for kernel_done before D2H) replace the old
+ * explicit CPU-side kernel sync.
+ *
+ * Pipeline shape per half-cycle:
+ *   wait_d2h(X) → merged_pass(X) + compact + refill → submit(X)
+ *
+ * PCIe overlap opportunity: after submit(X) queues H2D(X), the CPU
+ * immediately proceeds to wait_d2h(Y).  If Y's D2H is still in-flight,
+ * the two transfers run on separate copy engines (full duplex).
  ******************************************************************************/
 static res_T
 pool_run_dual(struct wavefront_pool* pool,
@@ -4213,43 +4315,50 @@ pool_run_dual(struct wavefront_pool* pool,
   res_T res;
   size_t refill_count = 0;
 
-  /* Startup: initial compact + merged_pass(A) → launch GPU(A) */
+  /* ═══════ Startup: prepare both views, then submit both ═══════ */
+
+  /* A: initial CPU work */
   compact_active_paths(pool, pv_a);
   res = merged_pass(pool, pv_a, scn);
   if(res != RES_OK) return res;
   compact_active_paths(pool, pv_a);
   res = refill_pool(pool, pv_a, &refill_count);
   if(res != RES_OK) return res;
-#ifdef SDIS_DEBUG_CHECKS
-  assert_no_pending_result_before_dispatch(pool, pv_a);
-#endif
-  res = gpu_launch_all(pool, pv_a, sv);
-  if(res != RES_OK) return res;
 
-  /* Startup: initial compact + merged_pass(B) */
+  /* B: initial CPU work */
   compact_active_paths(pool, pv_b);
   res = merged_pass(pool, pv_b, scn);
   if(res != RES_OK) return res;
   compact_active_paths(pool, pv_b);
   res = refill_pool(pool, pv_b, &refill_count);
   if(res != RES_OK) return res;
-  /* B's enc/cp requests pending — will be launched in first gpu_launch_all(B) */
+
+  /* Submit both: H2D→Kernel→D2H fully queued on each view's streams */
+  { struct time t_sub0, t_sub1;
+    time_current(&t_sub0);
+#ifdef SDIS_DEBUG_CHECKS
+    assert_no_pending_result_before_dispatch(pool, pv_a);
+#endif
+    res = gpu_submit_all(pool, pv_a, sv);
+    if(res != RES_OK) return res;
+#ifdef SDIS_DEBUG_CHECKS
+    assert_no_pending_result_before_dispatch(pool, pv_b);
+#endif
+    res = gpu_submit_all(pool, pv_b, sv);
+    if(res != RES_OK) return res;
+    time_current(&t_sub1);
+    pool->time_submit_s += time_elapsed_sec(&t_sub0, &t_sub1);
+  }
 
   while(pool->active_count > 0 || pool->task_next < pool->task_count) {
     struct time t_pl0, t_pl1;
 
-    /* ════════ Phase 1: wait GPU(A) → launch GPU(B) → CPU on A ════════ */
+    /* ════════ Phase 1: wait D2H(A) → CPU on A → submit(A) ════════ */
     time_current(&t_pl0);
-    res = gpu_wait_download_all(pool, pv_a, sv);
+    res = gpu_wait_d2h_only(pool, pv_a, sv);
     if(res != RES_OK) return res;
     time_current(&t_pl1);
     pool->time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-
-#ifdef SDIS_DEBUG_CHECKS
-    assert_no_pending_result_before_dispatch(pool, pv_b);
-#endif
-    res = gpu_launch_all(pool, pv_b, sv);
-    if(res != RES_OK) return res;
 
     pool->total_steps++;
 
@@ -4274,6 +4383,19 @@ pool_run_dual(struct wavefront_pool* pool,
     time_current(&t_pl1);
     pool->time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
 
+    /* O12: submit(A) — H2D→Kernel→D2H queued async.
+     * B's D2H may still be in-flight → PCIe full duplex with A's H2D. */
+    { struct time t_sub0, t_sub1;
+      time_current(&t_sub0);
+#ifdef SDIS_DEBUG_CHECKS
+      assert_no_pending_result_before_dispatch(pool, pv_a);
+#endif
+      res = gpu_submit_all(pool, pv_a, sv);
+      if(res != RES_OK) return res;
+      time_current(&t_sub1);
+      pool->time_submit_s += time_elapsed_sec(&t_sub0, &t_sub1);
+    }
+
     pool_update_active_count(pool);
 
     if(!pool->in_drain_phase && pool->task_next >= pool->task_count) {
@@ -4284,18 +4406,12 @@ pool_run_dual(struct wavefront_pool* pool,
       return RES_BAD_OP;
     }
 
-    /* ════════ Phase 2: wait GPU(B) → launch GPU(A) → CPU on B ════════ */
+    /* ════════ Phase 2: wait D2H(B) → CPU on B → submit(B) ════════ */
     time_current(&t_pl0);
-    res = gpu_wait_download_all(pool, pv_b, sv);
+    res = gpu_wait_d2h_only(pool, pv_b, sv);
     if(res != RES_OK) return res;
     time_current(&t_pl1);
     pool->time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-
-#ifdef SDIS_DEBUG_CHECKS
-    assert_no_pending_result_before_dispatch(pool, pv_a);
-#endif
-    res = gpu_launch_all(pool, pv_a, sv);
-    if(res != RES_OK) return res;
 
     pool->total_steps++;
 
@@ -4320,6 +4436,19 @@ pool_run_dual(struct wavefront_pool* pool,
     time_current(&t_pl1);
     pool->time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
 
+    /* O12: submit(B) — H2D→Kernel→D2H queued async.
+     * A's D2H may still be in-flight → PCIe full duplex with B's H2D. */
+    { struct time t_sub0, t_sub1;
+      time_current(&t_sub0);
+#ifdef SDIS_DEBUG_CHECKS
+      assert_no_pending_result_before_dispatch(pool, pv_b);
+#endif
+      res = gpu_submit_all(pool, pv_b, sv);
+      if(res != RES_OK) return res;
+      time_current(&t_sub1);
+      pool->time_submit_s += time_elapsed_sec(&t_sub0, &t_sub1);
+    }
+
     pool_update_active_count(pool);
 
     if(!pool->in_drain_phase && pool->task_next >= pool->task_count) {
@@ -4339,12 +4468,14 @@ pool_run_dual(struct wavefront_pool* pool,
         pool->views[1].active_compact, pool->views[1].view_size,
         pool->views[0].view_size / 8,
         pool->task_next, pool->task_count);
+      /* Both views have pending submit (H2D→Kernel→D2H).
+       * gpu_wait_d2h_only drains the full pipeline via stream events. */
       if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
-        res = gpu_wait_download_all(pool, pv_a, sv);
+        res = gpu_wait_d2h_only(pool, pv_a, sv);
         if(res != RES_OK) return res;
       }
       if(pv_b->gpu_pending || pv_b->enc_gpu_pending || pv_b->cp_gpu_pending) {
-        res = gpu_wait_download_all(pool, pv_b, sv);
+        res = gpu_wait_d2h_only(pool, pv_b, sv);
         if(res != RES_OK) return res;
       }
       merge_to_single_pool(pool);
@@ -4352,10 +4483,10 @@ pool_run_dual(struct wavefront_pool* pool,
     }
   } /* end dual-buffer while */
 
-  /* Drain: wait for last pending GPU calls */
+  /* Drain: wait for last pending GPU pipelines */
   if(pool->num_active_views == 2) {
     if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
-      res = gpu_wait_download_all(pool, pv_a, sv);
+      res = gpu_wait_d2h_only(pool, pv_a, sv);
       if(res != RES_OK) return res;
       pool->total_steps++;
       res = merged_pass(pool, pv_a, scn);
@@ -4363,7 +4494,7 @@ pool_run_dual(struct wavefront_pool* pool,
       compact_active_paths(pool, pv_a);
     }
     if(pv_b->gpu_pending || pv_b->enc_gpu_pending || pv_b->cp_gpu_pending) {
-      res = gpu_wait_download_all(pool, pv_b, sv);
+      res = gpu_wait_d2h_only(pool, pv_b, sv);
       if(res != RES_OK) return res;
       pool->total_steps++;
       res = merged_pass(pool, pv_b, scn);
@@ -4764,6 +4895,7 @@ solve_camera_persistent_wavefront(
       /* Accumulate Phase 1 untimed GPU ops */
       pool.time_gpu_sync_s   += time_elapsed_sec(&t_cy[0], &t_cy[1]);
       pool.time_gpu_launch_s += time_elapsed_sec(&t_cy[1], &t_cy[3]);
+      pool.time_submit_s     += time_elapsed_sec(&t_cy[0], &t_cy[3]);
 
       /* 1d. Wait D2H(A) for RT + enc + cp + distribute enc/cp results */
       time_current(&t_pl0);
@@ -4885,6 +5017,7 @@ solve_camera_persistent_wavefront(
       /* Accumulate Phase 2 untimed GPU ops (t_hk = end of housekeeping A) */
       pool.time_gpu_sync_s   += time_elapsed_sec(&t_hk, &t_cy[6]);
       pool.time_gpu_launch_s += time_elapsed_sec(&t_cy[6], &t_cy[8]);
+      pool.time_submit_s     += time_elapsed_sec(&t_hk, &t_cy[8]);
 
       /* 2d. Wait D2H(B) for RT + enc + cp + distribute enc/cp results */
       time_current(&t_pl0);
@@ -5109,10 +5242,15 @@ solve_camera_persistent_wavefront(
 #endif
     res = gpu_launch_all(&pool, pv, scn->s3d_view);
     if(res != RES_OK) goto cleanup;
+    { struct time t_sub1;
+      time_current(&t_sub1);
+      pool.time_submit_s += time_elapsed_sec(&t_phase0, &t_sub1);
+      t_phase0 = t_sub1;  /* reset for wait measurement */
+    }
     res = gpu_wait_download_all(&pool, pv, scn->s3d_view);
     if(res != RES_OK) goto cleanup;
     time_current(&t_phase1);
-    pool.time_trace_s += time_elapsed_sec(&t_phase0, &t_phase1);
+    pool.time_pipeline_wait_s += time_elapsed_sec(&t_phase0, &t_phase1);
 
     /* Steps H-L: Housekeeping (update_active, drain detect, diagnostics,
      * progress reporting, periodic logging, safety check) */
