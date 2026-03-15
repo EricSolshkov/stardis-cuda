@@ -2812,127 +2812,13 @@ log_drain_phase_report(struct sdis_device* dev, struct wavefront_pool* pool)
 
 
 /*******************************************************************************
- * L3: Fine-grained pipeline helper functions (dual-stream)
- *
- * Split the old gpu_wait_download into three steps:
- *   gpu_sync_kernel  — wait for GPU kernel to complete (no D2H)
- *   gpu_start_d2h    — launch async D2H download (returns immediately)
- *   gpu_wait_d2h     — wait for D2H, then CPU filter/retrace + stats
- *
- * This allows overlapping D2H(A) with H2D(B)+kernel(B) on the bus.
- ******************************************************************************/
-
-/**
- * gpu_sync_kernel — wait for GPU compute kernel to finish (no data transfer).
- * Measures wall-clock wait time and accumulates into pool->trace_kernel_time_ms_sum.
- */
-static res_T
-gpu_sync_kernel(struct wavefront_pool* pool, struct pool_view* pv)
-{
-  struct time k0, k1;
-  res_T rc;
-  if(pv->ray_count == 0 || !pv->gpu_pending) return RES_OK;
-  time_current(&k0);
-  if(pool->use_gpu_filter)
-    rc = s3d_scene_view_trace_rays_batch_ctx_filtered_sync_kernel(
-      pv->batch_ctx);
-  else
-    rc = s3d_scene_view_trace_rays_batch_ctx_sync_kernel(pv->batch_ctx);
-  time_current(&k1);
-  /* Use CUDA event elapsed time for accurate GPU kernel measurement */
-  pool->trace_kernel_time_ms_sum +=
-    (double)s3d_batch_trace_context_get_last_kernel_ms(pv->batch_ctx);
-  return rc;
-}
-
-/**
- * gpu_start_d2h — launch async D2H download on transfer_stream.
- * Returns immediately.  Caller must call gpu_wait_d2h() before reading.
- */
-static res_T
-gpu_start_d2h(struct wavefront_pool* pool, struct pool_view* pv)
-{
-  if(pv->ray_count == 0 || !pv->gpu_pending) return RES_OK;
-  if(pool->use_gpu_filter)
-    return s3d_scene_view_trace_rays_batch_ctx_filtered_start_d2h(
-      pv->batch_ctx, pv->ray_count);
-  return s3d_scene_view_trace_rays_batch_ctx_start_d2h(
-    pv->batch_ctx, pv->ray_count);
-}
-
-/**
- * gpu_wait_d2h — wait for D2H transfer, CPU filter/retrace, accumulate stats.
- * Replaces gpu_wait_download() in the L3 pipeline.
- * L4: when use_gpu_filter, calls the filtered wait (no retrace).
- */
-static res_T
-gpu_wait_d2h(struct wavefront_pool* pool,
-             struct pool_view* pv,
-             struct s3d_scene_view* sv)
-{
-  struct time t0, t1;
-  res_T res;
-
-  time_current(&t0);
-  if(pv->ray_count > 0 && pv->gpu_pending) {
-    struct s3d_batch_trace_stats stats;
-    memset(&stats, 0, sizeof(stats));
-
-    if(pool->use_gpu_filter) {
-      res = s3d_scene_view_trace_rays_batch_ctx_filtered_wait_d2h(
-        sv, pv->batch_ctx,
-        pv->ray_requests, pv->ray_count,
-        pv->ray_hits, &stats);
-    } else {
-      res = s3d_scene_view_trace_rays_batch_ctx_wait_d2h(
-        sv, pv->batch_ctx,
-        pv->ray_requests, pv->ray_count,
-        pv->ray_hits, &stats);
-    }
-    if(res != RES_OK) return res;
-    pv->gpu_pending = 0;
-
-    pool->total_rays_traced += pv->ray_count;
-
-    /* Promote per-view pending ray stats to pool-level counters */
-    {
-      pool->rays_radiative           += pv->pending_rays_radiative;
-      pool->rays_conductive_ds       += pv->pending_rays_conductive_ds;
-      pool->rays_conductive_ds_retry += pv->pending_rays_conductive_ds_retry;
-      pool->rays_shadow              += pv->pending_rays_shadow;
-      pool->rays_enclosure           += pv->pending_rays_enclosure;
-      pool->rays_startup             += pv->pending_rays_startup;
-      pool->rays_other               += pv->pending_rays_other;
-    }
-
-    pool->trace_call_count++;
-    pool->trace_batch_size_sum   += pv->ray_count;
-    pool->trace_batch_time_ms_sum  += stats.batch_time_ms;
-    pool->trace_post_time_ms_sum   += stats.postprocess_time_ms;
-    pool->trace_retrace_time_ms_sum += stats.retrace_time_ms;
-    pool->trace_retrace_accepted_sum += stats.retrace_accepted;
-    pool->trace_retrace_missed_sum   += stats.retrace_missed;
-    pool->trace_filter_rejected_sum  += stats.filter_rejected;
-
-    if(pv->ray_count < pool->trace_batch_size_min)
-      pool->trace_batch_size_min = pv->ray_count;
-    if(pv->ray_count > pool->trace_batch_size_max)
-      pool->trace_batch_size_max = pv->ray_count;
-  }
-  time_current(&t1);
-  pool->time_trace_s += time_elapsed_sec(&t0, &t1);
-
-  return RES_OK;
-}
-
-/*******************************************************************************
  * O11: Unified async dispatch — RT + enc_locate + closest_point
  *
  * gpu_launch_all   — launch RT + enc + cp async (replaces gpu_launch_async
  *                    for views that have pending enc/cp requests)
  * gpu_sync_kernel_all — sync RT + enc + cp compute kernels
  * gpu_start_d2h_all   — start D2H for RT + enc + cp
- * gpu_wait_d2h_all    — wait D2H + post-process + distribute enc/cp results
+ * gpu_wait_d2h        — wait D2H + post-process + distribute enc/cp results
  *
  * This eliminates the synchronous post_merged_enc_cp() from the CPU phase,
  * hiding enc/cp GPU latency behind the dual-buffer pipeline.
@@ -3064,14 +2950,14 @@ gpu_start_d2h_all(struct wavefront_pool* pool, struct pool_view* pv)
 }
 
 /**
- * gpu_wait_d2h_all — wait for D2H + post-process + distribute enc/cp results.
+ * gpu_wait_d2h — wait for D2H + post-process + distribute enc/cp results.
  * Replaces gpu_wait_d2h() and absorbs the distribute+post-process parts
  * of post_merged_enc_cp().
  */
 static res_T
-gpu_wait_d2h_all(struct wavefront_pool* pool,
-                 struct pool_view* pv,
-                 struct s3d_scene_view* sv)
+gpu_wait_d2h(struct wavefront_pool* pool,
+             struct pool_view* pv,
+             struct s3d_scene_view* sv)
 {
   struct time t0, t1;
   res_T res;
@@ -3182,7 +3068,7 @@ gpu_wait_download_all(struct wavefront_pool* pool,
   if(res != RES_OK) return res;
   res = gpu_start_d2h_all(pool, pv);
   if(res != RES_OK) return res;
-  return gpu_wait_d2h_all(pool, pv, sv);
+  return gpu_wait_d2h(pool, pv, sv);
 }
 
 /**
@@ -3207,21 +3093,6 @@ gpu_submit_all(struct wavefront_pool* pool,
   if(res != RES_OK) return res;
   res = gpu_start_d2h_all(pool, pv);      /* D2H (async, event-gated) */
   return res;
-}
-
-/**
- * gpu_wait_d2h_only — wait for D2H completion + post-process + distribute.
- *
- * Unlike gpu_wait_download_all(), this does NOT call gpu_sync_kernel_all().
- * The kernel→D2H dependency is handled by stream events (cudaStreamWaitEvent
- * inside start_d2h), so we only need to synchronise the transfer_stream.
- */
-static res_T
-gpu_wait_d2h_only(struct wavefront_pool* pool,
-                  struct pool_view* pv,
-                  struct s3d_scene_view* sv)
-{
-  return gpu_wait_d2h_all(pool, pv, sv);
 }
 
 /*******************************************************************************
@@ -4202,100 +4073,146 @@ merged_pass(struct wavefront_pool* pool,
 
 
 /*******************************************************************************
- * pool_run_single — Single-buffer main loop (bare, no progress reporting).
+ * Unified pool runner configuration.
  *
- * O11 merged architecture:
- *   1. merged_pass:     distribute+cascade+collect+harvest (single OMP scan)
- *   2. compact:         rebuild active_indices from hot_arr
- *   3. refill:          replace completed paths with new tasks
- *   4. enc/cp batch:    synchronous enc_locate + closest_point
- *   5. gpu_launch:      async RT trace
- *   6. gpu_wait:        sync + D2H (ray results ready for next merged_pass)
+ * Camera mode enables full diagnostics/progress/timeline hooks.
+ * Probe/probe_batch keep the same execution core but pass NULL/disabled hooks.
  ******************************************************************************/
-static res_T
-pool_run_single(struct wavefront_pool* pool,
-                struct s3d_scene_view* sv,
-                struct sdis_scene* scn)
-{
-  struct pool_view* pv = &pool->views[0];
-  struct time t0, t1;
-  res_T res;
-  size_t refill_count = 0;
+struct pool_run_cfg {
+  size_t total_tasks;
+  int32_t* progress;
+  int pcent_progress;
+  const char* progress_label;
+  int* last_pcent;
+  const struct time* run_start;
+  int enable_diagnostics;
+  int enable_progress;
+  int enable_status_log;
+  int enable_timeline_log;
+};
 
-  compact_active_paths(pool, pv);
+static void
+pool_run_housekeeping(struct wavefront_pool* pool,
+                      struct pool_view* pv,
+                      struct sdis_scene* scn,
+                      const struct pool_run_cfg* cfg,
+                      char half_tag)
+{
+  size_t tasks_done;
+  size_t total_tasks;
+
   pool_update_active_count(pool);
 
-  while(pool->active_count > 0 || pool->task_next < pool->task_count) {
-    pool->total_steps++;
-
-    /* Step 1: O11 merged_pass (distribute+cascade+collect+harvest) */
-    time_current(&t0);
-    res = merged_pass(pool, pv, scn);
-    if(res != RES_OK) return res;
-    time_current(&t1);
-    pool->time_cascade_s += time_elapsed_sec(&t0, &t1);
-
-    /* Step 2: compact active indices */
-    time_current(&t0);
-    compact_active_paths(pool, pv);
-    time_current(&t1);
-    pool->time_compact_s += time_elapsed_sec(&t0, &t1);
-
-    /* Step 3: refill completed slots */
-    time_current(&t0);
-    res = refill_pool(pool, pv, &refill_count);
-    if(res != RES_OK) return res;
-    time_current(&t1);
-    pool->time_harvest_s += time_elapsed_sec(&t0, &t1);
-
-    /* Step 4: GPU launch RT + enc + cp (async) */
-#ifdef SDIS_DEBUG_CHECKS
-    assert_no_pending_result_before_dispatch(pool, pv);
-#endif
-    time_current(&t0);
-    res = gpu_launch_all(pool, pv, sv);
-    if(res != RES_OK) return res;
-    time_current(&t1);
-    pool->time_gpu_launch_s += time_elapsed_sec(&t0, &t1);
-    pool->time_submit_s     += time_elapsed_sec(&t0, &t1);
-
-    /* Step 5: GPU wait + D2H for RT + enc + cp */
-    time_current(&t0);
-    res = gpu_wait_download_all(pool, pv, sv);
-    if(res != RES_OK) return res;
-    time_current(&t1);
-    pool->time_pipeline_wait_s += time_elapsed_sec(&t0, &t1);
-    if(res != RES_OK) return res;
-
-    /* DIAG_V3: optional extra cascade after enc/cp distribution.
-     * Main branch resolves enc_locate/cp synchronously within the same
-     * iteration *before* cascade.  Merge-phase defers them to GPU,
-     * meaning freshly-distributed enc/cp RESULT phases wait until the
-     * next iteration's Phase B cascade.  Enable with env var
-     * STARDIS_DIAG_V3=1 to add a compensating cascade sweep here.
-     * If results then match main, the enc/cp timing gap causes the
-     * residual divergence (H2). */
-    {
-      static int diag_v3 = -1;
-      if(diag_v3 < 0) {
-        const char* e = getenv("STARDIS_DIAG_V3");
-        diag_v3 = (e && e[0] == '1') ? 1 : 0;
-      }
-      if(diag_v3) {
-        res = pool_cascade_non_ray_steps_compact(pool, pv, scn);
-        if(res != RES_OK) return res;
-      }
+  if(!pool->in_drain_phase && pool->task_next >= pool->task_count) {
+    pool->in_drain_phase = 1;
+    if(cfg && cfg->run_start) {
+      struct time t_now;
+      time_current(&t_now);
+      pool->time_refill_phase_s = time_elapsed_sec(cfg->run_start, &t_now);
     }
-
-    pool_update_active_count(pool);
-
-    /* Safety: prevent infinite loops */
-    if(pool->total_steps > pool->task_count * 1000) {
-      return RES_BAD_OP;
+    if(cfg && cfg->enable_status_log) {
+      log_info(scn->dev,
+        "persistent_wavefront: entering drain phase at step %llu, "
+        "%llu active paths remain, refill_wall=%.3fs\n",
+        (unsigned long long)pool->total_steps,
+        (unsigned long long)pool->active_count,
+        pool->time_refill_phase_s);
     }
   }
 
-  return RES_OK;
+  if(cfg && cfg->enable_diagnostics)
+    pool_update_diagnostics(pool, pv);
+
+  if(cfg && cfg->enable_progress
+  && cfg->progress
+  && cfg->last_pcent
+  && cfg->pcent_progress > 0) {
+    tasks_done = pool->paths_completed + pool->paths_failed;
+    total_tasks = cfg->total_tasks > 0 ? cfg->total_tasks : pool->task_count;
+    if(total_tasks > 0) {
+      int pcent = (int)((double)tasks_done * 100.0 / (double)total_tasks + 0.5);
+      if(pcent > 100) pcent = 100;
+      if(pcent / cfg->pcent_progress > (*cfg->last_pcent) / cfg->pcent_progress) {
+        *cfg->last_pcent = pcent;
+        cfg->progress[0] = pcent;
+        print_progress_update(scn->dev, cfg->progress,
+                              cfg->progress_label ? cfg->progress_label : "");
+      }
+    }
+  }
+
+  if(cfg && cfg->enable_status_log) {
+    int do_log = 0;
+    total_tasks = cfg->total_tasks > 0 ? cfg->total_tasks : pool->task_count;
+
+    if(half_tag == 'A') {
+      do_log = (pool->total_steps % 1000 == 1)
+            || (pool->in_drain_phase && pool->drain_step_count % 500 == 0
+             && pool->active_count > 0);
+      if(do_log) {
+        log_info(scn->dev,
+          "persistent_wavefront pipeline step %llu [A]: %llu/%llu active, "
+          "%llu rays (rad=%llu ds=%llu shd=%llu enc=%llu st=%llu), "
+          "%llu/%llu tasks done, %s\n",
+          (unsigned long long)pool->total_steps,
+          (unsigned long long)pool->active_count,
+          (unsigned long long)pool->pool_size,
+          (unsigned long long)pv->ray_count,
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_RADIATIVE],
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_STEP_PAIR],
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_SHADOW],
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_ENCLOSURE],
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_STARTUP],
+          (unsigned long long)(pool->paths_completed + pool->paths_failed),
+          (unsigned long long)total_tasks,
+          pool->in_drain_phase ? "DRAIN" : "refill");
+      }
+    } else if(half_tag == 'B') {
+      do_log = (pool->total_steps % 1000 == 0)
+            || (pool->in_drain_phase && pool->drain_step_count % 500 == 0
+             && pool->active_count > 0);
+      if(do_log) {
+        log_info(scn->dev,
+          "persistent_wavefront pipeline step %llu [B]: %llu/%llu active, "
+          "%llu rays (rad=%llu ds=%llu shd=%llu enc=%llu st=%llu), "
+          "%llu/%llu tasks done, %s\n",
+          (unsigned long long)pool->total_steps,
+          (unsigned long long)pool->active_count,
+          (unsigned long long)pool->pool_size,
+          (unsigned long long)pv->ray_count,
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_RADIATIVE],
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_STEP_PAIR],
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_SHADOW],
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_ENCLOSURE],
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_STARTUP],
+          (unsigned long long)(pool->paths_completed + pool->paths_failed),
+          (unsigned long long)total_tasks,
+          pool->in_drain_phase ? "DRAIN" : "refill");
+      }
+    } else {
+      do_log = (pool->total_steps % 1000 == 0)
+            || (pool->in_drain_phase && pool->drain_step_count % 500 == 0
+             && pool->active_count > 0);
+      if(do_log) {
+        log_info(scn->dev,
+          "persistent_wavefront step %llu: %llu/%llu active, "
+          "%llu rays this step (rad=%llu ds=%llu shd=%llu enc=%llu st=%llu), "
+          "%llu/%llu tasks done, %s\n",
+          (unsigned long long)pool->total_steps,
+          (unsigned long long)pool->active_count,
+          (unsigned long long)pool->pool_size,
+          (unsigned long long)pv->ray_count,
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_RADIATIVE],
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_STEP_PAIR],
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_SHADOW],
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_ENCLOSURE],
+          (unsigned long long)pv->bucket_counts[RAY_BUCKET_STARTUP],
+          (unsigned long long)(pool->paths_completed + pool->paths_failed),
+          (unsigned long long)total_tasks,
+          pool->in_drain_phase ? "DRAIN" : "refill");
+      }
+    }
+  }
 }
 
 /*******************************************************************************
@@ -4455,12 +4372,19 @@ static res_T submit_thread_wait_view(struct wavefront_pool* pool, int view_idx) 
 static res_T
 pool_run_dual(struct wavefront_pool* pool,
               struct s3d_scene_view* sv,
-              struct sdis_scene* scn)
+              struct sdis_scene* scn,
+              const struct pool_run_cfg* cfg)
 {
   struct pool_view* pv_a = &pool->views[0];
   struct pool_view* pv_b = &pool->views[1];
   res_T res;
   size_t refill_count = 0;
+
+  if(cfg && cfg->enable_status_log) {
+    log_info(scn->dev,
+      "pipeline: starting dual-buffer mode (O13 async submit), half=%llu\n",
+      (unsigned long long)pv_a->view_size);
+  }
 
   /* ═══════ O13: Start submit thread ═══════ */
   submit_thread_init(pool);
@@ -4469,17 +4393,47 @@ pool_run_dual(struct wavefront_pool* pool,
 
   /* A: initial CPU work */
   compact_active_paths(pool, pv_a);
+  if(cfg && cfg->enable_status_log) {
+    log_info(scn->dev,
+      "O11_STARTUP A pre-merge: active=%llu need_ray=%llu done=%llu\n",
+      (unsigned long long)pv_a->active_compact,
+      (unsigned long long)pv_a->need_ray_count,
+      (unsigned long long)pv_a->done_count);
+  }
   res = merged_pass(pool, pv_a, scn);
   if(res != RES_OK) goto dual_cleanup;
   compact_active_paths(pool, pv_a);
+  if(cfg && cfg->enable_status_log) {
+    log_info(scn->dev,
+      "O11_STARTUP A post-merge: active=%llu need_ray=%llu done=%llu rays=%llu\n",
+      (unsigned long long)pv_a->active_compact,
+      (unsigned long long)pv_a->need_ray_count,
+      (unsigned long long)pv_a->done_count,
+      (unsigned long long)pv_a->ray_count);
+  }
   res = refill_pool(pool, pv_a, &refill_count);
   if(res != RES_OK) goto dual_cleanup;
 
   /* B: initial CPU work */
   compact_active_paths(pool, pv_b);
+  if(cfg && cfg->enable_status_log) {
+    log_info(scn->dev,
+      "O11_STARTUP B pre-merge: active=%llu need_ray=%llu done=%llu\n",
+      (unsigned long long)pv_b->active_compact,
+      (unsigned long long)pv_b->need_ray_count,
+      (unsigned long long)pv_b->done_count);
+  }
   res = merged_pass(pool, pv_b, scn);
   if(res != RES_OK) goto dual_cleanup;
   compact_active_paths(pool, pv_b);
+  if(cfg && cfg->enable_status_log) {
+    log_info(scn->dev,
+      "O11_STARTUP B post-merge: active=%llu need_ray=%llu done=%llu rays=%llu\n",
+      (unsigned long long)pv_b->active_compact,
+      (unsigned long long)pv_b->need_ray_count,
+      (unsigned long long)pv_b->done_count,
+      (unsigned long long)pv_b->ray_count);
+  }
   res = refill_pool(pool, pv_b, &refill_count);
   if(res != RES_OK) goto dual_cleanup;
 
@@ -4501,7 +4455,10 @@ pool_run_dual(struct wavefront_pool* pool,
   }
 
   while(pool->active_count > 0 || pool->task_next < pool->task_count) {
-    struct time t_pl0, t_pl1;
+    struct time t_pl0, t_pl1, t_hk0, t_hk1;
+    struct time t_cy[6];
+
+    time_current(&t_cy[0]);
 
     /* ════════ Half-A: wait D2H(A) → CPU on A → async submit(A) ════════ */
 
@@ -4514,7 +4471,7 @@ pool_run_dual(struct wavefront_pool* pool,
     pool->time_submit_s += pool->submit_elapsed_s[0];
 
     time_current(&t_pl0);
-    res = gpu_wait_d2h_only(pool, pv_a, sv);
+    res = gpu_wait_d2h(pool, pv_a, sv);
     if(res != RES_OK) goto dual_cleanup;
     time_current(&t_pl1);
     pool->time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
@@ -4549,11 +4506,10 @@ pool_run_dual(struct wavefront_pool* pool,
 #endif
     submit_thread_signal(pool, pv_a, sv, 0);
 
-    pool_update_active_count(pool);
-
-    if(!pool->in_drain_phase && pool->task_next >= pool->task_count) {
-      pool->in_drain_phase = 1;
-    }
+    time_current(&t_hk0);
+    pool_run_housekeeping(pool, pv_a, scn, cfg, 'A');
+    time_current(&t_hk1);
+    pool->time_housekeeping_s += time_elapsed_sec(&t_hk0, &t_hk1);
 
     if(pool->total_steps > pool->task_count * 1000) {
       res = RES_BAD_OP;
@@ -4570,10 +4526,11 @@ pool_run_dual(struct wavefront_pool* pool,
     pool->time_submit_s += pool->submit_elapsed_s[1];
 
     time_current(&t_pl0);
-    res = gpu_wait_d2h_only(pool, pv_b, sv);
+    res = gpu_wait_d2h(pool, pv_b, sv);
     if(res != RES_OK) goto dual_cleanup;
     time_current(&t_pl1);
     pool->time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
+    t_cy[3] = t_pl1;
 
     pool->total_steps++;
 
@@ -4596,6 +4553,7 @@ pool_run_dual(struct wavefront_pool* pool,
     }
     time_current(&t_pl1);
     pool->time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
+    t_cy[4] = t_pl1;
 
     /* O13: async submit(B) */
 #ifdef SDIS_DEBUG_CHECKS
@@ -4603,10 +4561,29 @@ pool_run_dual(struct wavefront_pool* pool,
 #endif
     submit_thread_signal(pool, pv_b, sv, 1);
 
-    pool_update_active_count(pool);
+    time_current(&t_hk0);
+    pool_run_housekeeping(pool, pv_b, scn, cfg, 'B');
 
-    if(!pool->in_drain_phase && pool->task_next >= pool->task_count) {
-      pool->in_drain_phase = 1;
+    if(cfg && cfg->enable_timeline_log) {
+      const char* env_tl = getenv("STARDIS_PIPELINE_LOG");
+      time_current(&t_cy[5]);
+      if(env_tl && env_tl[0] == '2' && pool->total_steps % 1000 == 0) {
+        double waitA  = time_elapsed_sec(&t_cy[0],  &t_cy[1]) * 1000.0;
+        double cpuA   = time_elapsed_sec(&t_cy[1],  &t_cy[2]) * 1000.0;
+        double waitB  = time_elapsed_sec(&t_cy[2],  &t_cy[3]) * 1000.0;
+        double cpuB   = time_elapsed_sec(&t_cy[3],  &t_cy[4]) * 1000.0;
+        double cycle  = time_elapsed_sec(&t_cy[0],  &t_cy[5]) * 1000.0;
+        double sub_ms = (pool->submit_elapsed_s[0] + pool->submit_elapsed_s[1])
+                      * 1000.0;
+        log_info(scn->dev,
+          "[TIMELINE] step=%llu "
+          "|waitA=%.2f|cpuA=%.2f|waitB=%.2f|cpuB=%.2f"
+          "|submit=%.2f(async)|cycle=%.2fms raysA=%llu raysB=%llu\n",
+          (unsigned long long)pool->total_steps,
+          waitA, cpuA, waitB, cpuB, sub_ms, cycle,
+          (unsigned long long)pv_a->ray_count,
+          (unsigned long long)pv_b->ray_count);
+      }
     }
 
     if(pool->total_steps > pool->task_count * 1000) {
@@ -4631,18 +4608,31 @@ pool_run_dual(struct wavefront_pool* pool,
       if(res != RES_OK) goto dual_cleanup;
       pool->time_submit_s += pool->submit_elapsed_s[1];
       /* Both views have pending submit (H2D→Kernel→D2H).
-       * gpu_wait_d2h_only drains the full pipeline via stream events. */
+       * gpu_wait_d2h drains the full pipeline via stream events. */
       if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
-        res = gpu_wait_d2h_only(pool, pv_a, sv);
+        res = gpu_wait_d2h(pool, pv_a, sv);
         if(res != RES_OK) goto dual_cleanup;
       }
       if(pv_b->gpu_pending || pv_b->enc_gpu_pending || pv_b->cp_gpu_pending) {
-        res = gpu_wait_d2h_only(pool, pv_b, sv);
+        res = gpu_wait_d2h(pool, pv_b, sv);
         if(res != RES_OK) goto dual_cleanup;
       }
+      if(cfg && cfg->enable_status_log) {
+        log_info(scn->dev,
+          "pipeline: merging to single-pool at step %llu "
+          "(A.active=%llu, B.active=%llu)\n",
+          (unsigned long long)pool->total_steps,
+          (unsigned long long)pv_a->active_compact,
+          (unsigned long long)pv_b->active_compact);
+      }
       merge_to_single_pool(pool);
+      time_current(&t_hk1);
+      pool->time_housekeeping_s += time_elapsed_sec(&t_hk0, &t_hk1);
       break;
     }
+
+    time_current(&t_hk1);
+    pool->time_housekeeping_s += time_elapsed_sec(&t_hk0, &t_hk1);
   } /* end dual-buffer while */
 
   /* Drain: wait for last pending GPU pipelines */
@@ -4656,7 +4646,7 @@ pool_run_dual(struct wavefront_pool* pool,
     pool->time_submit_s += pool->submit_elapsed_s[1];
 
     if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
-      res = gpu_wait_d2h_only(pool, pv_a, sv);
+      res = gpu_wait_d2h(pool, pv_a, sv);
       if(res != RES_OK) goto dual_cleanup;
       pool->total_steps++;
       res = merged_pass(pool, pv_a, scn);
@@ -4664,7 +4654,7 @@ pool_run_dual(struct wavefront_pool* pool,
       compact_active_paths(pool, pv_a);
     }
     if(pv_b->gpu_pending || pv_b->enc_gpu_pending || pv_b->cp_gpu_pending) {
-      res = gpu_wait_d2h_only(pool, pv_b, sv);
+      res = gpu_wait_d2h(pool, pv_b, sv);
       if(res != RES_OK) goto dual_cleanup;
       pool->total_steps++;
       res = merged_pass(pool, pv_b, scn);
@@ -4678,43 +4668,116 @@ dual_cleanup:
   return res;
 }
 
+static res_T
+pool_run_single(struct wavefront_pool* pool,
+                struct s3d_scene_view* sv,
+                struct sdis_scene* scn,
+                const struct pool_run_cfg* cfg)
+{
+  struct pool_view* pv = &pool->views[0];
+  res_T res;
+
+  while(pool->active_count > 0 || pool->task_next < pool->task_count) {
+    size_t refill_count = 0;
+    struct time t_phase0, t_phase1;
+
+    pool->total_steps++;
+
+    time_current(&t_phase0);
+    res = merged_pass(pool, pv, scn);
+    if(res != RES_OK) return res;
+    time_current(&t_phase1);
+    pool->time_cascade_s += time_elapsed_sec(&t_phase0, &t_phase1);
+    pool->time_pipeline_cpu_between_s += time_elapsed_sec(&t_phase0, &t_phase1);
+
+    time_current(&t_phase0);
+    compact_active_paths(pool, pv);
+    res = refill_pool(pool, pv, &refill_count);
+    if(res != RES_OK) return res;
+    time_current(&t_phase1);
+    pool->time_harvest_s += time_elapsed_sec(&t_phase0, &t_phase1);
+
+    time_current(&t_phase0);
+#ifdef SDIS_DEBUG_CHECKS
+    assert_no_pending_result_before_dispatch(pool, pv);
+#endif
+    res = gpu_launch_all(pool, pv, sv);
+    if(res != RES_OK) return res;
+    {
+      struct time t_sub1;
+      time_current(&t_sub1);
+      pool->time_gpu_launch_s += time_elapsed_sec(&t_phase0, &t_sub1);
+      pool->time_submit_s += time_elapsed_sec(&t_phase0, &t_sub1);
+      t_phase0 = t_sub1;
+    }
+
+    res = gpu_wait_download_all(pool, pv, sv);
+    if(res != RES_OK) return res;
+    time_current(&t_phase1);
+    pool->time_pipeline_wait_s += time_elapsed_sec(&t_phase0, &t_phase1);
+
+    time_current(&t_phase0);
+    pool_run_housekeeping(pool, pv, scn, cfg, 0);
+    time_current(&t_phase1);
+    pool->time_housekeeping_s += time_elapsed_sec(&t_phase0, &t_phase1);
+
+    if(pool->total_steps > pool->task_count * 1000) {
+      return RES_BAD_OP;
+    }
+  }
+
+  return RES_OK;
+}
+
 /*******************************************************************************
- * pool_run — Unified main loop dispatcher.
+ * run_pool — Unified main loop dispatcher.
  *
  * Runs the dual-buffer pipeline if num_active_views == 2 (which may
  * dynamically merge to single).  Then runs single-buffer to completion.
  *
- * This is the entry point for probe / probe_batch modes.  Camera mode
- * currently uses its own verbose loop with progress reporting.
+ * Entry points (camera/probe/probe_batch) only initialize pool/tasks and
+ * delegate execution here.
  ******************************************************************************/
 static res_T
-pool_run(struct wavefront_pool* pool,
+run_pool(struct wavefront_pool* pool,
          struct s3d_scene_view* sv,
-         struct sdis_scene* scn)
+         struct sdis_scene* scn,
+         const struct pool_run_cfg* cfg)
 {
   res_T res = RES_OK;
 
   /* Phase 1: Dual-buffer pipeline (if scheduled) */
   if(pool->num_active_views == 2) {
-    log_info(scn->dev,
-      "pool_run: dual-buffer pipeline, per-view=%llu, pool=%llu\n",
-      (unsigned long long)pool->views[0].view_size,
-      (unsigned long long)pool->pool_size);
-
-    res = pool_run_dual(pool, sv, scn);
+    res = pool_run_dual(pool, sv, scn, cfg);
     if(res != RES_OK) return res;
 
     /* May have merged — log if so */
-    if(pool->num_active_views == 1) {
+    if((cfg && cfg->enable_status_log) && pool->num_active_views == 1) {
       log_info(scn->dev,
-        "pool_run: merged to single-buffer at step %llu\n",
+        "run_pool: merged to single-buffer at step %llu\n",
+        (unsigned long long)pool->total_steps);
+    }
+
+    if(cfg && cfg->enable_status_log && cfg->run_start) {
+      struct time t_now;
+      double pipeline_wall;
+      time_current(&t_now);
+      pipeline_wall = time_elapsed_sec(cfg->run_start, &t_now);
+      if(pipeline_wall <= 0) pipeline_wall = 1e-9;
+      log_info(scn->dev,
+        "pipeline stats: wall=%.3fs, gpu_wait=%.3fs, cpu_between=%.3fs, "
+        "submit=%.3fs(async), steps=%llu\n",
+        pipeline_wall,
+        pool->time_pipeline_wait_s,
+        pool->time_pipeline_cpu_between_s,
+        pool->time_submit_s,
         (unsigned long long)pool->total_steps);
     }
   }
 
   /* Phase 2: Single-buffer drain (or full run if started single) */
   if(pool->num_active_views == 1) {
-    res = pool_run_single(pool, sv, scn);
+    res = pool_run_single(pool, sv, scn, cfg);
     if(res != RES_OK) return res;
   }
 
@@ -4793,6 +4856,7 @@ solve_camera_persistent_wavefront(
   res_T res = RES_OK;
   struct time t_start, t_end, t_elapsed;
   int last_pcent = 0;
+  struct pool_run_cfg run_cfg;
 
   ASSERT(scn && per_thread_rng && nthreads > 0 && cam && spp);
   ASSERT(image_def && image_def[0] > 0 && image_def[1] > 0);
@@ -4976,508 +5040,20 @@ solve_camera_persistent_wavefront(
 
   /* ====== 7. Wavefront main loop ====== */
   time_current(&t_start);
+  memset(&run_cfg, 0, sizeof(run_cfg));
+  run_cfg.total_tasks = total_tasks;
+  run_cfg.progress = progress;
+  run_cfg.pcent_progress = pcent_progress;
+  run_cfg.progress_label = progress_label;
+  run_cfg.last_pcent = &last_pcent;
+  run_cfg.run_start = &t_start;
+  run_cfg.enable_diagnostics = 1;
+  run_cfg.enable_progress = 1;
+  run_cfg.enable_status_log = 1;
+  run_cfg.enable_timeline_log = 1;
 
-  /* ═══════════════════════════════════════════════════════ */
-  /*  P4: Dual-buffer pipeline (num_active_views == 2)       */
-  /* ═══════════════════════════════════════════════════════ */
-  if(pool.num_active_views == 2) {
-    struct pool_view* pv_a = &pool.views[0];
-    struct pool_view* pv_b = &pool.views[1];
-
-    log_info(scn->dev,
-      "pipeline: starting dual-buffer mode (O13 async submit), half=%llu\n",
-      (unsigned long long)pv_a->view_size);
-
-    /* O13: Start submit thread */
-    submit_thread_init(&pool);
-
-    /* ---- O11 Startup: merged_pass(A) ---- */
-    compact_active_paths(&pool, pv_a);
-    log_info(scn->dev,
-      "O11_STARTUP A pre-merge: active=%llu need_ray=%llu done=%llu\n",
-      (unsigned long long)pv_a->active_compact,
-      (unsigned long long)pv_a->need_ray_count,
-      (unsigned long long)pv_a->done_count);
-    res = merged_pass(&pool, pv_a, scn);
-    if(res != RES_OK) goto cleanup;
-    compact_active_paths(&pool, pv_a);
-    log_info(scn->dev,
-      "O11_STARTUP A post-merge: active=%llu need_ray=%llu done=%llu rays=%llu\n",
-      (unsigned long long)pv_a->active_compact,
-      (unsigned long long)pv_a->need_ray_count,
-      (unsigned long long)pv_a->done_count,
-      (unsigned long long)pv_a->ray_count);
-    { size_t rc = 0;
-      res = refill_pool(&pool, pv_a, &rc);
-      if(res != RES_OK) goto cleanup; }
-
-    /* ---- O11 Startup: merged_pass(B) ---- */
-    compact_active_paths(&pool, pv_b);
-    log_info(scn->dev,
-      "O11_STARTUP B pre-merge: active=%llu need_ray=%llu done=%llu\n",
-      (unsigned long long)pv_b->active_compact,
-      (unsigned long long)pv_b->need_ray_count,
-      (unsigned long long)pv_b->done_count);
-    res = merged_pass(&pool, pv_b, scn);
-    if(res != RES_OK) goto cleanup;
-    compact_active_paths(&pool, pv_b);
-    log_info(scn->dev,
-      "O11_STARTUP B post-merge: active=%llu need_ray=%llu done=%llu rays=%llu\n",
-      (unsigned long long)pv_b->active_compact,
-      (unsigned long long)pv_b->need_ray_count,
-      (unsigned long long)pv_b->done_count,
-      (unsigned long long)pv_b->ray_count);
-    { size_t rc = 0;
-      res = refill_pool(&pool, pv_b, &rc);
-      if(res != RES_OK) goto cleanup; }
-
-    /* Startup submit: both views synchronously */
-    { struct time t_sub0, t_sub1;
-      time_current(&t_sub0);
-#ifdef SDIS_DEBUG_CHECKS
-      assert_no_pending_result_before_dispatch(&pool, pv_a);
-#endif
-      res = gpu_submit_all(&pool, pv_a, scn->s3d_view);
-      if(res != RES_OK) goto cleanup;
-#ifdef SDIS_DEBUG_CHECKS
-      assert_no_pending_result_before_dispatch(&pool, pv_b);
-#endif
-      res = gpu_submit_all(&pool, pv_b, scn->s3d_view);
-      if(res != RES_OK) goto cleanup;
-      time_current(&t_sub1);
-      pool.time_submit_s += time_elapsed_sec(&t_sub0, &t_sub1);
-    }
-
-    while(pool.active_count > 0 || pool.task_next < pool.task_count) {
-      struct time t_pl0, t_pl1, t_hk;
-      /* O13 timeline: 6 timestamps per half-cycle
-       * [0]=ensure_done  [1]=after_wait_d2h(A)  [2]=after_cpu(A)
-       * [3]=after_wait_d2h(B)  [4]=after_cpu(B)  [5]=cycle_end */
-      struct time t_cy[6];
-
-      /* ════════ Half-A: wait D2H(A) → CPU on A → async submit(A) ════════ */
-      time_current(&t_cy[0]);
-
-      /* Ensure A's submit from the PREVIOUS cycle completed.
-       * First iter: evt_done[0] starts signaled → instant return.
-       * Steady state: A was signaled 1 full cycle ago. */
-      res = submit_thread_wait_view(&pool, 0);
-      if(res != RES_OK) goto cleanup;
-      pool.time_submit_s += pool.submit_elapsed_s[0];
-
-      /* Wait D2H(A) */
-      time_current(&t_pl0);
-      res = gpu_wait_d2h_all(&pool, pv_a, scn->s3d_view);
-      if(res != RES_OK) goto cleanup;
-      time_current(&t_pl1);
-      pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[1] = t_pl1;
-
-      pool.total_steps++;
-
-      /* O11 merged_pass + compact + refill on A */
-      time_current(&t_pl0);
-      { struct time t_mp0, t_mp1;
-        time_current(&t_mp0);
-        res = merged_pass(&pool, pv_a, scn);
-        if(res != RES_OK) goto cleanup;
-        time_current(&t_mp1);
-        pool.time_cascade_s += time_elapsed_sec(&t_mp0, &t_mp1);
-      }
-      { struct time t_cr0, t_cr1;
-        time_current(&t_cr0);
-        compact_active_paths(&pool, pv_a);
-        { size_t rc = 0;
-          res = refill_pool(&pool, pv_a, &rc);
-          if(res != RES_OK) goto cleanup;
-          if(rc > 0) compact_active_paths(&pool, pv_a); }
-        time_current(&t_cr1);
-        pool.time_harvest_s += time_elapsed_sec(&t_cr0, &t_cr1);
-      }
-      time_current(&t_pl1);
-      pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[2] = t_pl1;
-
-      /* O13: async submit(A) */
-#ifdef SDIS_DEBUG_CHECKS
-      assert_no_pending_result_before_dispatch(&pool, pv_a);
-#endif
-      submit_thread_signal(&pool, pv_a, scn->s3d_view, 0);
-
-      /* -- Housekeeping after A's step -- */
-      time_current(&t_hk);
-      pool_update_active_count(&pool);
-
-      if(!pool.in_drain_phase && pool.task_next >= pool.task_count) {
-        struct time t_now;
-        pool.in_drain_phase = 1;
-        time_current(&t_now);
-        pool.time_refill_phase_s = time_elapsed_sec(&t_start, &t_now);
-        log_info(scn->dev,
-          "persistent_wavefront: entering drain phase at step %llu, "
-          "%llu active paths remain, refill_wall=%.3fs\n",
-          (unsigned long long)pool.total_steps,
-          (unsigned long long)pool.active_count,
-          pool.time_refill_phase_s);
-      }
-      pool_update_diagnostics(&pool, pv_a);
-      {
-        size_t tasks_done = pool.paths_completed + pool.paths_failed;
-        int pcent = (int)((double)tasks_done * 100.0
-                        / (double)total_tasks + 0.5);
-        if(pcent > 100) pcent = 100;
-        if(pcent / pcent_progress > last_pcent / pcent_progress) {
-          last_pcent = pcent;
-          if(progress) {
-            progress[0] = pcent;
-            print_progress_update(scn->dev, progress, progress_label);
-          }
-        }
-      }
-      if(pool.total_steps % 1000 == 1
-      || (pool.in_drain_phase && pool.drain_step_count % 500 == 0
-       && pool.active_count > 0)) {
-        log_info(scn->dev,
-          "persistent_wavefront pipeline step %llu [A]: %llu/%llu active, "
-          "%llu rays (rad=%llu ds=%llu shd=%llu enc=%llu st=%llu), "
-          "%llu/%llu tasks done, %s\n",
-          (unsigned long long)pool.total_steps,
-          (unsigned long long)pool.active_count,
-          (unsigned long long)pool.pool_size,
-          (unsigned long long)pv_a->ray_count,
-          (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_RADIATIVE],
-          (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_STEP_PAIR],
-          (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_SHADOW],
-          (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_ENCLOSURE],
-          (unsigned long long)pv_a->bucket_counts[RAY_BUCKET_STARTUP],
-          (unsigned long long)(pool.paths_completed + pool.paths_failed),
-          (unsigned long long)total_tasks,
-          pool.in_drain_phase ? "DRAIN" : "refill");
-      }
-      { struct time t_hk_end; time_current(&t_hk_end);
-        pool.time_housekeeping_s += time_elapsed_sec(&t_hk, &t_hk_end); }
-
-      /* ════════ Half-B: wait D2H(B) → CPU on B → async submit(B) ════════ */
-
-      /* Ensure B's submit from the PREVIOUS cycle completed.
-       * Steady state: B was signaled 1 full cycle ago. */
-      res = submit_thread_wait_view(&pool, 1);
-      if(res != RES_OK) goto cleanup;
-      pool.time_submit_s += pool.submit_elapsed_s[1];
-
-      /* Wait D2H(B) */
-      time_current(&t_pl0);
-      res = gpu_wait_d2h_all(&pool, pv_b, scn->s3d_view);
-      if(res != RES_OK) goto cleanup;
-      time_current(&t_pl1);
-      pool.time_pipeline_wait_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[3] = t_pl1;
-
-      pool.total_steps++;
-
-      /* O11 merged_pass + compact + refill on B */
-      time_current(&t_pl0);
-      { struct time t_mp0, t_mp1;
-        time_current(&t_mp0);
-        res = merged_pass(&pool, pv_b, scn);
-        if(res != RES_OK) goto cleanup;
-        time_current(&t_mp1);
-        pool.time_cascade_s += time_elapsed_sec(&t_mp0, &t_mp1);
-      }
-      { struct time t_cr0, t_cr1;
-        time_current(&t_cr0);
-        compact_active_paths(&pool, pv_b);
-        { size_t rc = 0;
-          res = refill_pool(&pool, pv_b, &rc);
-          if(res != RES_OK) goto cleanup;
-          if(rc > 0) compact_active_paths(&pool, pv_b); }
-        time_current(&t_cr1);
-        pool.time_harvest_s += time_elapsed_sec(&t_cr0, &t_cr1);
-      }
-      time_current(&t_pl1);
-      pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_pl0, &t_pl1);
-      t_cy[4] = t_pl1;
-
-      /* O13: async submit(B) */
-#ifdef SDIS_DEBUG_CHECKS
-      assert_no_pending_result_before_dispatch(&pool, pv_b);
-#endif
-      submit_thread_signal(&pool, pv_b, scn->s3d_view, 1);
-
-      /* -- Housekeeping after B's step -- */
-      time_current(&t_hk);
-      pool_update_active_count(&pool);
-
-      if(!pool.in_drain_phase && pool.task_next >= pool.task_count) {
-        struct time t_now;
-        pool.in_drain_phase = 1;
-        time_current(&t_now);
-        pool.time_refill_phase_s = time_elapsed_sec(&t_start, &t_now);
-        log_info(scn->dev,
-          "persistent_wavefront: entering drain phase at step %llu, "
-          "%llu active paths remain, refill_wall=%.3fs\n",
-          (unsigned long long)pool.total_steps,
-          (unsigned long long)pool.active_count,
-          pool.time_refill_phase_s);
-      }
-      pool_update_diagnostics(&pool, pv_b);
-      {
-        size_t tasks_done = pool.paths_completed + pool.paths_failed;
-        int pcent = (int)((double)tasks_done * 100.0
-                        / (double)total_tasks + 0.5);
-        if(pcent > 100) pcent = 100;
-        if(pcent / pcent_progress > last_pcent / pcent_progress) {
-          last_pcent = pcent;
-          if(progress) {
-            progress[0] = pcent;
-            print_progress_update(scn->dev, progress, progress_label);
-          }
-        }
-      }
-      if(pool.total_steps % 1000 == 0
-      || (pool.in_drain_phase && pool.drain_step_count % 500 == 0
-       && pool.active_count > 0)) {
-        log_info(scn->dev,
-          "persistent_wavefront pipeline step %llu [B]: %llu/%llu active, "
-          "%llu rays (rad=%llu ds=%llu shd=%llu enc=%llu st=%llu), "
-          "%llu/%llu tasks done, %s\n",
-          (unsigned long long)pool.total_steps,
-          (unsigned long long)pool.active_count,
-          (unsigned long long)pool.pool_size,
-          (unsigned long long)pv_b->ray_count,
-          (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_RADIATIVE],
-          (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_STEP_PAIR],
-          (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_SHADOW],
-          (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_ENCLOSURE],
-          (unsigned long long)pv_b->bucket_counts[RAY_BUCKET_STARTUP],
-          (unsigned long long)(pool.paths_completed + pool.paths_failed),
-          (unsigned long long)total_tasks,
-          pool.in_drain_phase ? "DRAIN" : "refill");
-      }
-
-      /* ════════ O13 Timeline output (STARDIS_PIPELINE_LOG=2) ════════ */
-      time_current(&t_cy[5]);
-      {
-        const char* env_tl = getenv("STARDIS_PIPELINE_LOG");
-        env_tl="2";
-        if(env_tl && env_tl[0] == '2' && pool.total_steps % 1000 == 0) {
-          double waitA  = time_elapsed_sec(&t_cy[0],  &t_cy[1])  * 1000.0;
-          double cpuA   = time_elapsed_sec(&t_cy[1],  &t_cy[2])  * 1000.0;
-          double waitB  = time_elapsed_sec(&t_cy[2],  &t_cy[3])  * 1000.0;
-          double cpuB   = time_elapsed_sec(&t_cy[3],  &t_cy[4])  * 1000.0;
-          double cycle  = time_elapsed_sec(&t_cy[0],  &t_cy[5])  * 1000.0;
-          double sub_ms = (pool.submit_elapsed_s[0] + pool.submit_elapsed_s[1]) * 1000.0;
-          log_info(scn->dev,
-            "[TIMELINE] step=%llu "
-            "|waitA=%.2f|cpuA=%.2f|waitB=%.2f|cpuB=%.2f"
-            "|submit=%.2f(async)|cycle=%.2fms raysA=%llu raysB=%llu\n",
-            (unsigned long long)pool.total_steps,
-            waitA, cpuA, waitB, cpuB,
-            sub_ms, cycle,
-            (unsigned long long)pv_a->ray_count,
-            (unsigned long long)pv_b->ray_count);
-        }
-      }
-
-      /* ════════ Dynamic merge check ════════ */
-      if(should_merge(&pool)) {
-        /* Wait for both views' async submits before touching GPU state */
-        res = submit_thread_wait_view(&pool, 0);
-        if(res != RES_OK) goto cleanup;
-        pool.time_submit_s += pool.submit_elapsed_s[0];
-        res = submit_thread_wait_view(&pool, 1);
-        if(res != RES_OK) goto cleanup;
-        pool.time_submit_s += pool.submit_elapsed_s[1];
-        /* Wait for all pending GPU calls (RT + enc + cp) */
-        if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
-          res = gpu_wait_download_all(&pool, pv_a, scn->s3d_view);
-          if(res != RES_OK) goto cleanup;
-        }
-        if(pv_b->gpu_pending || pv_b->enc_gpu_pending || pv_b->cp_gpu_pending) {
-          res = gpu_wait_download_all(&pool, pv_b, scn->s3d_view);
-          if(res != RES_OK) goto cleanup;
-        }
-        log_info(scn->dev,
-          "pipeline: merging to single-pool at step %llu "
-          "(A.active=%llu, B.active=%llu)\n",
-          (unsigned long long)pool.total_steps,
-          (unsigned long long)pv_a->active_compact,
-          (unsigned long long)pv_b->active_compact);
-        merge_to_single_pool(&pool);
-        { struct time t_hk_end; time_current(&t_hk_end);
-          pool.time_housekeeping_s += time_elapsed_sec(&t_hk, &t_hk_end); }
-        break;  /* fall through to single-pool loop */
-      }
-      { struct time t_hk_end; time_current(&t_hk_end);
-        pool.time_housekeeping_s += time_elapsed_sec(&t_hk, &t_hk_end); }
-    } /* end dual-pool while */
-
-    /* ---- Drain: wait for last pending GPU calls (RT + enc + cp) ---- */
-    if(pool.num_active_views == 2) {
-      /* Ensure both views' async submits finished */
-      res = submit_thread_wait_view(&pool, 0);
-      if(res != RES_OK) goto cleanup;
-      pool.time_submit_s += pool.submit_elapsed_s[0];
-      res = submit_thread_wait_view(&pool, 1);
-      if(res != RES_OK) goto cleanup;
-      pool.time_submit_s += pool.submit_elapsed_s[1];
-
-      if(pv_a->gpu_pending || pv_a->enc_gpu_pending || pv_a->cp_gpu_pending) {
-        res = gpu_wait_download_all(&pool, pv_a, scn->s3d_view);
-        if(res != RES_OK) goto cleanup;
-        pool.total_steps++;
-        res = merged_pass(&pool, pv_a, scn);
-        if(res != RES_OK) goto cleanup;
-        compact_active_paths(&pool, pv_a);
-      }
-      if(pv_b->gpu_pending || pv_b->enc_gpu_pending || pv_b->cp_gpu_pending) {
-        res = gpu_wait_download_all(&pool, pv_b, scn->s3d_view);
-        if(res != RES_OK) goto cleanup;
-        pool.total_steps++;
-        res = merged_pass(&pool, pv_b, scn);
-        if(res != RES_OK) goto cleanup;
-        compact_active_paths(&pool, pv_b);
-      }
-    }
-
-    /* O13: Destroy submit thread */
-    submit_thread_destroy(&pool);
-
-    /* Log pipeline stats */
-    {
-      struct time t_now;
-      double pipeline_wall;
-      time_current(&t_now);
-      pipeline_wall = time_elapsed_sec(&t_start, &t_now);
-      if(pipeline_wall <= 0) pipeline_wall = 1e-9;
-      log_info(scn->dev,
-        "pipeline stats: wall=%.3fs, gpu_wait=%.3fs, cpu_between=%.3fs, "
-        "submit=%.3fs(async), steps=%llu\n",
-        pipeline_wall,
-        pool.time_pipeline_wait_s,
-        pool.time_pipeline_cpu_between_s,
-        pool.time_submit_s,
-        (unsigned long long)pool.total_steps);
-    }
-  } /* end if(num_active_views == 2) */
-
-  /* ═══════════════════════════════════════════════════════════ */
-  /*  Single-pool main loop (num_active_views == 1)              */
-  /*  - STARDIS_PIPELINE=0 enters directly                      */
-  /*  - Or merge_to_single_pool above falls through              */
-  /* ═══════════════════════════════════════════════════════════ */
-  if(pool.num_active_views == 1) {
-
-  while(pool.active_count > 0 || pool.task_next < pool.task_count) {
-    size_t refill_count = 0;
-    struct time t_phase0, t_phase1; /* M3 per-phase timing */
-    struct pool_view* pv = &pool.views[0]; /* single-pool view */
-    pool.total_steps++;
-
-    /* O11: merged_pass (distribute+cascade+collect+harvest in one scan) */
-    time_current(&t_phase0);
-    res = merged_pass(&pool, pv, scn);
-    if(res != RES_OK) goto cleanup;
-    time_current(&t_phase1);
-    pool.time_cascade_s += time_elapsed_sec(&t_phase0, &t_phase1);
-    pool.time_pipeline_cpu_between_s += time_elapsed_sec(&t_phase0, &t_phase1);
-
-    /* Compact + refill */
-    time_current(&t_phase0);
-    compact_active_paths(&pool, pv);
-    res = refill_pool(&pool, pv, &refill_count);
-    if(res != RES_OK) goto cleanup;
-    time_current(&t_phase1);
-    pool.time_harvest_s += time_elapsed_sec(&t_phase0, &t_phase1);
-
-    /* GPU trace RT+enc+cp (sync in single-pool camera mode) */
-    time_current(&t_phase0);
-#ifdef SDIS_DEBUG_CHECKS
-    assert_no_pending_result_before_dispatch(&pool, pv);
-#endif
-    res = gpu_launch_all(&pool, pv, scn->s3d_view);
-    if(res != RES_OK) goto cleanup;
-    { struct time t_sub1;
-      time_current(&t_sub1);
-      pool.time_submit_s += time_elapsed_sec(&t_phase0, &t_sub1);
-      t_phase0 = t_sub1;  /* reset for wait measurement */
-    }
-    res = gpu_wait_download_all(&pool, pv, scn->s3d_view);
-    if(res != RES_OK) goto cleanup;
-    time_current(&t_phase1);
-    pool.time_pipeline_wait_s += time_elapsed_sec(&t_phase0, &t_phase1);
-
-    /* Steps H-L: Housekeeping (update_active, drain detect, diagnostics,
-     * progress reporting, periodic logging, safety check) */
-    time_current(&t_phase0);
-
-    /* Step H: Update active count */
-    pool_update_active_count(&pool);
-
-    /* Step I: Detect drain phase transition */
-    if(!pool.in_drain_phase && pool.task_next >= pool.task_count) {
-      pool.in_drain_phase = 1;
-      /* Record refill phase total wall-clock */
-      {
-        struct time t_now;
-        time_current(&t_now);
-        pool.time_refill_phase_s = time_elapsed_sec(&t_start, &t_now);
-      }
-      log_info(scn->dev,
-        "persistent_wavefront: entering drain phase at step %llu, "
-        "%llu active paths remain, refill_wall=%.3fs\n",
-        (unsigned long long)pool.total_steps,
-        (unsigned long long)pool.active_count,
-        pool.time_refill_phase_s);
-    }
-
-    /* Step J: Update diagnostics (M2.5 + M3 wavefront width) */
-    pool_update_diagnostics(&pool, pv);
-
-    /* Step K: Progress reporting */
-    {
-      size_t tasks_done = pool.paths_completed + pool.paths_failed;
-      int pcent = (int)((double)tasks_done * 100.0
-                      / (double)total_tasks + 0.5);
-      if(pcent > 100) pcent = 100;
-
-      if(pcent / pcent_progress > last_pcent / pcent_progress) {
-        last_pcent = pcent;
-        if(progress) {
-          progress[0] = pcent;
-          print_progress_update(scn->dev, progress, progress_label);
-        }
-      }
-    }
-
-    /* Step L: Periodic status logging */
-    if(pool.total_steps % 1000 == 0
-    || (pool.in_drain_phase && pool.drain_step_count % 500 == 0
-     && pool.active_count > 0)) {
-      log_info(scn->dev,
-        "persistent_wavefront step %llu: %llu/%llu active, "
-        "%llu rays this step (rad=%llu ds=%llu shd=%llu enc=%llu st=%llu), "
-        "%llu/%llu tasks done, %s\n",
-        (unsigned long long)pool.total_steps,
-        (unsigned long long)pool.active_count,
-        (unsigned long long)pool.pool_size,
-        (unsigned long long)pv->ray_count,
-        (unsigned long long)pv->bucket_counts[RAY_BUCKET_RADIATIVE],
-        (unsigned long long)pv->bucket_counts[RAY_BUCKET_STEP_PAIR],
-        (unsigned long long)pv->bucket_counts[RAY_BUCKET_SHADOW],
-        (unsigned long long)pv->bucket_counts[RAY_BUCKET_ENCLOSURE],
-        (unsigned long long)pv->bucket_counts[RAY_BUCKET_STARTUP],
-        (unsigned long long)(pool.paths_completed + pool.paths_failed),
-        (unsigned long long)total_tasks,
-        pool.in_drain_phase ? "DRAIN" : "refill");
-    }
-
-
-
-    time_current(&t_phase1);
-    pool.time_housekeeping_s += time_elapsed_sec(&t_phase0, &t_phase1);
-  } /* end single-pool while */
-  } /* end if(pool.num_active_views == 1) */
+  res = run_pool(&pool, scn->s3d_view, scn, &run_cfg);
+  if(res != RES_OK) goto cleanup;
 
   /* ====== 8. Summary logging ====== */
   time_current(&t_end);
@@ -5664,7 +5240,7 @@ solve_persistent_wavefront_probe(
 
   /* ====== 7. Main loop (dispatched by pool_run) ====== */
   time_current(&t_start);
-  res = pool_run(&pool, scn->s3d_view, scn);
+  res = run_pool(&pool, scn->s3d_view, scn, NULL);
   if(res != RES_OK) goto cleanup;
   time_current(&t_end);
 
@@ -5810,7 +5386,7 @@ solve_persistent_wavefront_probe_batch(
 
   /* ====== 7. Main loop (dispatched by pool_run) ====== */
   time_current(&t_start);
-  res = pool_run(&pool, scn->s3d_view, scn);
+  res = run_pool(&pool, scn->s3d_view, scn, NULL);
   if(res != RES_OK) goto cleanup_batch;
   time_current(&t_end);
 
