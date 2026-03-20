@@ -73,6 +73,9 @@
 #define PREFETCH_T0(addr) __builtin_prefetch((const void*)(addr), 0, 3)
 #endif
 
+/* O16: SSE2 non-temporal stores for pinned buffer writes */
+#include <emmintrin.h>
+
 /* Per-path temperature trace (set STARDIS_PIXEL_TRACE=gpu_trace.csv) */
 static FILE* s_pixel_trace_fp = NULL;
 static int   s_pixel_trace_checked = 0;
@@ -676,11 +679,11 @@ pool_destroy(struct wavefront_pool* pool)
   free(pool->enc_arr);
   free(pool->ext_arr);
 
-  /* O11: per-thread ray buffers */
+  /* O11: per-thread ray buffers (O16: cacheline-aligned) */
   if(pool->tl_ray_bufs) {
     int ti;
     for(ti = 0; ti < pool->tl_ray_nbufs; ti++)
-      free(pool->tl_ray_bufs[ti]);
+      _aligned_free(pool->tl_ray_bufs[ti]);
     free(pool->tl_ray_bufs);
   }
 
@@ -3119,18 +3122,22 @@ gpu_submit_all(struct wavefront_pool* pool,
  * the pinned buffer (unsorted — no bucket ordering, Option A).
  ******************************************************************************/
 
-/* --- Per-ray entry in thread-local ray buffer --- */
+/* --- Per-ray entry in thread-local ray buffer ---
+ * O16: Slimmed from 104B (double intermediary) to 56B by embedding
+ * destination-format structs directly.  All sources (path_ray_request,
+ * enc_arr.directions, bnd_ss.dir_bck) are float — the old double
+ * round-trip was pure waste.
+ * Padded to 64B (1 cacheline) to eliminate split-line loads in flush. */
 struct tl_ray_entry {
-  uint32_t  slot;
-  uint32_t  sub;          /* 0, 1, 2..5 for multi-ray */
-  double    origin[3];
-  double    direction[3];
-  double    tmin, tmax;
-  struct s3d_filter_per_ray filter;
-};
+  struct s3d_ray_pinned     ray;     /* 32B — exact pinned layout       */
+  struct s3d_filter_per_ray filter;  /* 16B — exact filter pinned layout */
+  uint32_t  slot;                    /* 4B                               */
+  uint32_t  sub;                     /* 4B  — 0..5 for multi-ray         */
+  uint32_t  _pad[2];                 /* 8B  — pad to 64B cacheline       */
+};  /* total: 64B = 1 cacheline */
 
 /* Maximum rays per thread-local buffer before forced flush.
- * 8192 entries × ~104 B ≈ 800 KB stack — safe for OMP thread. */
+ * 8192 entries × 64 B = 512 KB — well within OMP thread budget. */
 #define TL_RAY_BUF_MAX 8192
 
 /**
@@ -3304,14 +3311,14 @@ merged_pass_collect_ray(
     struct tl_ray_entry* e = &tl_entries[tl_count + added];
     e->slot = slot;
     e->sub  = 0;
-    e->origin[0]    = p->ray_req.origin[0];
-    e->origin[1]    = p->ray_req.origin[1];
-    e->origin[2]    = p->ray_req.origin[2];
-    e->direction[0] = p->ray_req.direction[0];
-    e->direction[1] = p->ray_req.direction[1];
-    e->direction[2] = p->ray_req.direction[2];
-    e->tmin          = p->ray_req.range[0];
-    e->tmax          = p->ray_req.range[1];
+    e->ray.origin_x    = p->ray_req.origin[0];
+    e->ray.origin_y    = p->ray_req.origin[1];
+    e->ray.origin_z    = p->ray_req.origin[2];
+    e->ray.tmin        = p->ray_req.range[0];
+    e->ray.direction_x = p->ray_req.direction[0];
+    e->ray.direction_y = p->ray_req.direction[1];
+    e->ray.direction_z = p->ray_req.direction[2];
+    e->ray.tmax        = p->ray_req.range[1];
     fill_filter_per_ray(&e->filter, p);
     added++;
   }
@@ -3321,14 +3328,14 @@ merged_pass_collect_ray(
     struct tl_ray_entry* e = &tl_entries[tl_count + added];
     e->slot = slot;
     e->sub  = 1;
-    e->origin[0]    = p->ray_req.origin[0];
-    e->origin[1]    = p->ray_req.origin[1];
-    e->origin[2]    = p->ray_req.origin[2];
-    e->direction[0] = p->ray_req.direction2[0];
-    e->direction[1] = p->ray_req.direction2[1];
-    e->direction[2] = p->ray_req.direction2[2];
-    e->tmin          = p->ray_req.range2[0];
-    e->tmax          = p->ray_req.range2[1];
+    e->ray.origin_x    = p->ray_req.origin[0];
+    e->ray.origin_y    = p->ray_req.origin[1];
+    e->ray.origin_z    = p->ray_req.origin[2];
+    e->ray.tmin        = p->ray_req.range[0];
+    e->ray.direction_x = p->ray_req.direction2[0];
+    e->ray.direction_y = p->ray_req.direction2[1];
+    e->ray.direction_z = p->ray_req.direction2[2];
+    e->ray.tmax        = p->ray_req.range2[1];
     fill_filter_per_ray(&e->filter, p);
     added++;
   }
@@ -3336,19 +3343,18 @@ merged_pass_collect_ray(
   /* Rays 2..5 for 6-ray enclosure query */
   if(hot->ray_count_ext == 6 && ph_i == PATH_ENC_QUERY_EMIT) {
     int j;
-    /* batch_indices[0..1] are set from Ray 0/1 above */
     for(j = 2; j < 6; j++) {
       struct tl_ray_entry* e = &tl_entries[tl_count + added];
       e->slot = slot;
       e->sub  = (uint32_t)j;
-      e->origin[0]    = p->ray_req.origin[0];
-      e->origin[1]    = p->ray_req.origin[1];
-      e->origin[2]    = p->ray_req.origin[2];
-      e->direction[0] = pool->enc_arr[slot].directions[j][0];
-      e->direction[1] = pool->enc_arr[slot].directions[j][1];
-      e->direction[2] = pool->enc_arr[slot].directions[j][2];
-      e->tmin          = p->ray_req.range[0];
-      e->tmax          = p->ray_req.range[1];
+      e->ray.origin_x    = p->ray_req.origin[0];
+      e->ray.origin_y    = p->ray_req.origin[1];
+      e->ray.origin_z    = p->ray_req.origin[2];
+      e->ray.tmin        = p->ray_req.range[0];
+      e->ray.direction_x = pool->enc_arr[slot].directions[j][0];
+      e->ray.direction_y = pool->enc_arr[slot].directions[j][1];
+      e->ray.direction_z = pool->enc_arr[slot].directions[j][2];
+      e->ray.tmax        = p->ray_req.range[1];
       fill_filter_per_ray(&e->filter, p);
       added++;
     }
@@ -3361,14 +3367,14 @@ merged_pass_collect_ray(
       struct tl_ray_entry* e = &tl_entries[tl_count + added];
       e->slot = slot;
       e->sub  = (uint32_t)(j + 2);
-      e->origin[0]    = p->ray_req.origin[0];
-      e->origin[1]    = p->ray_req.origin[1];
-      e->origin[2]    = p->ray_req.origin[2];
-      e->direction[0] = p->locals.bnd_ss.dir_bck[j][0];
-      e->direction[1] = p->locals.bnd_ss.dir_bck[j][1];
-      e->direction[2] = p->locals.bnd_ss.dir_bck[j][2];
-      e->tmin          = p->ray_req.range[0];
-      e->tmax          = p->ray_req.range[1];
+      e->ray.origin_x    = p->ray_req.origin[0];
+      e->ray.origin_y    = p->ray_req.origin[1];
+      e->ray.origin_z    = p->ray_req.origin[2];
+      e->ray.tmin        = p->ray_req.range[0];
+      e->ray.direction_x = p->locals.bnd_ss.dir_bck[j][0];
+      e->ray.direction_y = p->locals.bnd_ss.dir_bck[j][1];
+      e->ray.direction_z = p->locals.bnd_ss.dir_bck[j][2];
+      e->ray.tmax        = p->ray_req.range[1];
       fill_filter_per_ray(&e->filter, p);
       added++;
     }
@@ -3393,21 +3399,28 @@ merged_pass_flush_tl_rays(
   size_t                 ray_base)
 {
   size_t r;
+
+  /* O16: alignment assertions — cudaHostAlloc returns >= 256B aligned,
+   * but verify at first call to catch any future allocation change. */
+  assert(((uintptr_t)pv->ray_pinned    & 15) == 0);
+  assert(((uintptr_t)pv->filter_pinned & 15) == 0);
+
   for(r = 0; r < count; r++) {
     size_t ray_idx = ray_base + r;
     const struct tl_ray_entry* e = &entries[r];
     struct s3d_ray_pinned* rp = &pv->ray_pinned[ray_idx];
 
-    rp->origin_x    = e->origin[0];
-    rp->origin_y    = e->origin[1];
-    rp->origin_z    = e->origin[2];
-    rp->direction_x = e->direction[0];
-    rp->direction_y = e->direction[1];
-    rp->direction_z = e->direction[2];
-    rp->tmin         = e->tmin;
-    rp->tmax         = e->tmax;
+    /* O16: ray_pinned (32B = 2 x __m128i) — NT stream from pre-formatted
+     * entry.  No type conversion needed: collect already wrote float. */
+    _mm_stream_si128((__m128i*)rp,
+                     _mm_loadu_si128((const __m128i*)&e->ray));
+    _mm_stream_si128((__m128i*)((char*)rp + 16),
+                     _mm_loadu_si128((const __m128i*)((const char*)&e->ray + 16)));
 
-    pv->filter_pinned[ray_idx] = e->filter;
+    /* O16: filter_pinned (16B = 1 x __m128i) — NT stream. */
+    _mm_stream_si128((__m128i*)&pv->filter_pinned[ray_idx],
+                     _mm_loadu_si128((const __m128i*)&e->filter));
+
     pv->ray_to_slot[ray_idx]   = e->slot;
     pv->ray_slot_sub[ray_idx]  = e->sub;
   }
@@ -3641,8 +3654,14 @@ merged_pass(struct wavefront_pool* pool,
         if(ser_ray_count + nrays > ser_rays_cap) {
           size_t new_cap = (ser_rays_cap == 0) ? 4096 : ser_rays_cap * 2;
           while(new_cap < ser_ray_count + nrays) new_cap *= 2;
-          ser_rays = (struct tl_ray_entry*)realloc(ser_rays,
-            new_cap * sizeof(struct tl_ray_entry));
+          { /* O16: cacheline-aligned realloc for serial ray buffer */
+            struct tl_ray_entry* new_buf = (struct tl_ray_entry*)
+              _aligned_malloc(new_cap * sizeof(struct tl_ray_entry), 64);
+            if(ser_rays && ser_ray_count > 0)
+              memcpy(new_buf, ser_rays, ser_ray_count * sizeof(struct tl_ray_entry));
+            _aligned_free(ser_rays);
+            ser_rays = new_buf;
+          }
           ser_rays_cap = new_cap;
         }
 
@@ -3760,10 +3779,11 @@ merged_pass(struct wavefront_pool* pool,
     /* Flush serial ray buffer to pinned */
     if(ser_ray_count > 0) {
       merged_pass_flush_tl_rays(pool, pv, ser_rays, ser_ray_count, 0);
+      _mm_sfence();  /* O16: ensure NT stores globally visible before fixup */
       merged_pass_fixup_batch_idx(pool, pv, ser_ray_count);
     }
     pv->ray_count = ser_ray_count;
-    free(ser_rays);
+    _aligned_free(ser_rays);
 
     /* Update pool counters */
     pool->cascade_total_iterations += tl_iterations;
@@ -3785,7 +3805,7 @@ merged_pass(struct wavefront_pool* pool,
     /* Free old (if nthreads grew) */
     if(pool->tl_ray_bufs) {
       for(ti = 0; ti < pool->tl_ray_nbufs; ti++)
-        free(pool->tl_ray_bufs[ti]);
+        _aligned_free(pool->tl_ray_bufs[ti]);
       free(pool->tl_ray_bufs);
     }
     pool->tl_ray_nbufs = omp_nthreads;
@@ -3793,8 +3813,8 @@ merged_pass(struct wavefront_pool* pool,
       (size_t)omp_nthreads, sizeof(void*));
     if(!pool->tl_ray_bufs) return RES_MEM_ERR;
     for(ti = 0; ti < omp_nthreads; ti++) {
-      pool->tl_ray_bufs[ti] = malloc(
-        TL_RAY_BUF_MAX * sizeof(struct tl_ray_entry));
+      pool->tl_ray_bufs[ti] = _aligned_malloc(
+        TL_RAY_BUF_MAX * sizeof(struct tl_ray_entry), 64);
       if(!pool->tl_ray_bufs[ti]) return RES_MEM_ERR;
     }
   }
@@ -4057,6 +4077,10 @@ merged_pass(struct wavefront_pool* pool,
   } /* end omp parallel */
 
   if(had_fatal) return RES_UNKNOWN_ERR;
+
+  /* O16: ensure all NT stores from flush are globally visible
+   * before fixup reads ray_to_slot/ray_slot_sub. */
+  _mm_sfence();
 
   /* Fixup batch_idx after all rays are in pinned buffer */
   pv->ray_count = total_rays;
